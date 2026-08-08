@@ -302,6 +302,9 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
                 pass
         batch_ports = set()
         for nd in nodes:
+            # 每个节点必须带 id（前端 batch payload / 订阅导入都不传，由后端生成）
+            if not nd.get("id"):
+                nd["id"] = new_node_id()
             rc = nd.get("rawConfig") or {}
             srv = rc.get("server") or rc.get("address")
             sp = rc.get("server_port") or rc.get("port")
