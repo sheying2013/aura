@@ -88,16 +88,17 @@ async def _guard_loop() -> None:
     global _guard_paused, _restart_times
     while True:
         await asyncio.sleep(GUARD_INTERVAL)
-        proc = config_manager.get_proc()
         # 进程对象不存在（从未启动/已正常停止）→ 不处理
-        if proc is None:
+        if config_manager.get_proc() is None:
             continue
-        # 进程仍在运行 → 不处理；活着即重置暂停标记（恢复周期已过）
-        if proc.returncode is None:
+        # is_running() 基于收割任务判断：进程已退出且被 _reap_proc 收割 → False
+        # （asyncio 的 Process.returncode 不调 wait() 永远不更新，直接读它进程死了
+        #   也显示"活着"，守护会漏重启。此判断依赖 config_manager 的收割任务）
+        if config_manager.is_running():
             if _guard_paused:
                 _guard_paused = False
             continue
-        # 进程对象存在但已退出 → 需要重启
+        # 进程已退出 → 需要重启
         now = time.time()
         _restart_times.append(now)
         _restart_times = [t for t in _restart_times if now - t < 60]

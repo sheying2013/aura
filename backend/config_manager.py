@@ -65,6 +65,7 @@ _started_at: Optional[float] = None
 _last_good_config: Optional[Dict] = None  # 最近一次成功 apply 的配置（回滚参考）
 _op_lock = asyncio.Lock()  # 串行化 apply/start/stop，避免 SIGHUP/SIGTERM 竞态
 _logf = None  # sing-box 日志文件句柄，避免 fd 泄漏
+_wait_task: Optional[asyncio.Task] = None  # 收割子进程的 wait() 任务
 
 
 # ---------- clash secret ----------
@@ -270,7 +271,7 @@ def check_config(config: Dict[str, Any]) -> tuple:
 def _detect_port_conflict(ports: Set[int]) -> List[int]:
     """端口冲突检测：独占 bind 探测。
     仅当 sing-box 运行时跳过其管理端口（此时确实被占）；未运行时这些端口
-    实际空闲，若外部进程占用必须报冲突。"""
+    实际空闲，若外部进程占用必须报冲突。clash API 端口（9090）也纳入检测。"""
     managed = set()
     if is_running():
         for n in db.list_nodes():
@@ -278,7 +279,7 @@ def _detect_port_conflict(ports: Set[int]) -> List[int]:
         for rd in db.list_relay_domains():
             managed.add(int(rd["port"]))
     conflicted = []
-    for p in ports:
+    for p in ports | {CLASH_PORT}:
         if p in managed:
             continue
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -309,8 +310,39 @@ def _atomic_write_config(config: Dict[str, Any]) -> None:
 # ---------- 进程托管 ----------
 
 def is_running() -> bool:
+    """进程对象存在且尚未被 wait() 收割，视为运行中。
+
+    注意：asyncio 的 Process.returncode 只有调用过 wait()/poll() 才会更新，
+    直接读 returncode 判断"进程是否还活着"在进程已退出但未收割时为 False
+    （永远返回 None），导致崩溃守护/防重入失效。统一用 _wait_task 判断。
+    """
     global _proc
-    return _proc is not None and _proc.returncode is None
+    return _proc is not None and (_wait_task is None or not _wait_task.done())
+
+
+async def _reap_proc() -> None:
+    """收割 sing-box 子进程并打印退出信息。
+
+    进程退出后本任务 done()，is_running() 据此返回 False（不能把 _wait_task 置
+    None——那样 is_running 会误判"活着"）。注意 asyncio 的 Process.returncode
+    只有调用过 wait()/poll() 才会更新，直接读它永远显示进程活着。
+    """
+    proc = _proc
+    if proc is None:
+        return
+    try:
+        await proc.wait()
+    except Exception:
+        return
+    # 退出后回读 singbox.log 尾行，把真实死因（如 bind: address already in use）带上
+    tail = ""
+    try:
+        with open(LOG_PATH, "r", errors="replace") as f:
+            lines = f.read().splitlines()[-3:]
+        tail = " | ".join(l for l in lines if l.strip())[-400:]
+    except Exception:
+        pass
+    print(f"[singbox] 进程已退出 code={proc.returncode} {tail}")
 
 
 async def start() -> bool:
@@ -321,7 +353,7 @@ async def start() -> bool:
 
 async def _start_unlocked() -> bool:
     """无锁内核版 start（调用方需已持 _op_lock）。"""
-    global _proc, _started_at, _logf
+    global _proc, _started_at, _logf, _wait_task
     if is_running():
         return True
     cfg = CONFIG_PATH
@@ -351,11 +383,19 @@ async def _start_unlocked() -> bool:
         stdout=_logf, stderr=_logf,
     )
     _started_at = time.time()
-    return True
+    # 关键：spawn 收割任务——asyncio 的 Process.returncode 不调用 wait() 永远不会更新，
+    # 崩溃守护靠这个任务感知进程退出，否则 sing-box 死后守护会永远以为它活着。
+    _wait_task = asyncio.create_task(_reap_proc())
+    # 启动后短观察：若立即退出（如 clash API 端口被占），把真实死因从日志带回。
+    # 注意不能用 wait_for——它超时后会取消被等待的收割任务，守护就废了。
+    done, _ = await asyncio.wait({_wait_task}, timeout=2.0)
+    if _wait_task in done:
+        return False  # 进程已退出（_reap_proc 已把退出信息打印到 stdout）
+    return True  # 存活超过 2s，视为启动成功
 
 
 async def stop() -> None:
-    global _proc, _logf
+    global _proc, _logf, _wait_task
     async with _op_lock:
         if _proc is None:
             return
@@ -367,6 +407,14 @@ async def stop() -> None:
                 _proc.kill()
         except Exception:
             pass
+        # 取消收割任务，避免其 try/finally 中访问已回收的 _proc
+        if _wait_task is not None:
+            _wait_task.cancel()
+            try:
+                await _wait_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            _wait_task = None
         _proc = None
         # 关闭日志句柄避免 fd 泄漏
         if _logf is not None:
