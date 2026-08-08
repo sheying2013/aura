@@ -150,12 +150,12 @@ def build_config() -> Dict[str, Any]:
                 out_item["tls"] = tls
             elif sb_type == "vless":
                 # vless 订阅节点（clash/vless://）几乎全走 TLS 端口；无 tls 配置时
-                # 尝试按 sni/skip-cert-verify 推断，避免裸连超时
+                # 按 sni/server 推断。推断场景 server_name 是猜的（IP 节点证书无 SAN），
+                # 必须 insecure 跳过证书校验，否则必然握手失败
                 out_item["tls"] = {
                     "enabled": True,
                     "server_name": cfg.get("sni") or cfg.get("server_name") or cfg.get("server", ""),
-                    **({"insecure": True} if cfg.get("skip-cert-verify") in (True, "true", "1")
-                       else {}),
+                    "insecure": True,
                 }
             if cfg.get("flow"):
                 out_item["flow"] = cfg["flow"]
@@ -170,12 +170,12 @@ def build_config() -> Dict[str, Any]:
             if tls:
                 out_item["tls"] = tls
             else:
-                # trojan 协议强制 TLS；订阅节点未带 tls 配置时按 sni 推断
+                # trojan 协议强制 TLS；订阅节点未带 tls 配置时按 sni 推断。
+                # 推断的 server_name 是猜的，必须 insecure（同 vless 推断）
                 out_item["tls"] = {
                     "enabled": True,
                     "server_name": cfg.get("sni") or cfg.get("server_name") or cfg.get("server", ""),
-                    **({"insecure": True} if cfg.get("skip-cert-verify") in (True, "true", "1")
-                       else {}),
+                    "insecure": True,
                 }
             if cfg.get("transport") or cfg.get("streamSettings"):
                 out_item["transport"] = cfg.get("transport") or cfg.get("streamSettings")

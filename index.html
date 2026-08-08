@@ -4519,8 +4519,9 @@
             server_port: cfg.server_port,
             uuid: cfg.uuid
           };
-          // vless 订阅节点几乎全走 TLS 端口；按 sni/insecure 生成 tls（与后端一致）
-          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          // vless 订阅节点几乎全走 TLS 端口；按 sni/insecure 生成 tls（与后端一致）。
+          // 推断场景（无原始 tls 配置）server_name 是猜的，默认 insecure 跳过证书校验
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, insecure: true };
           if (cfg.transport || cfg.streamSettings) outItem.transport = cfg.transport || cfg.streamSettings;
         } else if (node.protocol === 'trojan') {
           outItem = {
@@ -4530,8 +4531,8 @@
             server_port: cfg.server_port,
             password: cfg.password
           };
-          // trojan 协议强制 TLS（与后端一致）
-          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          // trojan 协议强制 TLS（与后端一致）；推断场景默认 insecure
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, insecure: true };
           if (cfg.transport || cfg.streamSettings) outItem.transport = cfg.transport || cfg.streamSettings;
         } else if (node.protocol === 'hysteria2') {
           outItem = {
