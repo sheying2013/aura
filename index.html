@@ -2933,17 +2933,59 @@
         }
       ];
 
+      // 后端模式：demo 也走 batch API 真实落库（重新载入 demo 是显式功能，必须落库）
+      if (window.__backendMode) {
+        const payload = nodeState.map(d => ({
+          name: d.name, protocol: d.protocol, group: d.group, port: d.port,
+          segment: d.segment, authUser: d.authUser, authPass: d.authPass,
+          entryProto: d.entryProto || 'mixed', rawConfig: d.rawConfig || {},
+        }));
+        api('/api/nodes/batch', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nodes: payload }),
+        }).then(resp => {
+          if (!resp.ok) throw new Error('batch 失败 ' + resp.status);
+          return resp.json();
+        }).then(data => {
+          addLog('SUCCESS', `已装载 Demo ${data.created} 节点（后端落库，跳过 ${data.skipped}）`);
+          return api('/api/nodes').then(r => r.json());
+        }).then(data => {
+          if (data && data.items) {
+            nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
+            renderAll();
+          }
+        }).catch(err => addLog('ERROR', 'Demo 装载失败: ' + err.message));
+        return;
+      }
+
       addLog('SUCCESS', '重置并装载 Demo 4 节点数据（含 51/52 徽标与模拟流量）');
       if (shouldSave) saveNodesToStorage();
       else renderAll();
     }
 
     function clearAllData() {
-      if (confirm('确认清空面板全部节点与数据配置？此操作无法撤销。')) {
-        nodeState = [];
-        saveNodesToStorage();
-        addLog('WARN', '已清空所有节点数据。');
+      if (!confirm('确认清空面板全部节点与数据配置？此操作无法撤销。')) return;
+      // 后端模式：批量删除真实落库
+      if (window.__backendMode) {
+        const ids = nodeState.map(n => n.id);
+        if (ids.length) {
+          api('/api/nodes/delete-batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids }),
+          }).then(resp => {
+            if (!resp.ok) throw new Error('API ' + resp.status);
+            nodeState = [];
+            addLog('WARN', '已清空所有节点数据（后端）');
+            renderAll();
+            try { api('/api/config/apply', { method: 'POST' }); } catch(e) {}
+          }).catch(err => addLog('ERROR', '清空数据失败: ' + err.message));
+        }
+        return;
       }
+      nodeState = [];
+      saveNodesToStorage();
+      addLog('WARN', '已清空所有节点数据。');
     }
 
     /* ==========================================
@@ -3705,6 +3747,25 @@
       if (!node) return;
 
       addLog('INFO', `正在对节点 [${node.name}] 发起延迟探活测试...`);
+      // 后端模式：走真实探活 API（clash_api delay），不用模拟值
+      if (window.__backendMode) {
+        api('/api/nodes/ping', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: [nodeId], all: false }),
+        }).then(resp => resp.ok ? resp.json() : Promise.reject('探活 API ' + resp.status))
+        .then(items => {
+          if (items && items[0]) {
+            const it = items[0];
+            const n = nodeState.find(x => x.id === nodeId);
+            if (n) { n.ping = it.ping || 0; n.status = it.status || 'offline'; }
+            addLog(it.status === 'online' ? 'SUCCESS' : 'WARN',
+              `节点 [${node.name}] 探活：${it.status === 'online' ? '延迟 ' + it.ping + 'ms' : (it.error || '离线')}`);
+            renderNodesTable(); renderQuickStats();
+          }
+        }).catch(err => addLog('ERROR', `节点 [${node.name}] 探活失败: ${err}`));
+        return;
+      }
       setTimeout(() => {
         node.ping = Math.floor(Math.random() * 110) + 15;
         node.status = 'online';
@@ -3715,6 +3776,24 @@
 
     function triggerPingAll() {
       addLog('INFO', '开启全局节点批量探活任务...');
+      // 后端模式：真实批量探活 API
+      if (window.__backendMode) {
+        api('/api/nodes/ping', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: [], all: true }),
+        }).then(resp => resp.ok ? resp.json() : Promise.reject('探活 API ' + resp.status))
+        .then(items => {
+          let online = 0;
+          items.forEach(it => {
+            const n = nodeState.find(x => x.id === it.id);
+            if (n) { n.ping = it.ping || 0; n.status = it.status || 'offline'; online += (it.status === 'online' ? 1 : 0); }
+          });
+          addLog('SUCCESS', `全局批量探活完成：${online}/${items.length} 在线`);
+          renderNodesTable(); renderQuickStats();
+        }).catch(err => addLog('ERROR', '批量探活失败: ' + err));
+        return;
+      }
       let completed = 0;
       nodeState.forEach((node, idx) => {
         setTimeout(() => {
@@ -4305,23 +4384,49 @@
 
     function resetSingleTraffic(nodeId) {
       const node = nodeState.find(n => n.id === nodeId);
-      if (node) {
-        node.upTraffic = 0;
-        node.downTraffic = 0;
-        addLog('INFO', `节点 [${node.name}] 流量计数已归零`);
-        saveNodesToStorage();
+      if (!node) return;
+      // 后端模式：调真实 API 归零
+      if (window.__backendMode) {
+        api(`/api/nodes/${encodeURIComponent(nodeId)}/traffic/reset`, { method: 'POST' })
+          .then(resp => {
+            if (!resp.ok) throw new Error('API ' + resp.status);
+            return resp.json();
+          })
+          .then(updated => {
+            const n = nodeState.find(x => x.id === nodeId);
+            if (n && updated) { n.upTraffic = 0; n.downTraffic = 0; }
+            addLog('INFO', `节点 [${node.name}] 流量计数已归零（后端）`);
+            renderNodesTable();
+          })
+          .catch(err => addLog('ERROR', `重置流量失败: ${err.message}`));
+        return;
       }
+      node.upTraffic = 0;
+      node.downTraffic = 0;
+      addLog('INFO', `节点 [${node.name}] 流量计数已归零`);
+      saveNodesToStorage();
     }
 
     function resetAllTraffic() {
-      if (confirm('确定将所有节点的流量统计重置归零？')) {
-        nodeState.forEach(n => {
-          n.upTraffic = 0;
-          n.downTraffic = 0;
-        });
-        addLog('WARN', '全局节点流量计数已重置归零');
-        saveNodesToStorage();
+      if (!confirm('确定将所有节点的流量统计重置归零？')) return;
+      // 后端模式：调真实 API 全局归零
+      if (window.__backendMode) {
+        api('/api/traffic/reset', { method: 'POST' })
+          .then(resp => {
+            if (!resp.ok) throw new Error('API ' + resp.status);
+            nodeState.forEach(n => { n.upTraffic = 0; n.downTraffic = 0; });
+            addLog('WARN', '全局节点流量计数已重置归零（后端）');
+            renderNodesTable(); renderQuickStats();
+          })
+          .catch(err => addLog('ERROR', `重置流量失败: ${err.message}`));
+        return;
       }
+      nodeState.forEach(n => {
+        n.upTraffic = 0;
+        n.downTraffic = 0;
+      });
+      addLog('WARN', '全局节点流量计数已重置归零');
+      saveNodesToStorage();
     }
 
     /* ==========================================
