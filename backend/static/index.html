@@ -3479,6 +3479,23 @@
     }
 
 
+    // 清洗 markdown 自动链接残留：sni=[www.yahoo.com&fp=... 或 sni=[www.yahoo.com&fp=...](https://...
+    // markdown 会把链接转成 [sni&...](https://...)，sni 值可能带 [ 或无配对 ]，统一剥离 [ 及其后到 & 的残留
+    function cleanMdValue(v) {
+      if (!v) return v;
+      let s = String(v);
+      if (s.startsWith('[')) {
+        s = s.substring(1);
+        // 若存在配对 ] 只取到它之前；否则取到第一个 & 前（md 残留 URL 常以 & 或 ] 分隔）
+        const closeB = s.indexOf(']');
+        const amp = s.indexOf('&');
+        if (closeB !== -1) s = s.substring(0, closeB);
+        else if (amp !== -1) s = s.substring(0, amp);
+        return s;
+      }
+      return s;
+    }
+
     // Protocol URI 解析器
     function parseProxyUri(uri) {
       uri = uri.trim();
@@ -3561,9 +3578,11 @@
         if (q.fp) cfg.fp = q.fp;
         if (q.pbk) cfg.pbk = q.pbk;
         if (q.sid) cfg.sid = q.sid;
-        if (q.sni) cfg.sni = q.sni;
-        if (q.host) cfg.host = q.host;
-        if (q.alpn) cfg.alpn = q.alpn;
+        // 清洗 markdown 自动链接残留（sni=[www.yahoo.com&fp=...](https://... 被渲染破坏）
+        if (q.sni) cfg.sni = cleanMdValue(q.sni);
+        if (q.host) cfg.host = cleanMdValue(q.host);
+        if (q.path) cfg.path = cleanMdValue(q.path);
+        if (q.alpn) cfg.alpn = cleanMdValue(q.alpn);
         if (q.serviceName) cfg.serviceName = q.serviceName;
         if (q.allowInsecure === '1' || q.allowInsecure === 'true') cfg.insecure = true;
         const transportType = q.type || q.net;
@@ -3593,15 +3612,16 @@
         // trojan query 常含 sni/transport 参数，必须完整解析
         const q = qIdx === -1 ? {} : Object.fromEntries(new URLSearchParams(body.substring(qIdx + 1)));
         const cfg = { type: 'trojan', server, server_port: port, password };
-        if (q.sni) cfg.sni = q.sni;
+        // 清洗 markdown 自动链接残留（同 vless）
+        if (q.sni) cfg.sni = cleanMdValue(q.sni);
         if (q.fp) cfg.fp = q.fp;
-        if (q.alpn) cfg.alpn = q.alpn;
-        if (q.host) cfg.host = q.host;
+        if (q.alpn) cfg.alpn = cleanMdValue(q.alpn);
+        if (q.host) cfg.host = cleanMdValue(q.host);
         if (q.allowInsecure === '1' || q.allowInsecure === 'true') cfg.insecure = true;
         const transportType = q.type || q.net;
         if (transportType && transportType !== 'tcp' && transportType !== 'none') {
           const transport = { type: transportType };
-          if (q.path) transport.path = q.path;
+          if (q.path) transport.path = cleanMdValue(q.path);
           if (transportType === 'grpc') transport.service_name = q.serviceName || q.path || '';
           if (transportType === 'http' && q.host) transport.host = [q.host];
           if ((transportType === 'ws' || transportType === 'http') && q.host) transport.headers = { Host: q.host };
@@ -3679,12 +3699,7 @@
         }
         const cfg = { type: 'hysteria2', server, server_port: port, password };
         // 清洗 markdown 自动链接残留（如 sni=[www.bing.com&mport=...](https://... 被渲染破坏）
-        let sni = query.sni || '';
-        if (sni.includes('[') && sni.includes(']')) {
-          const inner = sni.substring(sni.indexOf('[') + 1, sni.indexOf(']'));
-          sni = inner.split('&')[0];
-        }
-        if (sni) cfg.sni = sni;
+        if (query.sni) cfg.sni = cleanMdValue(query.sni);
         // hy2 机场节点证书多与 SNI 不匹配，默认 insecure 跳过证书校验（实测连通关键）
         cfg.insecure = true;
         if (query.insecure === '0' || query.insecure === 'false') cfg.insecure = false;
