@@ -60,6 +60,19 @@ def _tls_enabled_dict(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"enabled": True} if tls else None
     return None
 
+def _normalize_transport(tr: Any) -> Optional[Dict[str, Any]]:
+    """transport 规范化：sing-box V2RayTransportOptions 必须是对象。
+
+    老订阅节点 DB 里可能存字符串（如 "ws"），直接透传会让 check 失败
+    （json: cannot unmarshal string into ... transport）。字符串 → {type: str}。
+    """
+    if isinstance(tr, dict):
+        return tr if tr.get("type") else None
+    if isinstance(tr, str) and tr:
+        return {"type": tr}
+    return None
+
+
 # 进程状态
 _proc: Optional[asyncio.subprocess.Process] = None
 _started_at: Optional[float] = None
@@ -160,8 +173,9 @@ def build_config() -> Dict[str, Any]:
                 }
             if cfg.get("flow"):
                 out_item["flow"] = cfg["flow"]
-            if cfg.get("transport") or cfg.get("streamSettings"):
-                out_item["transport"] = cfg.get("transport") or cfg.get("streamSettings")
+            tr = _normalize_transport(cfg.get("transport") or cfg.get("streamSettings"))
+            if tr:
+                out_item["transport"] = tr
         elif sb_type == "trojan":
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
@@ -178,8 +192,9 @@ def build_config() -> Dict[str, Any]:
                     "server_name": cfg.get("sni") or cfg.get("server_name") or cfg.get("server", ""),
                     "insecure": True,
                 }
-            if cfg.get("transport") or cfg.get("streamSettings"):
-                out_item["transport"] = cfg.get("transport") or cfg.get("streamSettings")
+            tr = _normalize_transport(cfg.get("transport") or cfg.get("streamSettings"))
+            if tr:
+                out_item["transport"] = tr
         elif sb_type in ("socks", "http"):
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
