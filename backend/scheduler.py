@@ -102,6 +102,9 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> Lis
         return []
     results = await asyncio.gather(*(_probe_one(n) for n in nodes))
     # 结果落库 + 失败计数 → 自动停用/删除（_probe_one 不落库，避免双重计数）
+    # 注意：只标记需要重建，循环结束后统一 apply 一次——每个节点单独 apply_config
+    # 会触发大量 reload，sing-box 反复重启累积 TIME-WAIT 导致 bind 冲突（1.7.7 无 SO_REUSEADDR）
+    need_rebuild = False
     for node, res in zip(nodes, results):
         if res.get("status") == "online":
             db.update_node_probe(node["id"], res.get("ping", 0), "online")  # 成功清零
@@ -111,17 +114,16 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> Lis
         if fails >= DELETE_AFTER_FAILS:
             print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动删除")
             db.delete_node(node["id"])
-            try:
-                await cm.apply_config()
-            except Exception:
-                pass
+            need_rebuild = True
         elif fails >= DISABLE_AFTER_FAILS:
             print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动停用")
             db.update_node(node["id"], {"status": "disabled"})
-            try:
-                await cm.apply_config()
-            except Exception:
-                pass
+            need_rebuild = True
+    if need_rebuild:
+        try:
+            await cm.apply_config()
+        except Exception:
+            pass
     return results
 
 
