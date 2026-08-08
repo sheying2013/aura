@@ -352,9 +352,25 @@ def is_running() -> bool:
     注意：asyncio 的 Process.returncode 只有调用过 wait()/poll() 才会更新，
     直接读 returncode 判断"进程是否还活着"在进程已退出但未收割时为 False
     （永远返回 None），导致崩溃守护/防重入失效。统一用 _wait_task 判断。
+
+    Docker host 网络部署下 sing-box 子进程可能进入宿主机 PID 空间（容器内
+    看不到 /proc，_wait_task 立即 done），此时用 clash API 探测兜底判断——
+    host 网络共享 127.0.0.1，容器内外都能访问 9090。
     """
     global _proc
-    return _proc is not None and (_wait_task is None or not _wait_task.done())
+    if _proc is not None and (_wait_task is None or not _wait_task.done()):
+        return True
+    # 兜底：clash API 探测（host 网络下容器内外一致）
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://{CLASH_HOST}:{CLASH_PORT}/version",
+            headers={"Authorization": f"Bearer {get_clash_secret()}"},
+        )
+        r = urllib.request.urlopen(req, timeout=1)
+        return r.status == 200
+    except Exception:
+        return False
 
 
 async def _reap_proc() -> None:
