@@ -14,6 +14,40 @@ SUB_REFRESH_INTERVAL = 3 * 60 * 60  # 秒（3 小时）
 GUARD_INTERVAL = 10  # 秒
 MAX_RESTARTS_PER_MIN = 3
 
+# IP 情报惰性补查：信号量限并发（ipinfo.io 免费 5 万次/月），仅补缺情报的节点
+_ip_enrich_sem = asyncio.Semaphore(8)
+_ip_enrich_pending: set = set()  # 防同一节点并发重复查
+
+
+def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
+    """探活成功后惰性补查出口 IP 归属地/评分，已有关键情报则跳过。"""
+    ip = node.get("exitIp")
+    nid = node["id"]
+    if not ip or ip in ("N/A", "1.1.1.1"):
+        return
+    if node.get("exitCountry") and node.get("exitType"):
+        return  # 已有情报
+    if nid in _ip_enrich_pending:
+        return
+    _ip_enrich_pending.add(nid)
+
+    async def _do() -> None:
+        try:
+            async with _ip_enrich_sem:
+                import ipinfo
+                info = await asyncio.to_thread(ipinfo.lookup, ip)
+            patch = {k: info[k] for k in
+                     ("exitCountry", "exitFlag", "exitCity", "exitType", "exitScore")
+                     if k in info}
+            if patch:
+                db.update_node(nid, patch)
+        except Exception:
+            pass
+        finally:
+            _ip_enrich_pending.discard(nid)
+
+    asyncio.create_task(_do())
+
 # 崩溃守护状态
 _restart_times: List[float] = []
 _guard_paused = False
@@ -71,6 +105,7 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> Lis
     for node, res in zip(nodes, results):
         if res.get("status") == "online":
             db.update_node_probe(node["id"], res.get("ping", 0), "online")  # 成功清零
+            _lazy_enrich_ip(node)
             continue
         fails = db.update_node_probe(node["id"], 0, "offline")  # 失败 +1 并返回累计值
         if fails >= DELETE_AFTER_FAILS:

@@ -322,8 +322,20 @@ async def get_exit_ip(node_id: str):
             raise HTTPException(status_code=502, detail="出口 IP 探测失败")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"出口 IP 探测失败: {e}")
-    db.update_node(node_id, {"exitIp": ip})
-    return {"exitIp": ip, "ping": node.get("ping")}
+    patch = {"exitIp": ip}
+    # 异步查 IP 情报（ipinfo.io 归属地 + ipapi.is 纯净度评分），失败降级不阻塞
+    try:
+        import ipinfo
+        info = await asyncio.to_thread(ipinfo.lookup, ip)
+        for k in ("exitCountry", "exitFlag", "exitCity", "exitType", "exitScore"):
+            if k in info:
+                patch[k] = info[k]
+    except Exception:
+        pass
+    db.update_node(node_id, patch)
+    node = db.get_node(node_id)
+    return {"exitIp": ip, "ping": node.get("ping"), **{k: patch.get(k) for k in
+            ("exitCountry", "exitFlag", "exitCity", "exitType", "exitScore") if k in patch}}
 
 
 # ---------- sing-box 配置 ----------

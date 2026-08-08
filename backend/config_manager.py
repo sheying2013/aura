@@ -197,8 +197,9 @@ def build_config() -> Dict[str, Any]:
                 "password": cfg.get("password") or cfg.get("auth") or "",
             })
             tls_dict: Dict[str, Any] = {"enabled": True}
-            if cfg.get("sni") or cfg.get("server_name"):
-                tls_dict["server_name"] = cfg.get("sni") or cfg.get("server_name")
+            # hysteria2 强制要求 tls.server_name，缺省用 server 兜底（否则整份配置 check 失败）
+            tls_dict["server_name"] = (cfg.get("sni") or cfg.get("server_name")
+                                       or cfg.get("server") or cfg.get("address", ""))
             # hy2 机场节点证书多与 SNI 不匹配，默认 insecure 跳过证书校验（实测连通关键，与前端一致）
             if cfg.get("insecure") in (False, "0", "false"):
                 pass  # 显式关闭才不设 insecure
@@ -316,6 +317,8 @@ def _detect_port_conflict(ports: Set[int]) -> List[int]:
             managed.add(int(n["port"]))
         for rd in db.list_relay_domains():
             managed.add(int(rd["port"]))
+        # sing-box 正运行时自己占着 clash API 端口，不算外部冲突
+        managed.add(CLASH_PORT)
     conflicted = []
     for p in ports | {CLASH_PORT}:
         if p in managed:
@@ -451,44 +454,73 @@ async def _start_unlocked() -> bool:
 async def stop() -> None:
     global _proc, _logf, _wait_task
     async with _op_lock:
-        if _proc is None:
-            return
-        try:
-            _proc.send_signal(signal.SIGTERM)
+        if _proc is not None:
             try:
-                await asyncio.wait_for(_proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                _proc.kill()
-        except Exception:
-            pass
-        # 取消收割任务，避免其 try/finally 中访问已回收的 _proc
-        if _wait_task is not None:
-            _wait_task.cancel()
-            try:
-                await _wait_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            _wait_task = None
-        _proc = None
-        # 关闭日志句柄避免 fd 泄漏
-        if _logf is not None:
-            try:
-                _logf.close()
+                _proc.send_signal(signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(_proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    _proc.kill()
             except Exception:
                 pass
-            _logf = None
+            # 取消收割任务，避免其 try/finally 中访问已回收的 _proc
+            if _wait_task is not None:
+                _wait_task.cancel()
+                try:
+                    await _wait_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                _wait_task = None
+            _proc = None
+            # 关闭日志句柄避免 fd 泄漏
+            if _logf is not None:
+                try:
+                    _logf.close()
+                except Exception:
+                    pass
+                _logf = None
+            return
+        # _proc 丢失但 clash 探测仍活着（如 uvicorn 崩溃重启后 sing-box 残留），
+        # 兜底用 pkill 按命令行特征清理，避免面板显示已停止而 sing-box 仍占用端口。
+        if is_running():
+            try:
+                # 精确匹配本面板的 config 路径，避免误杀宿主其他 sing-box 实例
+                subprocess.run(["pkill", "-TERM", "-f", f"sing-box run -c {CONFIG_PATH}"],
+                               capture_output=True, timeout=5)
+            except Exception:
+                pass
 
 
 async def reload_config() -> bool:
-    """SIGHUP 热重载（sing-box 内部二次校验，失败保留旧实例）。"""
+    """SIGHUP 热重载（sing-box 收到后内部 check() 重读磁盘配置，失败保留旧实例）。
+
+    send_signal 只证明信号已发出，不代表重载成功——sing-box 收到 SIGHUP 后
+    先 check()，新配置无效会保留旧实例。因此这里在发出后轮询 clash API：
+    旧实例 close 再起新实例期间 /version 短暂不可达，恢复即视为重载成功。
+    """
     global _proc
     if not is_running() or _proc is None:
         return False
     try:
         _proc.send_signal(signal.SIGHUP)
-        return True
     except Exception:
         return False
+    # 等 clash API 恢复（旧实例关闭到新实例就绪的窗口 <1s 左右；最多 5s）
+    hdrs = {"Authorization": f"Bearer {get_clash_secret()}"}
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                try:
+                    r = await client.get(f"{clash_base()}/version", headers=hdrs)
+                    if r.status_code == 200:
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # clash API 一直没恢复——旧实例可能仍在（check 失败）或已死，交由调用方验证兜底
+    return False
 
 
 async def status() -> Dict[str, Any]:

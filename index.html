@@ -1289,6 +1289,42 @@
       color: var(--ochre-gold);
     }
 
+    /* 出口 IP 情报：国旗 + 类型徽标 + 评分色阶 */
+    .exit-ip-cell {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-family: var(--font-code);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .exit-ip-cell .flag { font-size: 13px; line-height: 1; }
+    .exit-ip-cell .ipaddr {
+      color: #c8c2b8;
+      cursor: help;
+      border-bottom: 1px dotted rgba(200, 194, 184, 0.3);
+    }
+    .exit-badge {
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-family: var(--font-code);
+    }
+    .exit-badge.residential { background: rgba(76, 217, 149, 0.15); color: var(--jade-green-glow); border: 1px solid rgba(76, 217, 149, 0.3); }
+    .exit-badge.hosting { background: rgba(212, 163, 55, 0.12); color: var(--ochre-gold); border: 1px solid rgba(212, 163, 55, 0.3); }
+    .exit-badge.proxy { background: rgba(230, 126, 34, 0.12); color: #e67e22; border: 1px solid rgba(230, 126, 34, 0.3); }
+    .exit-badge.unknown { background: rgba(140, 132, 120, 0.12); color: #8c8478; border: 1px solid rgba(140, 132, 120, 0.3); }
+    .exit-score {
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-family: var(--font-code);
+      font-weight: 600;
+    }
+    .exit-score.high { background: rgba(76, 217, 149, 0.15); color: var(--jade-green-glow); }
+    .exit-score.mid { background: rgba(212, 163, 55, 0.12); color: var(--ochre-gold); }
+    .exit-score.low { background: rgba(230, 126, 34, 0.12); color: #e67e22; }
+
     /* ==========================================
        7. 域名解析轮询入口卡片
        ========================================== */
@@ -2959,6 +2995,8 @@
           status: 'online',
           ping: 32,
           exitIp: '103.21.244.18',
+          exitFlag: '🇭🇰', exitCountry: '中国香港', exitCity: 'Hong Kong',
+          exitType: 'residential', exitScore: 92,
           upTraffic: 1024 * 1024 * 42,
           downTraffic: 1024 * 1024 * 380,
           rawConfig: { type: 'ss', server: 'hk.node.com', server_port: 8388, method: 'aes-128-gcm', password: 'secretpassword' }
@@ -2974,6 +3012,8 @@
           status: 'online',
           ping: 68,
           exitIp: '133.242.180.5',
+          exitFlag: '🇯🇵', exitCountry: '日本', exitCity: 'Tokyo',
+          exitType: 'hosting', exitScore: 42,
           upTraffic: 1024 * 1024 * 12,
           downTraffic: 1024 * 1024 * 150,
           rawConfig: { type: 'vmess', server: 'jp.node.com', server_port: 443, uuid: 'a1b2c3d4-e5f6-7890-1234-56789abcdef0' }
@@ -3989,6 +4029,32 @@
       document.getElementById('card-relay-status').innerText = `${relayCount} 入口 · 就绪`;
     }
 
+    // 出口 IP 情报渲染辅助
+    function exitTypeLabel(type) {
+      return { residential: '住宅', hosting: '数据中心', proxy: '代理/VPN', unknown: '' }[type] || '';
+    }
+    function exitScoreClass(score) {
+      if (score == null || score === '') return '';
+      return score >= 80 ? 'high' : (score >= 50 ? 'mid' : 'low');
+    }
+    function renderExitIp(n) {
+      const esc = v => escapeHtml(v);
+      const flag = esc(n.exitFlag || '');
+      const typeLabel = exitTypeLabel(n.exitType);
+      const score = n.exitScore;
+      // score 为 0 视为无数据（ipinfo 双源失败），不渲染误导性低分徽标
+      const hasScore = score > 0;
+      const scoreBadge = hasScore ? `<span class="exit-score ${exitScoreClass(score)}">${esc(score)}</span>` : '';
+      const typeBadge = typeLabel ? `<span class="exit-badge ${esc(n.exitType || 'unknown')}">${esc(typeLabel)}</span>` : '';
+      const city = esc(n.exitCity || '');
+      const country = esc(n.exitCountry || '');
+      const tooltip = [esc(n.exitIp), country ? `归属地: ${country}${city ? ' ' + city : ''}` : '', typeLabel ? `类型: ${typeLabel}` : '', hasScore ? `纯净度: ${esc(score)}/100` : ''].filter(Boolean).join('\n');
+      const ip = esc(n.exitIp) || 'N/A';
+      const ipTxt = ip === 'N/A' ? 'N/A' : `<span class="ipaddr" title="${tooltip}">${ip}</span>`;
+      const badges = [flag ? `<span class="flag">${flag}</span>` : '', ipTxt, typeBadge, scoreBadge].filter(Boolean).join('');
+      return badges ? `<span class="exit-ip-cell">${badges}</span>` : 'N/A';
+    }
+
     function renderNodesTable() {
       const tbody = document.getElementById('nodes-tbody');
       // 保留已勾选节点（SSE 2s 刷新会重建 tbody，清掉勾选 → 用户「无法多选」）
@@ -4029,7 +4095,7 @@
             <td style="font-weight: 500;" title="认证: ${n.authUser || ''}:${n.authPass || ''}${n.status === 'disabled' ? ' · 连续失败 ' + (n.consecutiveFails || 0) + ' 次已停用' : ''}">${escapeHtml(n.name)}${n.status === 'disabled' ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
             <td style="font-family:var(--font-code);">${formatBytes((n.upTraffic||0)+(n.downTraffic||0))}</td>
             <td style="font-family:var(--font-code); color:${n.ping < 80 ? 'var(--jade-green-glow)' : 'var(--ochre-gold)'}">${n.ping > 0 ? n.ping + 'ms' : 'timeout'}</td>
-            <td style="font-family:var(--font-code); font-size:12px;">${n.exitIp || 'N/A'}</td>
+            <td style="font-size:12px;">${renderExitIp(n)}</td>
             <td style="text-align: center; white-space: nowrap;">
               ${n.status === 'disabled'
                 ? `<button class="btn btn-secondary btn-xs" onclick="enableNode('${n.id}')" title="重新启用">启用</button>`
@@ -4730,7 +4796,8 @@
             server_port: cfg.server_port,
             password: cfg.password
           };
-          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || '' , ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          // hysteria2 强制要求 tls.server_name，缺省用 server 兜底（与后端一致）
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server || '', ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
           if (cfg.obfs) outItem.obfs = { type: cfg.obfs, password: cfg.obfsPassword || cfg['obfs-password'] || '' };
         }
 

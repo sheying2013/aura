@@ -145,13 +145,34 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 return None
             port = int(data.get("port", 0))
+            rc: Dict[str, Any] = {"server": data.get("add", ""), "server_port": port,
+                                  "uuid": data.get("id", ""), "method": data.get("method", "auto"),
+                                  "security": data.get("security", "auto"),
+                                  "alterId": data.get("aid", 0)}
+            # vmess base64 JSON 标准字段：tls=over-tls, sni, net=ws/grpc, host, path, fp
+            if str(data.get("tls", "")).lower() in ("tls", "1", "true"):
+                rc["tls"] = {"enabled": True}
+                if data.get("sni"):
+                    rc["tls"]["server_name"] = data["sni"]
+                fp = data.get("fp")
+                if fp and fp.lower() not in ("none", "random"):
+                    rc["tls"]["utls"] = {"enabled": True, "fingerprint": fp}
+                if str(data.get("allowInsecure", "")).lower() in ("1", "true"):
+                    rc["tls"]["insecure"] = True
+            net = data.get("net", "")
+            if net and net != "tcp":
+                rc["transport"] = {"type": net}
+                if data.get("path"):
+                    rc["transport"]["path"] = data["path"]
+                if data.get("host"):
+                    if net == "grpc":
+                        rc["transport"]["service_name"] = data["host"]
+                    else:
+                        rc["transport"]["headers"] = {"Host": data["host"]}
             return {
                 "name": name or data.get("ps", f"vmess-{data.get('add', '')}"),
                 "protocol": "vmess",
-                "rawConfig": {"server": data.get("add", ""), "server_port": port,
-                              "uuid": data.get("id", ""), "method": data.get("method", "auto"),
-                              "security": data.get("security", "auto"),
-                              "alterId": data.get("aid", 0)},
+                "rawConfig": rc,
             }
         # vless:// / trojan:// — URI
         for proto, sb_type in (("vless", "vless"), ("trojan", "trojan")):
@@ -173,6 +194,10 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
                 rc["tls"] = {"enabled": True}
                 if params.get("sni"):
                     rc["tls"]["server_name"] = params["sni"]
+                elif params.get("servername"):
+                    rc["tls"]["server_name"] = params["servername"]
+                if params.get("alpn"):
+                    rc["tls"]["alpn"] = [a for a in params["alpn"].split(",") if a]
                 if params.get("fp"):
                     rc["tls"]["utls"] = {"enabled": True, "fingerprint": params["fp"]}
                 # vless/trojan 常见 allowInsecure / insecure 参数

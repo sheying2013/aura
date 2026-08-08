@@ -116,6 +116,16 @@ def init_db() -> None:
             c.execute("ALTER TABLE nodes ADD COLUMN ss_pass TEXT")
         if "consecutive_fails" not in cols:
             c.execute("ALTER TABLE nodes ADD COLUMN consecutive_fails INTEGER DEFAULT 0")
+        # IP 情报列（探活成功后落库归属地/类型/评分）
+        for col, ddl in (
+            ("exit_country", "TEXT"),
+            ("exit_flag", "TEXT"),
+            ("exit_city", "TEXT"),
+            ("exit_type", "TEXT"),
+            ("exit_score", "INTEGER"),
+        ):
+            if col not in cols:
+                c.execute(f"ALTER TABLE nodes ADD COLUMN {col} {ddl}")
         c.commit()
 
 
@@ -143,6 +153,11 @@ def _row_to_node(row: sqlite3.Row) -> Dict[str, Any]:
         "entryProto": row["entry_proto"] or "mixed",
         "ssPass": row["ss_pass"],
         "consecutiveFails": row["consecutive_fails"] if "consecutive_fails" in row.keys() else 0,
+        "exitCountry": row["exit_country"] if "exit_country" in row.keys() else None,
+        "exitFlag": row["exit_flag"] if "exit_flag" in row.keys() else None,
+        "exitCity": row["exit_city"] if "exit_city" in row.keys() else None,
+        "exitType": row["exit_type"] if "exit_type" in row.keys() else None,
+        "exitScore": row["exit_score"] if "exit_score" in row.keys() else None,
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -394,7 +409,8 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
         c.execute(
             """UPDATE nodes SET name=?,protocol=?,"group"=?,port=?,segment=?,auth_user=?,
                auth_pass=?,status=?,ping=?,exit_ip=?,up_traffic=?,down_traffic=?,raw_config=?,
-               sub_id=?,stale=?,selected=?,entry_proto=?,ss_pass=?,consecutive_fails=?,updated_at=?
+               sub_id=?,stale=?,selected=?,entry_proto=?,ss_pass=?,consecutive_fails=?,
+               exit_country=?,exit_flag=?,exit_city=?,exit_type=?,exit_score=?,updated_at=?
                WHERE id=?""",
             (
                 merged["name"], merged["protocol"], merged["group"], merged["port"],
@@ -406,6 +422,8 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
                 1 if merged.get("selected") else 0,
                 merged.get("entryProto", "mixed"), merged.get("ssPass"),
                 merged.get("consecutiveFails", 0),
+                merged.get("exitCountry"), merged.get("exitFlag"), merged.get("exitCity"),
+                merged.get("exitType"), merged.get("exitScore"),
                 _conn_now(), node_id,
             ),
         )
