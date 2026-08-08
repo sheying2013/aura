@@ -1289,6 +1289,26 @@
       color: var(--ochre-gold);
     }
 
+    /* 订阅来源徽标：显示订阅名，hover 提示订阅 ID；stale 时警示色 */
+    .sub-tag {
+      font-size: 10px;
+      padding: 1px 5px;
+      margin-left: 6px;
+      background: rgba(122, 162, 247, 0.12);
+      color: #9db8f5;
+      border: 1px solid rgba(122, 162, 247, 0.25);
+      border-radius: 3px;
+      font-family: var(--font-code);
+      vertical-align: middle;
+      cursor: default;
+      white-space: nowrap;
+    }
+    .sub-tag.stale {
+      background: rgba(230, 126, 34, 0.10);
+      color: #e67e22;
+      border-color: rgba(230, 126, 34, 0.3);
+    }
+
     /* 出口 IP 情报：国旗 + 类型徽标 + 评分色阶 */
     .exit-ip-cell {
       display: inline-flex;
@@ -2203,6 +2223,7 @@
         edit:    '<path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3zm9-13 3 3"/>',
         download:'<path d="M12 3v10m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>',
         trash:   '<path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13"/>',
+        subscription: '<path d="M4 4h16v13H4zM4 9h16M4 21v-4h11v4"/><path d="M7 17v4h10v-4"/>',
       };
       return '<svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (P[name] || '') + '</svg>';
     }
@@ -4084,6 +4105,13 @@
       if (risk == null || risk === '') return '';
       return risk <= 50 ? 'low' : (risk <= 70 ? 'mid' : 'high');
     }
+    // 订阅来源徽标：有 subName 且非空才显示；stale 节点标警示色
+    function renderSubBadge(n) {
+      const sn = n.subName;
+      if (!sn) return '';
+      const cls = n.stale ? 'sub-tag stale' : 'sub-tag';
+      return `<span class="${cls}" title="来自订阅 ${escapeHtml(sn)}${n.subId ? '（' + escapeHtml(n.subId) + '）' : ''}${n.stale ? ' · 订阅刷新失败，使用上次快照' : ''}">${iconSvg('subscription')}${escapeHtml(sn)}</span>`;
+    }
     function renderExitIp(n) {
       const esc = v => escapeHtml(v);
       const flag = esc(n.exitFlag || '');
@@ -4141,7 +4169,7 @@
             <td>${escapeHtml(n.group || '默认分组')}</td>
             <td><span class="proto-tag">${n.protocol.toUpperCase()}</span></td>
             <td><span class="proto-tag" style="${n.entryProto === 'ss' ? 'background: var(--ochre-gold); color:#120e06;' : ''}">${(n.entryProto || 'mixed').toUpperCase()}</span></td>
-            <td style="font-weight: 500;" title="认证: ${n.authUser || ''}:${n.authPass || ''}${n.status === 'disabled' ? ' · 连续失败 ' + (n.consecutiveFails || 0) + ' 次已停用' : ''}">${escapeHtml(n.name)}${n.status === 'disabled' ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
+            <td style="font-weight: 500;" title="认证: ${n.authUser || ''}:${n.authPass || ''}${n.status === 'disabled' ? ' · 连续失败 ' + (n.consecutiveFails || 0) + ' 次已停用' : ''}">${escapeHtml(n.name)}${renderSubBadge(n)}${n.status === 'disabled' ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
             <td style="font-size:12px;" data-cell="ipq">${renderExitIp(n)}</td>
             <td style="font-family:var(--font-code);" data-cell="traffic">${formatBytes((n.upTraffic||0)+(n.downTraffic||0))}</td>
             <td style="font-family:var(--font-code); color:${n.ping < 80 ? 'var(--jade-green-glow)' : 'var(--ochre-gold)'}" data-cell="latency">${n.ping > 0 ? n.ping + 'ms' : 'timeout'}</td>
