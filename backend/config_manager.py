@@ -512,14 +512,25 @@ async def reload_config() -> bool:
     send_signal 只证明信号已发出，不代表重载成功——sing-box 收到 SIGHUP 后
     先 check()，新配置无效会保留旧实例。因此这里在发出后轮询 clash API：
     旧实例 close 再起新实例期间 /version 短暂不可达，恢复即视为重载成功。
+
+    host 网络下 sing-box 可能逃逸出容器 PID 空间（_proc 为 None 但 clash 探测
+    运行中），此时无法 send_signal，改用 pkill -HUP 按 config 路径匹配。
     """
     global _proc
-    if not is_running() or _proc is None:
+    if not is_running():
         return False
-    try:
-        _proc.send_signal(signal.SIGHUP)
-    except Exception:
-        return False
+    if _proc is not None:
+        try:
+            _proc.send_signal(signal.SIGHUP)
+        except Exception:
+            return False
+    else:
+        # _proc 丢失但 sing-box 仍在跑：pkill -HUP 按本面板 config 路径精确匹配
+        try:
+            subprocess.run(["pkill", "-HUP", "-f", f"sing-box run -c {CONFIG_PATH}"],
+                           capture_output=True, timeout=5)
+        except Exception:
+            return False
     # 等 clash API 恢复（旧实例关闭到新实例就绪的窗口 <1s 左右；最多 5s）
     hdrs = {"Authorization": f"Bearer {get_clash_secret()}"}
     try:
