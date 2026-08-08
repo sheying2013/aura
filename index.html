@@ -2152,8 +2152,13 @@
           }
           return true;
         }
-      } catch (e) { /* 401 已在 api() 内弹出登录 */ }
-      if (!authToken) { showLogin(true); return false; }
+      } catch (e) {
+        // 401 已在 api() 内弹出登录。token 过期/失效：清掉过期 token，
+        // 否则后续所有请求都带过期 Bearer 恒 401，loadNodes 会误判"后端不可达"
+        // 而走 localStorage 模式（__backendMode 不置位，导入只写浏览器不落库）。
+        authToken = '';
+        localStorage.removeItem(AUTH_TOKEN_KEY);
+      }
       showLogin(true);
       return false;
     }
@@ -2188,6 +2193,9 @@
           // "后端不可达" 而 __backendMode 未置位 → 导入/保存只写 localStorage 不落库。
           // 登录后带 token 重新拉取，置位后端模式，后续导入/保存才真正落 DB。
           loadNodesFromBackendOrStorage();
+          // 同步本地设置到后端：登录前 loadSettingsFromStorage 只在 localStorage，
+          // 后端 settings 表可能是空的（历史配置未同步），登录后推送一次保一致
+          syncSettingsToBackend();
         }
       } catch (e) { errEl.textContent = '网络错误：' + e.message; }
     }
@@ -2230,6 +2238,8 @@
           startTrafficSSE();
           // 首次登录强制改密场景：改密成功后同样重新加载节点（置位后端模式）
           loadNodesFromBackendOrStorage();
+          // 同步本地设置到后端（首次登录强制改密时后端可能还没有任何设置）
+          syncSettingsToBackend();
         }
         if (fromFirstLogin) {
           document.getElementById('pwd-overlay').style.display = 'none';
@@ -2863,6 +2873,39 @@
       document.getElementById('setting-sticky-enabled').checked = !!systemSettings.stickyEnabled;
       document.getElementById('setting-sticky-timeout').value = systemSettings.stickyTimeout || '5m';
       renderRelayDomainList();
+    }
+
+    // 登录成功后把本地（localStorage）设置同步到后端 DB：
+    // 登录前 loadSettingsFromStorage 只在本地加载（__backendMode 未置位），
+    // 若用户之前的配置（relay 域名/粘滞等）只存在于浏览器，此函数推送一次保证后端一致。
+    // 后端为空才推（避免覆盖后端已更新的配置）；已有数据则仅补齐缺失字段。
+    function syncSettingsToBackend() {
+      if (!window.__backendMode) return;
+      try {
+        api('/api/settings')
+          .then(resp => resp.ok ? resp.json() : Promise.reject('GET /api/settings ' + resp.status))
+          .then(backendSettings => {
+            const merged = Object.assign({}, backendSettings || {});
+            let needUpdate = false;
+            if (!merged.relayDomains || !merged.relayDomains.length) {
+              if (systemSettings.relayDomains && systemSettings.relayDomains.length) {
+                merged.relayDomains = systemSettings.relayDomains;
+                needUpdate = true;
+              }
+            }
+            for (const k of ['reservedPorts', 'listenIp', 'testUrl', 'stickyEnabled', 'stickyTimeout']) {
+              if (merged[k] === undefined || merged[k] === null) {
+                if (systemSettings[k] !== undefined) { merged[k] = systemSettings[k]; needUpdate = true; }
+              }
+            }
+            if (needUpdate) {
+              api('/api/settings', { method: 'PUT', body: JSON.stringify(merged) })
+                .then(resp => {
+                  if (resp.ok) addLog('INFO', '本地设置已同步到后端');
+                }).catch(() => {});
+            }
+          }).catch(() => {});
+      } catch(e) {}
     }
 
     function loadDemoNodes(shouldSave = true) {
