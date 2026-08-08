@@ -78,11 +78,25 @@ docker compose logs -f aura  # 实时日志
 ```bash
 docker build -t aura-panel .
 docker run -d --name aura-panel \
-  -p 19001:19001 \
+  --network host \
   -v "$(pwd)/data:/app/backend/data" \
   --restart unless-stopped \
   aura-panel
 ```
+
+> **必须使用 `--network host`**（host 网络）：面板端口 + 每个节点端口 + 域名轮询入口端口（如 33440）都直接监听宿主机，任意新增 relay 域名端口即时生效，无需逐个映射端口。
+
+### 生产更新（GitHub Actions 云端构建 + 一键部署）
+
+镜像在 GitHub Actions 云端多架构构建（amd64 + arm64）并推送到 GHCR，**服务器上不编译**，只拉取 + 重启：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sheying2013/aura/main/deploy.sh | bash
+```
+
+- 数据目录固定 `/opt/aura/data`（旧位置自动迁移，**更新不丢节点库/密码**）
+- 更新后保留现有登录密码（install.sh / deploy.sh 均不覆盖已有密码）
+- 环境变量：`AURA_PORT`（默认 19001）、`AURA_DATA_DIR`（默认 /opt/aura/data）
 
 ---
 
@@ -232,14 +246,17 @@ sudo systemctl enable --now aura.service
 
 - **多协议入站**：socks5 / http 双协议统一入站（mixed），或 Shadowsocks 单协议入站
 - **多协议出站**：ss / vmess / vless / trojan / hysteria2 / tuic / wireguard / socks / http 节点全部支持
-- **域名解析轮询入口**：多个独立域名入口，每个域名独立监听端口 + 独立分组，自动 urltest 轮询出口
+- **域名解析轮询入口**：多个独立域名入口，每个域名独立监听端口 + 独立分组，自动 urltest 轮询出口；入口保存后即时生效（自动热重载）
 - **真实探活**：通过 sing-box clash_api 对每个节点做真实延迟探测，离线节点自动标记
 - **实时流量统计**：全局速率 + 每节点归属流量，SSE 推送前端
 - **订阅管理**：URL 拉取、多格式解析（Base64 / Clash YAML / JSON / 明文）、6 小时自动刷新、last-good 快照兜底
+- **自动去重**：所有导入路径（批量导入 / 订阅导入 / 订阅刷新）按 server:port 自动去重，重复节点跳过并计数，不产生重复条目
 - **批量导入**：订阅一键导入，自动按名称判定高质量/普通分组，去重 + 分组继承
 - **三组分组**：高质量（ISP IP）/ 普通 / 代理池（独立分组名），一键重新分配端口
 - **面板认证**：登录门 + token 鉴权 + 强制首次改密 + 登录限流
-- **配置回滚**：配置校验失败自动回滚上一份好配置，sing-box 崩溃 10s 守护重启
+- **密码持久化**：更新 / 重跑安装脚本不重置已有密码，仅显式输入新密码才覆盖
+- **配置回滚 + 崩溃守护**：配置校验失败自动回滚上一份好配置；sing-box 进程崩溃 10s 内自动拉起（进程状态实时感知，不死锁）
+- **端口冲突检测**：应用配置前预检所有入站端口 + clash API 端口（9090），被占用时明确报错，不会静默启动失败
 
 ---
 
@@ -256,6 +273,12 @@ sudo systemctl enable --now aura.service
 
 **Q: 如何关闭认证（仅本地调试）？**
 启动时设置环境变量 `AUTH_DISABLED=1`。
+
+**Q: 新增节点/域名入口端口需要手动放行吗？**
+系统层不需要——面板用 host 网络模式运行，任何入站端口直接监听宿主机。唯一例外是**云服务商安全组**（如 Oracle Cloud Security List）：如果安全组是白名单模式，需要在控制台放行新端口；若安全组全放行（或未启用防火墙）则无需任何操作，新增端口即时可用。
+
+**Q: 节点重复导入会怎样？**
+自动去重。所有导入路径（批量导入 / 订阅导入 / 订阅刷新）按 `server:port` 判重，重复节点自动跳过并计数（前端提示「忽略 N 个（含重复）」），不会产生重复条目。
 
 **Q: sing-box 内核装不上怎么办？**
 确认架构（`uname -m`，arm64 需选 aarch64 包）与版本号，可手动下载后放到 `PATH`，用 `SINGBOX_BIN` 环境变量指定路径。

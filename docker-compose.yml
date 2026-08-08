@@ -1,5 +1,5 @@
 # Aura · SingBox 中转节点管理面板（Docker Compose）
-# 启动：docker compose up -d
+# 启动：docker compose up -d --build
 # 访问：http://<服务器IP>:19001/admin
 services:
   aura:
@@ -7,8 +7,9 @@ services:
     image: aura-panel:latest
     container_name: aura-panel
     restart: unless-stopped
-    ports:
-      - "19001:19001"   # 面板 WebUI
+    # host 网络：面板端口 + 节点端口 + 域名轮询入口端口（如 33440）全部直接
+    # 监听宿主机，任意新增 relay 域名端口即时生效（无需逐个映射端口）
+    network_mode: host
     volumes:
       # 持久化节点库 / 生成配置 / 运行日志
       - ./data:/app/backend/data
