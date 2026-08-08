@@ -267,6 +267,7 @@ const SubscriptionManager = (() => {
     const s = subscriptions.find(x => x.id === id);
     if (!s) return null;
     if (patch.name !== undefined) s.name = patch.name;
+    if (patch.url !== undefined) s.url = patch.url;
     if (patch.group !== undefined) s.group = patch.group;
     if (patch.authUser !== undefined) s.authUser = patch.authUser;
     if (patch.authPass !== undefined) s.authPass = patch.authPass;

@@ -405,17 +405,17 @@
       flex-wrap: wrap;
       justify-content: center;
       align-content: center;
-      gap: 6px;
-      padding: 3px;
+      gap: 5px;
+      padding: 6px;
       flex: 1;
       min-height: 0;
     }
 
     .matrix-dot {
-      width: 26px;
-      height: 26px;
+      width: 10px;
+      height: 10px;
       flex: 0 0 auto;
-      border-radius: 6px;
+      border-radius: 50%;
       background: rgba(180, 165, 140, 0.15);
       border: 1px solid rgba(180, 165, 140, 0.2);
       transition: all 0.3s ease;
@@ -425,7 +425,7 @@
     .matrix-dot.online {
       background: var(--jade-green);
       border-color: var(--jade-green-glow);
-      box-shadow: 0 0 6px rgba(76, 217, 149, 0.35);
+      box-shadow: 0 0 4px rgba(76, 217, 149, 0.5);
       animation: matrixPulse 3s infinite ease-in-out;
     }
 
@@ -437,7 +437,7 @@
     .matrix-dot.active {
       background: var(--cinnabar-red);
       border-color: #ff6b6b;
-      box-shadow: 0 0 8px rgba(200, 60, 35, 0.85);
+      box-shadow: 0 0 6px rgba(200, 60, 35, 0.85);
       animation: matrixPulseRed 1.2s infinite ease-in-out;
     }
 
@@ -3348,10 +3348,12 @@
       addLog('INFO', '已删除订阅及其节点');
     }
 
-    // 编辑订阅：改名/分组/自定义 socks 认证（覆盖导入时的随机认证）
+    // 编辑订阅：改链接/名称/分组/自定义 socks 认证（覆盖导入时的随机认证）
     function editSubscription(id) {
       const sub = window.SubscriptionManager.getSubs().find(x => x.id === id);
       if (!sub) return;
+      const url = prompt('订阅链接：', sub.url || '');
+      if (url === null) return;
       const name = prompt('订阅名称：', sub.name || '');
       if (name === null) return;
       const group = prompt('归属分组（留空保持）：', sub.group || '订阅节点');
@@ -3361,13 +3363,15 @@
       const authPass = prompt('自定义 socks5/http 密码（留空保持随机）：', sub.authPass || '');
       if (authPass === null) return;
       window.SubscriptionManager.updateSub(id, {
+        url: url.trim() || sub.url,
         name: name.trim() || sub.name,
         group: group.trim() || sub.group,
         authUser: authUser.trim(),
         authPass: authPass.trim(),
       });
       const updated = window.SubscriptionManager.getSubs().find(x => x.id === id);
-      addLog('INFO', `订阅 [${updated.name}] 已更新（分组: ${updated.group}${updated.authUser ? `，自定义认证: ${updated.authUser}:***` : '，保持随机认证'}`);
+      const urlChanged = updated.url !== sub.url;
+      addLog('INFO', `订阅 [${updated.name}] 已更新（分组: ${updated.group}${updated.authUser ? `，自定义认证: ${updated.authUser}:***` : '，保持随机认证'}${urlChanged ? '，链接已修改' : ''}`);
 
       // 认证/分组变更 → 应用到该订阅已导入的节点（重新导入覆盖认证）
       const nodeIds = nodeState.filter(n => n.subId === id).map(n => n.id);
