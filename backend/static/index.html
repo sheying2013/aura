@@ -2102,6 +2102,8 @@
     /* ==========================================
        0. 认证模块：登录门 / token / 改密 / 登出
        ========================================== */
+    const APP_VERSION = 'v1.3.0-loginfix';
+    console.log('[Aura] 版本 ' + APP_VERSION + ' · 后端模式: ' + (window.__backendMode ? 'on' : 'off'));
     const AUTH_TOKEN_KEY = 'sb_auth_token';
     let authToken = localStorage.getItem(AUTH_TOKEN_KEY) || '';
 
@@ -2774,13 +2776,13 @@
               return n;
             });
             // 后端空 + 浏览器 localStorage 有旧节点（历史 bug 遗留：保存只写 localStorage）
-            // → 提示一键迁移，否则用户以为节点丢了
+            // → 自动迁移到后端（不再用 confirm 弹窗——用户可能忽略导致节点永远留在浏览器，
+            //   登录后后端空列表覆盖显示 → "登录后还是空"）。自动迁移成功后页面直接显示节点。
             const localNodes = loadLocalNodes();
             if (data.items.length === 0 && localNodes.length > 0 && !window.__migratePromptShown) {
               window.__migratePromptShown = true;
-              if (confirm(`检测到本地浏览器中还保存着 ${localNodes.length} 个节点（早期版本未同步到服务器）。\n\n是否一键导入到服务器？`)) {
-                migrateLocalNodesToBackend(localNodes);
-              }
+              addLog('WARN', `检测到浏览器本地 ${localNodes.length} 个节点未同步到服务器，自动导入中…`);
+              migrateLocalNodesToBackend(localNodes);
             }
             renderAll();
             return;
