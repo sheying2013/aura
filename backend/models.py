@@ -97,6 +97,7 @@ class PortUpdateRequest(BaseModel):
 class PingRequest(BaseModel):
     ids: Optional[List[str]] = None
     all: bool = True
+    includeDisabled: bool = False
 
 
 class PingResultItem(BaseModel):

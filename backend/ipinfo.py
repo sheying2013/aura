@@ -237,3 +237,73 @@ def lookup_ping0(ip: str, nodes) -> Dict[str, Any]:
                 _ping0_cache.clear()
             return data
     return {}
+
+
+# ---------- IPPure 增强（fraudScore/是否住宅，经节点代理） ----------
+
+_IPPURE_TTL = 7 * 24 * 3600
+_ippure_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _fetch_ippure_via_proxy(proxy_url: str, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
+    """经 HTTP 代理调 my.ippure.com/v1/info（返回调用方 IP 情报）。"""
+    try:
+        import urllib.request
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        req = urllib.request.Request("https://my.ippure.com/v1/info",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        body = opener.open(req, timeout=timeout).read().decode("utf-8", errors="replace")
+        import json
+        d = json.loads(body)
+        if not isinstance(d, dict):
+            return None
+        return d
+    except Exception:
+        return None
+
+
+def _parse_ippure(d: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    fs = d.get("fraudScore")
+    if isinstance(fs, (int, float)):
+        out["exitRisk"] = int(fs)  # 与 ping0 风控值同字段：越低越纯净
+    out["exitResidential"] = bool(d.get("isResidential"))
+    cc = (d.get("countryCode") or "").upper()
+    if cc and len(cc) == 2:
+        out["exitCountry"] = country_cn(cc)
+        out["exitFlag"] = country_flag(cc)
+    if d.get("city"):
+        out["exitCity"] = d["city"]
+    if d.get("asn"):
+        out["exitAsn"] = f"AS{d['asn']}"
+    return out
+
+
+def lookup_ippure(nodes) -> Dict[str, Any]:
+    """经节点代理查 IPPure 出口情报（fraudScore/住宅性）。返回调用方（节点出口）IP 的数据。"""
+    if not nodes:
+        return {}
+    # 任意节点代理都可查（返回的是该节点的出口 IP），逐个尝试直到成功
+    for n in nodes:
+        port = n.get("port")
+        user = n.get("authUser") or "user"
+        passwd = n.get("authPass") or "pass"
+        proxy = f"http://{user}:{passwd}@127.0.0.1:{port}"
+        d = _fetch_ippure_via_proxy(proxy)
+        if not d:
+            continue
+        ip = d.get("ip")
+        if not ip:
+            continue
+        ent = _ippure_cache.get(ip)
+        if ent and time.time() - ent["ts"] < _IPPURE_TTL:
+            data = ent["data"]
+        else:
+            data = _parse_ippure(d)
+            data["exitIp"] = ip
+            _ippure_cache[ip] = {"ts": time.time(), "data": data}
+            if len(_ippure_cache) > 2000:
+                _ippure_cache.clear()
+        return data
+    return {}

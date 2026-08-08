@@ -20,7 +20,7 @@ _ip_enrich_pending: set = set()  # 防同一节点并发重复查
 
 
 def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
-    """探活成功后惰性补查出口 IP 情报（归属地/评分 + ping0 风控值），已有关键情报则跳过。"""
+    """探活成功后惰性补查出口 IP 情报（归属地/评分 + ippure/ping0 风控值），已齐全则跳过。"""
     ip = node.get("exitIp")
     nid = node["id"]
     if not ip or ip in ("N/A", "1.1.1.1"):
@@ -39,15 +39,25 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
             patch = {k: info[k] for k in
                      ("exitCountry", "exitFlag", "exitCity", "exitType", "exitScore")
                      if k in info}
-            # 缺 ping0 风控值时经在线节点代理补查（失败降级保留基础情报）
-            if patch and (node.get("exitRisk") is None or patch.get("exitCountry")):
+            # 风控值：优先 ippure（fraudScore，无验证稳定），失败再 ping0
+            if patch and node.get("exitRisk") is None:
                 try:
                     async with _ip_enrich_sem:
                         online = [n for n in db.list_nodes()
                                   if n.get("status") == "online" and n.get("port") != node.get("port")]
-                        p0 = await asyncio.to_thread(ipinfo.lookup_ping0, ip, online[:10])
-                    if p0:
-                        patch["exitRisk"] = p0.get("exitRisk")
+                        if node.get("status") == "online":
+                            online = [node] + online  # 目标节点在线时优先经它自己查
+                        ipr = await asyncio.to_thread(ipinfo.lookup_ippure, online[:8])
+                    if ipr.get("exitRisk") is not None:
+                        patch["exitRisk"] = ipr["exitRisk"]
+                    elif patch.get("exitCountry"):
+                        try:
+                            async with _ip_enrich_sem:
+                                p0 = await asyncio.to_thread(ipinfo.lookup_ping0, ip, online[:10])
+                            if p0.get("exitRisk") is not None:
+                                patch["exitRisk"] = p0["exitRisk"]
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             if patch:
@@ -70,11 +80,15 @@ _guard_paused = False
 DISABLE_AFTER_FAILS = 5   # 连续失败 ≥5 次 → 自动停用（不参与轮询/探活）
 DELETE_AFTER_FAILS = 10   # 连续失败 ≥10 次 → 自动删除（释放端口）
 
-async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> List[Dict[str, Any]]:
+async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
+                      include_disabled: bool = False) -> List[Dict[str, Any]]:
     """对节点经 clash API 并发探活。返回 {id, tag, ping, status, error}。
 
     失败计数：连续失败 DISABLE_AFTER_FAILS 次自动停用（status=disabled），
     达到 DELETE_AFTER_FAILS 次自动删除节点并重建配置；成功即清零。
+
+    include_disabled=True（手动测活停用节点）时：临时启用 disabled 节点（生成
+    outbound）→ 探活 → 失败恢复 disabled，通过则保持在线。
     """
     import config_manager as cm
 
@@ -83,8 +97,24 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> Lis
     nodes = db.list_nodes()
     if not all_ and ids:
         nodes = [n for n in nodes if n["id"] in ids]
-    # 已停用的节点跳过探活（前端可手动重新启用）
+    # 默认跳过 disabled；手动测活（include_disabled）时临时启用
+    disabled_ids = [n["id"] for n in nodes if n.get("status") == "disabled"]
     nodes = [n for n in nodes if n.get("status") != "disabled"]
+    # 只临时启用本次目标范围内的 disabled 节点（all_=全部；ids=仅指定的），
+    # 避免把所有停用节点一起重建进 sing-box 占用端口、探活后又恢复不回来。
+    target_disabled = [nid for nid in disabled_ids if (all_ or (ids and nid in ids))]
+    if include_disabled and target_disabled:
+        for nid in target_disabled:
+            db.update_node(nid, {"status": "offline", "consecutiveFails": 0})
+        try:
+            await cm.apply_config()  # 重建配置含临时启用的节点
+        except Exception:
+            pass
+        # 重新拉取含临时启用节点的列表
+        nodes = db.list_nodes()
+        if not all_ and ids:
+            nodes = [n for n in nodes if n["id"] in ids]
+        nodes = [n for n in nodes if n.get("status") != "disabled"]
 
     async def _probe_one(node: Dict[str, Any]) -> Dict[str, Any]:
         tag = cm.outbound_tag(node["protocol"], node["port"])
@@ -116,19 +146,27 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> Lis
     # 注意：只标记需要重建，循环结束后统一 apply 一次——每个节点单独 apply_config
     # 会触发大量 reload，sing-box 反复重启累积 TIME-WAIT 导致 bind 冲突（1.7.7 无 SO_REUSEADDR）
     need_rebuild = False
+    # 手动测活的 disabled 节点：失败直接恢复 disabled（不计连续失败），成功保持在线
+    manual_disabled = set(target_disabled) if include_disabled else set()
     for node, res in zip(nodes, results):
+        nid = node["id"]
         if res.get("status") == "online":
-            db.update_node_probe(node["id"], res.get("ping", 0), "online")  # 成功清零
+            db.update_node_probe(nid, res.get("ping", 0), "online")  # 成功清零
             _lazy_enrich_ip(node)
             continue
-        fails = db.update_node_probe(node["id"], 0, "offline")  # 失败 +1 并返回累计值
+        if nid in manual_disabled:
+            # 手动测活失败：恢复 disabled（避免生成 outbound 占用端口）
+            db.update_node(nid, {"status": "disabled", "consecutiveFails": 0})
+            need_rebuild = True
+            continue
+        fails = db.update_node_probe(nid, 0, "offline")  # 失败 +1 并返回累计值
         if fails >= DELETE_AFTER_FAILS:
             print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动删除")
-            db.delete_node(node["id"])
+            db.delete_node(nid)
             need_rebuild = True
         elif fails >= DISABLE_AFTER_FAILS:
             print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动停用")
-            db.update_node(node["id"], {"status": "disabled"})
+            db.update_node(nid, {"status": "disabled"})
             need_rebuild = True
     if need_rebuild:
         try:

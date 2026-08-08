@@ -106,6 +106,11 @@ def init_db() -> None:
               key   TEXT PRIMARY KEY,
               value TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS deleted_fingerprints (
+              fingerprint TEXT PRIMARY KEY,
+              created_at  INTEGER
+            );
             """
         )
         # 老库迁移：补 entry_proto / ss_pass 列（节点对外入口协议 + ss 密码）
@@ -350,6 +355,8 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
                     existing_servers.add((str(srv), int(sp)))
             except Exception:
                 pass
+        # 已删除节点指纹（sub_id|server|port）：订阅刷新不重复导入
+        deleted_fps = {r["fingerprint"] for r in c.execute("SELECT fingerprint FROM deleted_fingerprints")}
         batch_ports = set()
         for nd in nodes:
             # 每个节点必须带 id（前端 batch payload / 订阅导入都不传，由后端生成）
@@ -365,6 +372,10 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
                     skipped += 1
                     continue
                 existing_servers.add(key)
+                # 已删除节点指纹：订阅刷新时不重复导入（仅跳过，不占 duplicate 计数）
+                if nd.get("subId") and f"{nd['subId']}|{srv}|{sp}" in deleted_fps:
+                    skipped += 1
+                    continue
             # 端口冲突则跳过（不入库，避免 IntegrityError 中断整批）
             port = nd.get("port")
             db_used = {r[0] for r in c.execute("SELECT port FROM nodes")} | {r[0] for r in c.execute("SELECT port FROM relay_domains")}
@@ -481,7 +492,10 @@ def update_node_port(node_id: str, port: Optional[int]) -> Optional[Dict]:
 def delete_node(node_id: str) -> bool:
     with _lock:
         c = connect()
+        node = c.execute("SELECT raw_config, sub_id FROM nodes WHERE id = ?", (node_id,)).fetchone()
         cur = c.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+        if cur.rowcount > 0 and node:
+            _record_deleted(c, node)
         c.commit()
         return cur.rowcount > 0
 
@@ -489,9 +503,41 @@ def delete_node(node_id: str) -> bool:
 def delete_node_batch(ids: List[str]) -> int:
     with _lock:
         c = connect()
+        marks = []
+        for nid in ids:
+            node = c.execute("SELECT raw_config, sub_id FROM nodes WHERE id = ?", (nid,)).fetchone()
+            if node:
+                marks.append(node)
         cur = c.execute("DELETE FROM nodes WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)
+        for node in marks:
+            _record_deleted(c, node)
         c.commit()
         return cur.rowcount
+
+
+def _record_deleted(c: sqlite3.Connection, node_row) -> None:
+    """记录已删除节点指纹（sub_id + server:port），订阅刷新不再重复导入。"""
+    rc = json.loads(node_row["raw_config"] or "{}")
+    srv = rc.get("server") or rc.get("address")
+    sp = rc.get("server_port") or rc.get("port")
+    sub_id = node_row["sub_id"]
+    if not srv or not sp or not sub_id:
+        return
+    fp = f"{sub_id}|{srv}|{sp}"
+    c.execute("INSERT OR IGNORE INTO deleted_fingerprints (fingerprint, created_at) VALUES (?, ?)",
+              (fp, _conn_now()))
+
+
+def deleted_fingerprints(sub_id: Optional[str] = None) -> set:
+    """订阅指纹集合（sub_id 过滤可选）。"""
+    with _lock:
+        c = connect()
+        if sub_id:
+            rows = c.execute("SELECT fingerprint FROM deleted_fingerprints WHERE fingerprint LIKE ?",
+                             (f"{sub_id}|%",)).fetchall()
+        else:
+            rows = c.execute("SELECT fingerprint FROM deleted_fingerprints").fetchall()
+        return {r["fingerprint"] for r in rows}
 
 
 def add_traffic(node_id: str, up_delta: int, down_delta: int) -> None:

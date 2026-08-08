@@ -297,7 +297,8 @@ def reset_all_traffic():
 
 @app.post("/api/nodes/ping", response_model=List[models.PingResultItem], dependencies=[Depends(require_auth)])
 async def ping_nodes(body: models.PingRequest):
-    return await scheduler.probe_nodes(ids=body.ids, all_=body.all)
+    return await scheduler.probe_nodes(ids=body.ids, all_=body.all,
+                                       include_disabled=body.includeDisabled)
 
 
 @app.get("/api/nodes/{node_id}/exit-ip", dependencies=[Depends(require_auth)])

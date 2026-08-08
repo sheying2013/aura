@@ -1881,9 +1881,9 @@
                 <th style="width: 70px;">协议</th>
                 <th style="width: 70px;">入口</th>
                 <th>节点备注</th>
+                <th style="width: 150px;">IP 质量</th>
                 <th style="width: 86px;">流量</th>
                 <th style="width: 62px;">延迟</th>
-                <th style="width: 96px;">出口 IP</th>
                 <th style="width: 128px; text-align: center;">操作</th>
               </tr>
             </thead>
@@ -2576,8 +2576,10 @@
         trafficHistory.shift();
       }
 
-      // 实时递增当前在线节点的微小流量
-      if (nodeState.length > 0) {
+      // 实时递增当前在线节点的微小流量——仅本地预览/无后端（SSE 未连）时用模拟值；
+      // SSE 已连时累计流量由后端 stats 真实驱动（node.upTraffic = ns.upTraffic），
+      // 再加模拟值会叠加上虚高导致累计流量严重不准。
+      if (!sseConnected && nodeState.length > 0) {
         const onlineNodes = nodeState.filter(n => n.status === 'online');
         if (onlineNodes.length > 0) {
           const bytesToAddUp = Math.floor((realtimeUpSpeed * 1024 * 1024) / onlineNodes.length);
@@ -3126,6 +3128,11 @@
       const authPass = document.getElementById('import-auth-pass').value.trim();
       const entryProto = document.getElementById('import-entry-proto') ? document.getElementById('import-entry-proto').value : 'mixed';
       const ssPass = document.getElementById('import-ss-pass') ? document.getElementById('import-ss-pass').value.trim() : '';
+
+      // 持久化 socks5 认证，下次打开批量导入自动回填
+      try {
+        localStorage.setItem('aura_import_auth', JSON.stringify({ user: authUser, pass: authPass }));
+      } catch (e) {}
 
       if (!text) {
         alert('请先粘贴节点订阅/单链接！');
@@ -3910,6 +3917,14 @@
 
       if (tabKey === 'config') generateSingboxConfig();
       if (tabKey === 'export') generateExportText();
+      if (tabKey === 'import') {
+        // 回填上次导入的 socks5 认证（持久化到 localStorage，避免每次重复输入）
+        try {
+          const saved = JSON.parse(localStorage.getItem('aura_import_auth') || '{}');
+          if (saved.user) document.getElementById('import-auth-user').value = saved.user;
+          if (saved.pass) document.getElementById('import-auth-pass').value = saved.pass;
+        } catch (e) {}
+      }
     }
 
     function renderAll() {
@@ -4111,12 +4126,13 @@
             <td><span class="proto-tag">${n.protocol.toUpperCase()}</span></td>
             <td><span class="proto-tag" style="${n.entryProto === 'ss' ? 'background: var(--ochre-gold); color:#120e06;' : ''}">${(n.entryProto || 'mixed').toUpperCase()}</span></td>
             <td style="font-weight: 500;" title="认证: ${n.authUser || ''}:${n.authPass || ''}${n.status === 'disabled' ? ' · 连续失败 ' + (n.consecutiveFails || 0) + ' 次已停用' : ''}">${escapeHtml(n.name)}${n.status === 'disabled' ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
+            <td style="font-size:12px;">${renderExitIp(n)}</td>
             <td style="font-family:var(--font-code);">${formatBytes((n.upTraffic||0)+(n.downTraffic||0))}</td>
             <td style="font-family:var(--font-code); color:${n.ping < 80 ? 'var(--jade-green-glow)' : 'var(--ochre-gold)'}">${n.ping > 0 ? n.ping + 'ms' : 'timeout'}</td>
-            <td style="font-size:12px;">${renderExitIp(n)}</td>
             <td style="text-align: center; white-space: nowrap;">
               ${n.status === 'disabled'
-                ? `<button class="btn btn-secondary btn-xs" onclick="enableNode('${n.id}')" title="重新启用">启用</button>`
+                ? `<button class="btn btn-secondary btn-xs" onclick="enableNode('${n.id}')" title="重新启用">启用</button>
+                   <button class="btn btn-outline btn-xs" onclick="pingSingleNode('${n.id}', true)" title="临时启用测活（失败自动恢复停用）">${iconSvg('bolt')}测活</button>`
                 : `<button class="btn btn-gold btn-xs" onclick="pingSingleNode('${n.id}')" title="探活">${iconSvg('bolt')}</button>`}
               <button class="btn btn-secondary btn-xs" onclick="openEditNode('${n.id}')" title="编辑/重命名">${iconSvg('edit')}</button>
               <button class="btn btn-outline btn-xs" onclick="exportSingleNode('${n.id}')" title="导出">${iconSvg('download')}</button>
@@ -4164,7 +4180,7 @@
     /* ==========================================
        8. 节点探活与操作
        ========================================== */
-    function pingSingleNode(nodeId) {
+    function pingSingleNode(nodeId, includeDisabled) {
       const node = nodeState.find(n => n.id === nodeId);
       if (!node) return;
 
@@ -4174,13 +4190,17 @@
         api('/api/nodes/ping', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids: [nodeId], all: false }),
+          body: JSON.stringify({ ids: [nodeId], all: false, includeDisabled: includeDisabled || false }),
         }).then(resp => resp.ok ? resp.json() : Promise.reject('探活 API ' + resp.status))
         .then(items => {
           if (items && items[0]) {
             const it = items[0];
             const n = nodeState.find(x => x.id === nodeId);
-            if (n) { n.ping = it.ping || 0; n.status = it.status || 'offline'; }
+            if (n) {
+              n.ping = it.ping || 0;
+              // 停用节点手动测活失败：后端会恢复 disabled，前端同步状态
+              n.status = (includeDisabled && it.status !== 'online') ? 'disabled' : (it.status || 'offline');
+            }
             addLog(it.status === 'online' ? 'SUCCESS' : 'WARN',
               `节点 [${node.name}] 探活：${it.status === 'online' ? '延迟 ' + it.ping + 'ms' : (it.error || '离线')}`);
             renderNodesTable(); renderQuickStats();
