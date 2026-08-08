@@ -68,10 +68,13 @@ detect_os() {
 }
 
 detect_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64)  echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    *) fail "不支持的架构: $(uname -m)" ;;
+  local m
+  m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64|x64|intel)      echo "amd64" ;;
+    aarch64|arm64|armv8|armv8l)  echo "arm64" ;;
+    armv7l|armv7|armhf)          echo "armv7" ;;
+    *) fail "不支持的架构: $m" ;;
   esac
 }
 
@@ -111,12 +114,29 @@ install_singbox() {
     return
   fi
   info "下载 sing-box v${SINGBOX_VERSION:-1.7.7} ($OS-$ARCH)..."
+  if [ "$ARCH" = "armv7" ]; then
+    fail "sing-box 不提供 32 位 ARM 资产，请用 64 位系统（arm64/amd64）"
+  fi
   TARBALL="sing-box-${SINGBOX_VERSION:-1.7.7}-${OS}-${ARCH}.tar.gz"
   curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION:-1.7.7}/${TARBALL}" -o /tmp/singbox.tar.gz
   tar -xzf /tmp/singbox.tar.gz -C /tmp
   cp "/tmp/sing-box-${SINGBOX_VERSION:-1.7.7}-${OS}-${ARCH}/sing-box" "$SB_BIN"
   chmod +x "$SB_BIN"
+  # macOS：解除 Gatekeeper 隔离，否则直接运行报"来自身份不明的开发者"
+  if [ "$OS" = "darwin" ]; then
+    xattr -d com.apple.quarantine "$SB_BIN" 2>/dev/null || true
+  fi
   rm -rf /tmp/singbox.tar.gz /tmp/sing-box-*
+  # 确保 BIN_DIR 在 PATH 中（macOS 默认不含 ~/.local/bin）
+  if ! echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
+    export PATH="$BIN_DIR:$PATH"
+    if [ -f "$HOME/.zshrc" ]; then
+      echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc" 2>/dev/null || true
+    fi
+    if [ -f "$HOME/.bashrc" ]; then
+      echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc" 2>/dev/null || true
+    fi
+  fi
   export SINGBOX_BIN="$SB_BIN"
   ok "sing-box 已安装到 $SB_BIN"
 }
@@ -274,7 +294,52 @@ EOF
 }
 
 start_mac() {
-  warn "macOS 不注册后台服务，请保持本窗口运行，或自行配置 launchd："
+  # 询问是否注册 launchd 后台服务（开机自启）
+  if [ "${AURA_SKIP_INPUT}" != "1" ]; then
+    local ans
+    printf "注册 macOS 后台服务（launchd，开机自启）？[y/N] "
+    read -r ans
+    if [ "${ans:-N}" = "y" ] || [ "${ans:-N}" = "Y" ]; then
+      PLIST="$HOME/Library/LaunchAgents/com.aura.panel.plist"
+      mkdir -p "$HOME/Library/LaunchAgents"
+      cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aura.panel</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$SRC_DIR/backend/start.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$SRC_DIR/backend</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SINGBOX_BIN</key>
+        <string>${SINGBOX_BIN:-sing-box}</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$SRC_DIR/backend/data/panel-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$SRC_DIR/backend/data/panel-stderr.log</string>
+</dict>
+</plist>
+EOF
+      launchctl unload "$PLIST" 2>/dev/null || true
+      launchctl load "$PLIST"
+      ok "已注册 launchd 服务（开机自启 + 崩溃自动重启）"
+      echo "  http://127.0.0.1:${PORT}${PATH_PREFIX}"
+      return
+    fi
+  fi
+  warn "前台运行（后台服务未注册），保持本窗口即可："
   warn "  $SRC_DIR/backend/start.sh"
   cd "$SRC_DIR/backend"
   exec bash start.sh
