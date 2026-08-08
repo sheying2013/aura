@@ -262,6 +262,23 @@ def rename_group(old_name: str, new_name: str) -> Dict[str, Any]:
                 groups = [new_name if g == old_name else g for g in groups]
                 c.execute("UPDATE relay_domains SET groups=? WHERE id=?", (json.dumps(groups), r["id"]))
                 relay_updated += 1
+        # settings.relayDomains 同步更新（否则前端下次保存设置会用旧分组名回退）
+        if relay_updated:
+            srow = c.execute("SELECT value FROM settings WHERE key='system'").fetchone()
+            if srow:
+                try:
+                    s = json.loads(srow["value"] or "{}")
+                except Exception:
+                    s = {}
+                changed = False
+                for rd in s.get("relayDomains", []) or []:
+                    gs = rd.get("groups") or ["ALL"]
+                    if old_name in gs and "ALL" not in gs:
+                        rd["groups"] = [new_name if g == old_name else g for g in gs]
+                        changed = True
+                if changed:
+                    c.execute("UPDATE settings SET value=? WHERE key='system'",
+                              (json.dumps(s, ensure_ascii=False),))
         c.commit()
         return {"updated": updated, "relayUpdated": relay_updated}
 
