@@ -1,0 +1,34 @@
+# ========== 敏感数据 - 严禁推送 ==========
+# 项目说明文档（本地维护，永不入库）
+代码概要.md
+
+# .gitattributes 严禁推送
+.gitattributes
+
+# 运行时数据（真实节点库 / 生成配置 / 日志 / clash secret）
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# 本地截图（可能含真实节点信息）
+screenshots/
+
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# ========== 环境与密钥 ==========
+.env
+.env.*
+*.pem
+*.key
+
+# ========== 系统 / 工具 ==========
+.DS_Store
+.claude/
+Thumbs.db

@@ -1,0 +1,18 @@
+# Aura · SingBox 中转节点管理面板（Docker Compose）
+# 启动：docker compose up -d
+# 访问：http://<服务器IP>:19001/admin
+services:
+  aura:
+    build: .
+    image: aura-panel:latest
+    container_name: aura-panel
+    restart: unless-stopped
+    ports:
+      - "19001:19001"   # 面板 WebUI
+    volumes:
+      # 持久化节点库 / 生成配置 / 运行日志
+      - ./data:/app/backend/data
+    environment:
+      - SINGBOX_BIN=/usr/local/bin/sing-box
+      # 认证开关：1=关闭认证（仅本地调试），0/缺省=开启认证
+      - AUTH_DISABLED=0

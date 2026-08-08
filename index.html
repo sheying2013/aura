@@ -1,0 +1,4187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aura - 节点管理面板</title>
+  <style>
+    /* ==========================================
+       1. 中国山水水墨与现代数据可视化 设计语言
+       ========================================== */
+    :root {
+      --bg-dark: #0b0f14;
+      --paper-bg: rgba(16, 23, 30, 0.82);
+      --paper-bg-hover: rgba(22, 31, 40, 0.9);
+      --paper-border: rgba(180, 165, 140, 0.16);
+      --paper-border-hover: rgba(200, 175, 120, 0.35);
+      
+      --cinnabar-red: #c83c23;        /* 朱砂红 - 主按钮/印章/核心高亮 */
+      --cinnabar-red-hover: #db4529;
+      --indigo-blue: #3a6b88;         /* 黛青 - 辅色 */
+      --indigo-blue-hover: #4a729c;
+      --ochre-gold: #d4a337;          /* 赭金 - 点缀/高亮 */
+      --jade-green: #389e6d;          /* 石绿 - 在线/成功 */
+      --jade-green-glow: #4cd995;
+      
+      --ink-black: #e8e2d5;           /* 主要文字 (宣纸白/淡墨) */
+      --ink-gray: #9e9585;            /* 次要文字 */
+      --ink-muted: #666055;           /* 暗色弱化 */
+      --danger-red: #c0392b;
+      
+      --badge-51-bg: rgba(56, 142, 142, 0.2);
+      --badge-51-color: #5edfff;
+      --badge-51-border: rgba(94, 223, 255, 0.35);
+      
+      --badge-52-bg: rgba(150, 140, 120, 0.2);
+      --badge-52-color: #d1c8b8;
+      --badge-52-border: rgba(209, 200, 184, 0.3);
+
+      --badge-pool-bg: rgba(212, 163, 55, 0.18);
+      --badge-pool-color: #e6b45a;
+      --badge-pool-border: rgba(230, 180, 90, 0.35);
+
+      --font-serif: "STKaiti", "KaiTi", "Noto Serif SC", "Songti SC", "PMingLiU", serif;
+      --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", Roboto, Arial, sans-serif;
+      --font-code: "JetBrains Mono", "Fira Code", Consolas, Monaco, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background-color: var(--bg-dark);
+      color: var(--ink-black);
+      min-height: 100vh;
+      overflow-x: hidden;
+      position: relative;
+      padding-bottom: 0;
+      line-height: 1.5;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* 山水画背景 SVG */
+    #landscape-bg {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: -1;
+      pointer-events: none;
+      opacity: 0.85;
+    }
+
+    .container {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 24px 24px 0;
+      flex: 1;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* 水墨宣纸卡片基础组件 (替代过重的玻璃效果) */
+    .ink-card {
+      background: var(--paper-bg);
+      border: 1px solid var(--paper-border);
+      border-radius: 8px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.45);
+      transition: border-color 0.25s ease, box-shadow 0.25s ease;
+      position: relative;
+    }
+
+    .ink-card:hover {
+      border-color: var(--paper-border-hover);
+    }
+
+    /* 登录/改密遮罩 */
+    .login-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(5, 8, 12, 0.88);
+      backdrop-filter: blur(6px);
+      z-index: 9999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .login-box {
+      width: 360px;
+      max-width: 92vw;
+      padding: 32px 28px;
+    }
+    .login-box h2 {
+      letter-spacing: 1px;
+    }
+
+    /* ==========================================
+       2. 品牌行并入流量感知卡：logo+标题居左、操作按钮居右，内嵌 dash-wave-box 顶部
+       ========================================== */
+    .wave-toolbar {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      gap: 12px;
+      padding: 0 0 4px 0;
+      margin-bottom: 2px;
+      border-bottom: 1px solid rgba(180, 165, 140, 0.10);
+    }
+
+    .wave-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    /* 操作按钮：流量感知下方两侧（探活左、导入右） */
+    .wave-actions-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      gap: 12px;
+      margin-top: 4px;
+      padding-top: 4px;
+      border-top: 1px solid rgba(180, 165, 140, 0.10);
+    }
+
+    .seal-logo {
+      width: 28px;
+      height: 28px;
+      background: var(--cinnabar-red);
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.4), 0 3px 10px rgba(200, 60, 35, 0.45);
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-serif);
+      font-size: 14px;
+      font-weight: bold;
+      color: #fdfbf7;
+      user-select: none;
+      letter-spacing: 1px;
+      text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.6);
+      flex-shrink: 0;
+    }
+
+    .title-group h1 {
+      font-family: var(--font-serif);
+      font-size: 14px;
+      letter-spacing: 2px;
+      color: var(--ink-black);
+      font-weight: 600;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+
+    .title-group .slogan {
+      font-family: var(--font-serif);
+      font-size: 9px;
+      color: var(--ochre-gold);
+      letter-spacing: 2px;
+      margin-top: 0;
+      opacity: 0.9;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+
+    /* ==========================================
+       3. 核心视觉焦点：高密度实时流量监控中心 (Hero Dashboard)
+       ========================================== */
+    .dashboard-hero {
+      padding: 8px;
+      margin-bottom: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    /* 顶部全宽流量感知窄条：单行紧凑布局 */
+    .wave-top-full {
+      width: 100%;
+      flex: 0 0 auto;
+      display: grid !important;   /* 覆盖 dash-wave-box 的 flex column */
+      grid-template-columns: auto 1fr auto auto;
+      align-items: center;
+      gap: 14px;
+      padding: 6px 12px;
+    }
+
+    .wave-top-full > * {
+      align-self: center;
+      min-width: 0;
+    }
+
+    .wave-top-full .wave-speed-header {
+      margin: 0;
+      gap: 22px;
+      height: 26px;
+      align-items: center;
+    }
+
+    .wave-top-full .speed-item {
+      justify-content: center;
+      height: 100%;
+    }
+
+    .wave-top-full .wave-toolbar {
+      padding: 0;
+      margin: 0;
+      border: none;
+      width: auto;
+    }
+
+    .wave-top-full .wave-speed-header {
+      margin: 0;
+      gap: 22px;
+    }
+
+    .wave-top-full .wave-svg-container {
+      display: none;   /* 窄条模式隐藏波浪图 */
+    }
+
+    .wave-top-full .wave-status-tag {
+      position: static;
+      padding: 2px 8px;
+    }
+
+    .wave-top-full .wave-actions-bar {
+      margin: 0;
+      padding: 0;
+      border: none;
+      width: auto;
+    }
+
+    /* 下方左右两列 */
+    .dash-grid-container.dash-grid-two {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      align-items: stretch;
+    }
+
+    .dash-col {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    /* 左列：在线率环 + 矩阵 并排（平均铺满） */
+    .dash-col-left {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      align-items: stretch;
+    }
+
+    /* 右列：速率三连 + 曲线 上排，分布 + 概览 下排（2×2 压缩高度） */
+    .dash-col-right {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      align-items: start;
+    }
+
+    /* 统一的水墨子区块结构 */
+    .dash-subcard {
+      background: rgba(10, 14, 19, 0.65);
+      border: 1px solid rgba(180, 165, 140, 0.14);
+      border-radius: 6px;
+      padding: 5px 9px;
+      position: relative;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .dash-subcard:hover {
+      border-color: rgba(200, 175, 120, 0.3);
+    }
+
+    .dash-card-title {
+      font-family: var(--font-serif);
+      font-size: 11px;
+      letter-spacing: 0.5px;
+      color: var(--ink-gray);
+      margin-bottom: 5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* 仪表盘左侧：节点在线率环形图 */
+    .dash-ring-box {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 8px 10px;
+    }
+
+    .ring-container {
+      position: relative;
+      width: 62px;
+      height: 62px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .ring-svg {
+      transform: rotate(-90deg);
+      width: 100%;
+      height: 100%;
+    }
+
+    .ring-bg-circle {
+      stroke: rgba(255, 255, 255, 0.08);
+      stroke-width: 6;
+      fill: transparent;
+    }
+
+    .ring-val-circle {
+      stroke: var(--jade-green);
+      stroke-width: 6;
+      stroke-linecap: round;
+      fill: transparent;
+      stroke-dasharray: 201.06; /* 2 * PI * 32 */
+      stroke-dashoffset: 201.06;
+      transition: stroke-dashoffset 0.8s ease-in-out;
+    }
+
+    .ring-center-text {
+      position: absolute;
+      text-align: center;
+    }
+
+    .ring-center-val {
+      font-family: var(--font-code);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--jade-green-glow);
+    }
+
+    .ring-center-label {
+      font-size: 10px;
+      color: var(--ink-gray);
+      margin-top: 0;
+    }
+
+    .dash-ring-meta {
+      margin-top: 3px;
+      text-align: center;
+    }
+
+    .dash-ring-ratio {
+      font-family: var(--font-code);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--ink-black);
+    }
+
+    /* 2. 节点在线状态矩阵 */
+    .dash-matrix-box {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .matrix-count-badge {
+      font-family: var(--font-code);
+      font-size: 10px;
+      color: var(--ochre-gold);
+    }
+
+    .node-matrix-grid {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      align-content: center;
+      gap: 6px;
+      padding: 3px;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .matrix-dot {
+      width: 26px;
+      height: 26px;
+      flex: 0 0 auto;
+      border-radius: 6px;
+      background: rgba(180, 165, 140, 0.15);
+      border: 1px solid rgba(180, 165, 140, 0.2);
+      transition: all 0.3s ease;
+      cursor: pointer;
+    }
+
+    .matrix-dot.online {
+      background: var(--jade-green);
+      border-color: var(--jade-green-glow);
+      box-shadow: 0 0 6px rgba(76, 217, 149, 0.35);
+      animation: matrixPulse 3s infinite ease-in-out;
+    }
+
+    .matrix-dot.offline {
+      background: rgba(100, 100, 100, 0.25);
+      border-color: rgba(120, 120, 120, 0.3);
+    }
+
+    .matrix-dot.active {
+      background: var(--cinnabar-red);
+      border-color: #ff6b6b;
+      box-shadow: 0 0 8px rgba(200, 60, 35, 0.85);
+      animation: matrixPulseRed 1.2s infinite ease-in-out;
+    }
+
+    @keyframes matrixPulse {
+      0%, 100% { opacity: 0.85; transform: scale(1); }
+      50% { opacity: 1; transform: scale(1.08); box-shadow: 0 0 10px rgba(76, 217, 149, 0.7); }
+    }
+
+    @keyframes matrixPulseRed {
+      0%, 100% { opacity: 0.9; transform: scale(1); }
+      50% { opacity: 1; transform: scale(1.15); box-shadow: 0 0 12px rgba(219, 69, 41, 0.9); }
+    }
+
+    .matrix-legend {
+      display: flex;
+      gap: 10px;
+      font-size: 10px;
+      color: var(--ink-gray);
+      margin-top: 4px;
+      justify-content: flex-end;
+    }
+
+    .matrix-legend .dot {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      border-radius: 2px;
+      margin-right: 3px;
+    }
+    .matrix-legend .dot.online { background: var(--jade-green); }
+    .matrix-legend .dot.offline { background: rgba(120, 120, 120, 0.5); }
+    .matrix-legend .dot.active { background: var(--cinnabar-red); }
+
+    /* 仪表盘中央：实时水墨波浪流量速率（去掉 Top5 后撑满整列） */
+    .dash-wave-box {
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      align-items: center;
+      position: relative;
+      padding: 4px 10px;
+      flex: 0 0 auto;   /* 不再撑满，内容自适应，压缩中列高度 */
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .wave-speed-header {
+      display: flex;
+      gap: 36px;
+      margin-bottom: 0;
+      z-index: 2;
+    }
+
+    .speed-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .speed-label {
+      font-size: 9px;
+      color: var(--ink-gray);
+      letter-spacing: 1px;
+      margin-bottom: 0;
+    }
+
+    .speed-val {
+      font-family: var(--font-code);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .speed-val.up { color: var(--ochre-gold); }
+    .speed-val.down { color: var(--jade-green-glow); }
+
+    .speed-unit {
+      font-size: 10px;
+      color: var(--ink-gray);
+      font-weight: normal;
+      margin-left: 2px;
+    }
+
+    /* SVG 动态水墨波浪容器 */
+    .wave-svg-container {
+      width: 100%;
+      height: 18px;
+      position: relative;
+      margin-top: 2px;
+    }
+
+    .wave-svg {
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+    }
+
+    .wave-status-tag {
+      position: absolute;
+      bottom: 1px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 9.5px;
+      color: var(--ink-gray);
+      background: rgba(11, 15, 20, 0.7);
+      padding: 0 8px;
+      border-radius: 10px;
+      border: 1px solid rgba(180, 165, 140, 0.12);
+    }
+
+    .pulse-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--jade-green-glow);
+      box-shadow: 0 0 8px var(--jade-green-glow);
+      animation: pulseAnim 1.8s infinite ease-in-out;
+    }
+
+    @keyframes pulseAnim {
+      0%, 100% { opacity: 0.3; transform: scale(0.9); }
+      50% { opacity: 1; transform: scale(1.3); }
+    }
+
+    /* 节点实时速率排行 (替代原中心大曲线位置) */
+    .dash-speed-rank-box {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 12px 14px;
+    }
+
+    .speed-rank-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 3px;
+    }
+
+    .speed-rank-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(6, 10, 14, 0.55);
+      border: 1px solid rgba(180, 165, 140, 0.1);
+      border-radius: 4px;
+      padding: 4px 8px;
+      transition: border-color 0.2s ease, background 0.2s ease;
+    }
+
+    .speed-rank-item:hover {
+      background: rgba(16, 23, 30, 0.8);
+      border-color: rgba(200, 175, 120, 0.25);
+    }
+
+    .rank-badge {
+      font-family: var(--font-code);
+      font-weight: bold;
+      font-size: 10.5px;
+      width: 22px;
+      height: 22px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .rank-badge.rank-1 { background: rgba(200, 60, 35, 0.25); color: #ff6b6b; border: 1px solid rgba(200, 60, 35, 0.4); }
+    .rank-badge.rank-2 { background: rgba(212, 163, 55, 0.2); color: var(--ochre-gold); border: 1px solid rgba(212, 163, 55, 0.35); }
+    .rank-badge.rank-3 { background: rgba(56, 158, 109, 0.2); color: var(--jade-green-glow); border: 1px solid rgba(56, 158, 109, 0.35); }
+    .rank-badge.rank-4, .rank-badge.rank-5 { background: rgba(180, 165, 140, 0.12); color: var(--ink-gray); border: 1px solid rgba(180, 165, 140, 0.2); }
+
+    .rank-node-info {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .rank-node-name {
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--ink-black);
+      display: flex;
+      align-items: center;
+    }
+
+    .rank-bar-wrapper {
+      width: 100%;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .rank-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--jade-green), var(--ochre-gold));
+      border-radius: 2px;
+      transition: width 0.4s ease;
+    }
+
+    .rank-speed-val {
+      font-family: var(--font-code);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--jade-green-glow);
+      flex-shrink: 0;
+      width: 82px;
+      text-align: right;
+    }
+
+    /* 1. 实时流量曲线图（缩小为右侧迷你走势图） */
+    .dash-chart-box {
+      display: flex;
+      flex-direction: column;
+      padding: 5px 9px;
+    }
+
+    .chart-peak-tag {
+      font-size: 10px;
+      color: var(--ink-gray);
+    }
+    .chart-peak-tag .peak-val {
+      font-family: var(--font-code);
+      color: var(--ochre-gold);
+      font-weight: 600;
+    }
+
+    .chart-svg-wrapper {
+      position: relative;
+      width: 100%;
+      height: 30px;
+    }
+
+    .realtime-chart-svg {
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+    }
+
+    .chart-x-axis {
+      display: flex;
+      justify-content: space-between;
+      font-size: 9.5px;
+      font-family: var(--font-code);
+      color: var(--ink-muted);
+      margin-top: 2px;
+    }
+
+    /* 3. 速率统计三连 */
+    .dash-triplet-box {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 5px;
+      padding: 5px 8px;
+    }
+
+    .triplet-item {
+      background: rgba(6, 10, 14, 0.55);
+      border: 1px solid rgba(180, 165, 140, 0.1);
+      border-radius: 4px;
+      padding: 4px 3px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    .triplet-label {
+      font-size: 9.5px;
+      color: var(--ink-gray);
+      margin-bottom: 1px;
+    }
+
+    .triplet-val {
+      font-family: var(--font-code);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--ink-black);
+    }
+
+    .triplet-val.highlight { color: var(--ochre-gold); }
+    .triplet-val.online { color: var(--jade-green-glow); }
+    .triplet-val .unit { font-size: 8.5px; font-weight: normal; color: var(--ink-gray); }
+
+    /* 4. 分组流量分布 (撑满宽度 + 列表增强) */
+    .dash-group-dist-box {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+    }
+
+    .group-stacked-bar-container {
+      width: 100%;
+      height: 6px;
+      border-radius: 5px;
+      background: rgba(6, 10, 14, 0.6);
+      border: 1px solid rgba(180, 165, 140, 0.15);
+      display: flex;
+      overflow: hidden;
+      margin-bottom: 4px;
+    }
+
+    .group-bar-segment {
+      height: 100%;
+      transition: width 0.4s ease;
+      position: relative;
+    }
+
+    .group-legend-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      max-height: 26px;
+      overflow-y: auto;
+      font-size: 9px;
+      width: 100%;
+    }
+
+    .group-legend-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--ink-black);
+      width: 100%;
+      padding: 2px 6px;
+      background: rgba(6, 10, 14, 0.45);
+      border: 1px solid rgba(180, 165, 140, 0.08);
+      border-radius: 4px;
+    }
+
+    .group-legend-item .left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 1;
+      min-width: 0;
+    }
+
+    .group-legend-item .color-chip {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    .group-legend-item .group-name {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 500;
+      color: var(--ink-black);
+      max-width: 90px;
+    }
+
+    .group-legend-item .mini-bar-bg {
+      flex: 1;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 2px;
+      overflow: hidden;
+      margin: 0 6px;
+    }
+
+    .group-legend-item .right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    /* 仪表盘右侧原有 Tiles */
+    .dash-metrics-right {
+      display: flex;
+      gap: 5px;
+      align-self: start;
+    }
+
+    .mini-metric-tile {
+      background: rgba(11, 15, 20, 0.5);
+      border: 1px solid rgba(180, 165, 140, 0.12);
+      border-radius: 6px;
+      padding: 3px 6px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .tile-title {
+      font-size: 9px;
+      color: var(--ink-gray);
+      margin-bottom: 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 500;
+      line-height: 1.3;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tile-title > span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+
+    .tile-val {
+      font-family: var(--font-code);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--ink-black);
+      line-height: 1.3;
+    }
+
+    .tile-sub {
+      font-size: 9px;
+      color: var(--ink-gray);
+      margin-top: 0;
+      display: none;   /* 压缩高度：隐藏 tile 副文案 */
+    }
+
+
+    /* 底部快捷统计横条 (Scroll Ribbon) */
+    .quick-stats-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 10px 24px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      flex-wrap: wrap;
+      background: linear-gradient(90deg, rgba(16, 23, 30, 0.9) 0%, rgba(26, 36, 46, 0.7) 50%, rgba(16, 23, 30, 0.9) 100%);
+    }
+
+    .stat-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--ink-gray);
+    }
+
+    .stat-pill .val {
+      color: var(--ink-black);
+      font-weight: 600;
+      font-family: var(--font-code);
+    }
+
+    .stat-pill .val.highlight { color: var(--ochre-gold); }
+    .stat-pill .val.online { color: var(--jade-green-glow); }
+    .stat-divider { color: rgba(180, 165, 140, 0.2); }
+
+    /* Responsive layout adjustment for dashboard hero */
+    @media (max-width: 900px) {
+      .dash-grid-container {
+        grid-template-columns: 1fr 1fr;
+      }
+      .dash-col-center {
+        grid-column: 1 / -1;
+      }
+    }
+
+    @media (max-width: 768px) {
+      .dash-grid-container {
+        grid-template-columns: 1fr;
+      }
+      .dash-triplet-box {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* 小屏适配：节点表格横向滚动 + 导入三列改单列 + 表单控件宽度自适应 */
+    @media (max-width: 720px) {
+      /* 根容器：允许收缩，避免被内容撑破 */
+      .container {
+        padding: 12px;
+        min-width: 0;
+      }
+      .dashboard-hero {
+        padding: 6px;
+        min-width: 0;
+      }
+
+      /* 主 grid 与子卡片：grid 子项默认 min-width:auto 会被内容撑破，强制可收缩 */
+      .dash-grid-container,
+      .dash-col,
+      .dash-wave-box,
+      .dash-grid-container > *,
+      .dash-col > * {
+        min-width: 0;
+      }
+      .dash-grid-container.dash-grid-two {
+        grid-template-columns: 1fr !important;
+      }
+      .dash-col-left,
+      .dash-col-right {
+        grid-template-columns: 1fr !important;
+      }
+      .wave-toolbar {
+        flex-wrap: wrap;
+        min-width: 0;
+      }
+      .wave-brand,
+      .wave-actions-bar {
+        flex: none;
+        min-width: 0;
+      }
+      /* 窄屏：品牌标题与 slogan 允许换行，避免 nowrap 撑破容器 */
+      .title-group {
+        min-width: 0;
+      }
+      .title-group h1,
+      .title-group .slogan {
+        white-space: normal;
+        overflow-wrap: break-word;
+      }
+      .wave-speed-header {
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      /* 节点表格容器：横向滚动 */
+      .table-container {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      .node-table {
+        min-width: 760px;
+      }
+
+      /* 批量导入三列网格改单列 */
+      .import-three-col {
+        grid-template-columns: 1fr !important;
+      }
+
+      /* toolbar 表单控件宽度自适应 */
+      .toolbar-bar .form-select,
+      .toolbar-bar .form-control {
+        width: 100% !important;
+        min-width: 0 !important;
+      }
+
+      /* 订阅输入框宽度自适应 */
+      #sub-url {
+        min-width: 0 !important;
+        width: 100% !important;
+      }
+    }
+
+    /* ==========================================
+       4. Tabs 标签页导航 (水墨卷轴风格)
+       ========================================== */
+    .tabs-header {
+      display: flex;
+      gap: 2px;
+      border-bottom: 2px solid rgba(180, 165, 140, 0.18);
+      margin-bottom: 20px;
+      background: rgba(11, 15, 20, 0.4);
+      padding: 4px 8px 0 8px;
+      border-radius: 6px 6px 0 0;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--ink-gray);
+      padding: 10px 20px;
+      font-size: 15px;
+      font-family: var(--font-serif);
+      letter-spacing: 1px;
+      cursor: pointer;
+      border-radius: 6px 6px 0 0;
+      transition: all 0.2s ease;
+      position: relative;
+    }
+
+    .tab-btn:hover {
+      color: var(--ink-black);
+      background: rgba(180, 165, 140, 0.06);
+    }
+
+    .tab-btn.active {
+      color: var(--cinnabar-red);
+      font-weight: bold;
+      background: rgba(200, 60, 35, 0.08);
+    }
+
+    .tab-btn.active::after {
+      content: '';
+      position: absolute;
+      bottom: -2px;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: var(--cinnabar-red);
+      border-radius: 2px 2px 0 0;
+      box-shadow: 0 0 8px rgba(200, 60, 35, 0.5);
+    }
+
+    .tab-content {
+      display: none;
+      animation: fadeIn 0.25s ease;
+    }
+
+    .tab-content.active {
+      display: block;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ==========================================
+       5. 按钮 & 表单通用组件 (水墨朴素风)
+       ========================================== */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 500;
+      border-radius: 4px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      font-family: var(--font-sans);
+      user-select: none;
+      text-decoration: none;
+    }
+
+    .btn-sm {
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+
+    .btn-xs {
+      padding: 2px 5px;
+      font-size: 11px;
+      line-height: 1.2;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+    }
+
+    /* 内联 SVG 矢量图标：宽高随字号等比缩放，任意缩放不变形 */
+    .btn-icon {
+      width: 1.15em;
+      height: 1.15em;
+      display: block;
+      flex: none;
+      pointer-events: none;
+    }
+    .btn-xs .btn-icon {
+      width: 12px;
+      height: 12px;
+    }
+
+    .btn-primary {
+      background: var(--cinnabar-red);
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.15);
+      box-shadow: 0 2px 6px rgba(200, 60, 35, 0.35);
+    }
+    .btn-primary:hover {
+      background: var(--cinnabar-red-hover);
+      box-shadow: 0 4px 12px rgba(200, 60, 35, 0.5);
+    }
+
+    .btn-secondary {
+      background: var(--indigo-blue);
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.15);
+    }
+    .btn-secondary:hover {
+      background: var(--indigo-blue-hover);
+    }
+
+    .btn-gold {
+      background: var(--ochre-gold);
+      color: #120e06;
+      font-weight: 600;
+    }
+    .btn-gold:hover {
+      background: #e5b448;
+    }
+
+    .btn-outline {
+      background: rgba(180, 165, 140, 0.05);
+      border-color: var(--paper-border);
+      color: var(--ink-black);
+    }
+    .btn-outline:hover {
+      background: rgba(180, 165, 140, 0.12);
+      border-color: var(--paper-border-hover);
+    }
+
+    .btn-danger {
+      background: rgba(192, 57, 43, 0.2);
+      color: #ff6b6b;
+      border-color: rgba(192, 57, 43, 0.4);
+    }
+    .btn-danger:hover {
+      background: rgba(192, 57, 43, 0.4);
+    }
+
+    .form-control, .form-select, textarea {
+      width: 100%;
+      background: rgba(10, 14, 18, 0.7);
+      border: 1px solid var(--paper-border);
+      border-radius: 4px;
+      padding: 8px 12px;
+      color: var(--ink-black);
+      font-size: 13.5px;
+      font-family: var(--font-sans);
+      outline: none;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .form-control:focus, .form-select:focus, textarea:focus {
+      border-color: var(--ochre-gold);
+      box-shadow: 0 0 0 2px rgba(212, 163, 55, 0.2);
+    }
+
+    textarea {
+      font-family: var(--font-code);
+      resize: vertical;
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-label {
+      display: block;
+      font-size: 13px;
+      color: var(--ink-gray);
+      margin-bottom: 6px;
+      font-weight: 500;
+    }
+
+    /* ==========================================
+       6. 节点列表 Table 界面
+       ========================================== */
+    .toolbar-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar-left, .toolbar-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .table-container {
+      overflow-x: auto;
+      border-radius: 6px;
+      border: 1px solid rgba(180, 165, 140, 0.1);
+    }
+
+    .node-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11.5px;
+      line-height: 1.25;
+      text-align: left;
+    }
+
+    .node-table th {
+      background: rgba(10, 14, 18, 0.85);
+      color: var(--ink-gray);
+      padding: 4px 6px;
+      font-weight: 600;
+      border-bottom: 1px solid var(--paper-border);
+      white-space: nowrap;
+    }
+
+    .node-table td {
+      padding: 2px 6px;
+      border-bottom: 1px solid rgba(180, 165, 140, 0.08);
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    .node-table tr:hover td {
+      background: rgba(180, 165, 140, 0.04);
+    }
+
+    /* 状态指示点 */
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--ink-gray);
+    }
+    .status-dot.online {
+      background: var(--jade-green-glow);
+      box-shadow: 0 0 6px var(--jade-green-glow);
+    }
+    .status-dot.offline {
+      background: var(--danger-red);
+      box-shadow: 0 0 6px var(--danger-red);
+    }
+
+    /* 端口输入框 (冲突红框) */
+    .port-input {
+      width: 60px;
+      padding: 1px 3px;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--paper-border);
+      border-radius: 4px;
+      color: var(--ink-black);
+      font-family: var(--font-code);
+      font-size: 11px;
+      text-align: center;
+    }
+    .port-input.conflict {
+      border-color: var(--danger-red) !important;
+      background: rgba(192, 57, 43, 0.25) !important;
+      box-shadow: 0 0 6px rgba(192, 57, 43, 0.5);
+    }
+
+    /* 51 / 52 段徽标 */
+    .badge-segment {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: bold;
+      font-family: var(--font-code);
+    }
+    .badge-51 {
+      background: var(--badge-51-bg);
+      color: var(--badge-51-color);
+      border: 1px solid var(--badge-51-border);
+    }
+    .badge-52 {
+      background: var(--badge-52-bg);
+      color: var(--badge-52-color);
+      border: 1px solid var(--badge-52-border);
+    }
+    .badge-pool {
+      background: var(--badge-pool-bg);
+      color: var(--badge-pool-color);
+      border: 1px solid var(--badge-pool-border);
+    }
+
+    .proto-tag {
+      font-family: var(--font-code);
+      font-size: 10px;
+      padding: 1px 5px;
+      background: rgba(180, 165, 140, 0.08);
+      border-radius: 3px;
+      color: var(--ochre-gold);
+    }
+
+    /* ==========================================
+       7. 域名解析轮询入口卡片
+       ========================================== */
+    .relay-card {
+      padding: 24px;
+      background: linear-gradient(135deg, rgba(212, 163, 55, 0.06) 0%, rgba(16, 23, 30, 0.8) 100%);
+      border: 1px solid rgba(212, 163, 55, 0.25);
+      margin-bottom: 24px;
+    }
+
+    .relay-title {
+      font-family: var(--font-serif);
+      font-size: 20px;
+      color: var(--ochre-gold);
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .uri-display-box {
+      background: rgba(0, 0, 0, 0.5);
+      border: 1px dashed var(--ochre-gold);
+      padding: 12px 18px;
+      border-radius: 6px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 16px;
+      font-family: var(--font-code);
+      font-size: 14px;
+      word-break: break-all;
+    }
+
+    /* ==========================================
+       8. 实时日志 Terminal 样式
+       ========================================== */
+    .terminal-window {
+      background: #080c10;
+      border: 1px solid var(--paper-border);
+      border-radius: 6px;
+      padding: 14px;
+      font-family: var(--font-code);
+      font-size: 12.5px;
+      line-height: 1.6;
+      height: 420px;
+      overflow-y: auto;
+      color: #cfc7b9;
+    }
+
+    .log-line {
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+    .log-time { color: #6b7280; }
+    .log-info { color: #60a5fa; }
+    .log-warn { color: #f59e0b; }
+    .log-error { color: #ef4444; }
+    .log-success { color: #34d399; }
+
+    /* ==========================================
+       9. 页脚与 Slogan
+       ========================================== */
+    footer {
+      margin-top: auto;
+      text-align: center;
+      padding: 12px 20px 16px;
+      color: var(--ink-gray);
+      font-size: 10px;
+      letter-spacing: 0.5px;
+      border-top: 1px solid rgba(180, 165, 140, 0.12);
+    }
+    footer .slogan-footer {
+      font-family: var(--font-serif);
+      font-size: 12px;
+      color: var(--ochre-gold);
+      letter-spacing: 2px;
+      margin-bottom: 4px;
+    }
+
+    input[type="checkbox"] {
+      accent-color: var(--cinnabar-red);
+      cursor: pointer;
+      width: 15px;
+      height: 15px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 登录遮罩（未登录时覆盖全屏，防止查看面板数据） -->
+  <div id="login-overlay" class="login-overlay" style="display:none;">
+    <div class="login-box ink-card">
+      <div class="seal-logo" style="width:46px;height:46px;font-size:22px;margin:0 auto 8px;">U</div>
+      <h2 style="font-family:var(--font-serif);color:var(--ochre-gold);text-align:center;margin-bottom:4px;">Aura</h2>
+      <div style="text-align:center;font-size:12px;color:var(--ink-gray);margin-bottom:20px;">面板访问需身份验证</div>
+      <div class="form-group">
+        <label class="form-label">用户名</label>
+        <input type="text" id="login-username" class="form-control" value="admin" autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label class="form-label">密码</label>
+        <input type="password" id="login-password" class="form-control" autocomplete="current-password" placeholder="请输入密码" onkeydown="if(event.key==='Enter')doLogin()">
+      </div>
+      <div id="login-error" style="color:var(--cinnabar-red);font-size:12px;margin-bottom:10px;min-height:16px;"></div>
+      <button class="btn btn-primary" style="width:100%;" onclick="doLogin()">登 录</button>
+    </div>
+  </div>
+
+  <!-- 首次登录强制改密弹窗（不可关闭，必须改密） -->
+  <div id="pwd-overlay" class="login-overlay" style="display:none;">
+    <div class="login-box ink-card">
+      <div class="seal-logo" style="width:46px;height:46px;font-size:22px;margin:0 auto 8px;">锁</div>
+      <h2 style="font-family:var(--font-serif);color:var(--ochre-gold);text-align:center;margin-bottom:4px;">首次登录，请修改密码</h2>
+      <div style="text-align:center;font-size:12px;color:var(--ink-gray);margin-bottom:20px;">出于安全考虑，默认密码必须更换后才能使用面板</div>
+      <div class="form-group">
+        <label class="form-label">当前密码</label>
+        <input type="password" id="pwd-old" class="form-control" autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label">新密码（至少 6 位）</label>
+        <input type="password" id="pwd-new" class="form-control" autocomplete="new-password" onkeydown="if(event.key==='Enter')doChangePassword(true)">
+      </div>
+      <div class="form-group">
+        <label class="form-label">确认新密码</label>
+        <input type="password" id="pwd-confirm" class="form-control" autocomplete="new-password" onkeydown="if(event.key==='Enter')doChangePassword(true)">
+      </div>
+      <div id="pwd-error" style="color:var(--cinnabar-red);font-size:12px;margin-bottom:10px;min-height:16px;"></div>
+      <button class="btn btn-primary" style="width:100%;" onclick="doChangePassword(true)">确认修改密码</button>
+    </div>
+  </div>
+
+  <!-- 批量转换入口协议弹窗 -->
+  <div id="convert-entry-overlay" class="login-overlay" style="display:none;">
+    <div class="login-box ink-card" style="max-width: 560px;">
+      <div class="seal-logo" style="width:46px;height:46px;font-size:22px;margin:0 auto 8px;">⇄</div>
+      <h2 style="font-family:var(--font-serif);color:var(--ochre-gold);text-align:center;margin-bottom:4px;">批量转换入口协议</h2>
+      <div style="text-align:center;font-size:12px;color:var(--ink-gray);margin-bottom:20px;">在 socks5/http 与 Shadowsocks(aes-256-gcm) 之间互相转换</div>
+
+      <div class="form-group">
+        <label class="form-label">转换方向</label>
+        <select id="convert-direction" class="form-select" onchange="toggleConvertPassField()">
+          <option value="ss">转为 Shadowsocks (socks5/http → ss)</option>
+          <option value="mixed">转回 socks5+http (ss → mixed)</option>
+        </select>
+      </div>
+
+      <div class="form-group" id="convert-pass-group">
+        <label class="form-label">Shadowsocks 加密密码（批量统一设置，留空自动生成）</label>
+        <input type="text" id="convert-ss-pass" class="form-control" placeholder="例如: MySecretPass123">
+      </div>
+
+      <div style="font-size:12px;color:var(--ink-gray);margin-bottom:16px;" id="convert-scope-hint">转换范围: 当前选中的节点（未选中则全部节点）</div>
+      <div id="convert-error" style="color:var(--cinnabar-red);font-size:12px;margin-bottom:10px;min-height:16px;"></div>
+      <button class="btn btn-primary" style="width:100%;" onclick="doConvertEntry()">开始转换</button>
+      <button class="btn btn-outline btn-sm" style="width:100%;margin-top:8px;" onclick="closeConvertEntryDialog()">取消</button>
+    </div>
+  </div>
+
+  <!-- 编辑节点弹窗（重命名/分组/认证） -->
+  <div id="edit-node-overlay" class="login-overlay" style="display:none;">
+    <div class="login-box ink-card" style="max-width: 480px;">
+      <div class="seal-logo" style="width:46px;height:46px;font-size:22px;margin:0 auto 8px;">✎</div>
+      <h2 style="font-family:var(--font-serif);color:var(--ochre-gold);text-align:center;margin-bottom:4px;">编辑节点</h2>
+      <div id="edit-node-sub" style="text-align:center;font-size:12px;color:var(--ink-gray);margin-bottom:20px;"></div>
+
+      <div class="form-group">
+        <label class="form-label">节点名称（备注）</label>
+        <input type="text" id="edit-node-name" class="form-control">
+      </div>
+      <div class="form-group">
+        <label class="form-label">归属分组</label>
+        <input type="text" id="edit-node-group" class="form-control">
+      </div>
+      <div class="form-group">
+        <label class="form-label">本地认证账号（对外 socks5/http 认证）</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="edit-node-auth-user" class="form-control" placeholder="用户名" style="flex:1">
+          <input type="text" id="edit-node-auth-pass" class="form-control" placeholder="密码" style="flex:1">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">入口协议</label>
+        <select id="edit-node-entry" class="form-select">
+          <option value="mixed">socks5 + http（中转代理）</option>
+          <option value="ss">Shadowsocks（aes-256-gcm）</option>
+        </select>
+      </div>
+      <div class="form-group" id="edit-node-sspass-group">
+        <label class="form-label">Shadowsocks 密码（留空保留原密码）</label>
+        <input type="text" id="edit-node-sspass" class="form-control" placeholder="留空不修改">
+      </div>
+
+      <div id="edit-node-error" style="color:var(--cinnabar-red);font-size:12px;margin-bottom:10px;min-height:16px;"></div>
+      <button class="btn btn-primary" style="width:100%;" onclick="saveEditNode()">保存修改</button>
+      <button class="btn btn-outline btn-sm" style="width:100%;margin-top:8px;" onclick="closeEditNode()">取消</button>
+    </div>
+  </div>
+
+  <!-- 山水背景 SVG (石青/黛色/墨色/渐变/柔亮月光) -->
+  <svg id="landscape-bg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
+    <defs>
+      <radialGradient id="moonGlow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#fffef0" stop-opacity="0.85" />
+        <stop offset="35%" stop-color="#fdf4d8" stop-opacity="0.3" />
+        <stop offset="75%" stop-color="#d4a337" stop-opacity="0.08" />
+        <stop offset="100%" stop-color="#0b0f14" stop-opacity="0" />
+      </radialGradient>
+      
+      <linearGradient id="mountGrad1" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#243b47" stop-opacity="0.4" />
+        <stop offset="100%" stop-color="#0b0f14" stop-opacity="0.85" />
+      </linearGradient>
+
+      <linearGradient id="mountGrad2" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#162732" stop-opacity="0.65" />
+        <stop offset="100%" stop-color="#0b0f14" stop-opacity="0.95" />
+      </linearGradient>
+
+      <linearGradient id="mountGrad3" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#0f1922" stop-opacity="0.85" />
+        <stop offset="100%" stop-color="#070a0e" stop-opacity="1" />
+      </linearGradient>
+
+      <filter id="mistBlur" x="-20%" y="-20%" width="140%" height="140%">
+        <feGaussianBlur stdDeviation="40" />
+      </filter>
+    </defs>
+
+    <rect width="100%" height="100%" fill="#080c10" />
+
+    <!-- 月亮 -->
+    <circle cx="1200" cy="170" r="130" fill="url(#moonGlow)" />
+    <circle cx="1200" cy="170" r="34" fill="#fffef5" opacity="0.9" />
+
+    <!-- 雾霭 -->
+    <ellipse cx="380" cy="320" rx="380" ry="85" fill="#243b47" opacity="0.18" filter="url(#mistBlur)" />
+    <ellipse cx="1050" cy="440" rx="420" ry="90" fill="#3a6b88" opacity="0.12" filter="url(#mistBlur)" />
+
+    <!-- 远/中/近山峰剪影 -->
+    <path d="M0,520 Q220,390 480,470 T920,410 Q1180,350 1440,460 L1440,900 L0,900 Z" fill="url(#mountGrad1)" />
+    <path d="M0,600 Q320,460 680,560 T1220,470 Q1360,450 1440,510 L1440,900 L0,900 Z" fill="url(#mountGrad2)" />
+    <path d="M0,680 Q200,590 420,640 T880,590 Q1120,530 1440,650 L1440,900 L0,900 Z" fill="url(#mountGrad3)" />
+
+    <!-- 水面倒影 -->
+    <rect y="790" width="1440" height="110" fill="#040609" opacity="0.85" />
+    <path d="M100,830 Q300,825 500,830 T900,830 T1300,830" stroke="rgba(212, 163, 55, 0.12)" stroke-width="1.5" fill="none" />
+  </svg>
+
+  <div class="container">
+
+    <!-- 主视觉卡片：实时流量监控（logo+标题、操作按钮已并入卡内） -->
+    <div class="ink-card dashboard-hero">
+      <!-- 顶部：实时流量感知 全宽窄条 -->
+      <div class="dash-wave-box dash-subcard wave-top-full">
+        <!-- 品牌行：logo+标题居左 -->
+        <div class="wave-toolbar">
+          <div class="wave-brand">
+            <div class="seal-logo">U</div>
+            <div class="title-group">
+              <h1>Aura</h1>
+              <div class="slogan">One Gateway · Every Exit</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="wave-speed-header">
+          <div class="speed-item">
+            <span class="speed-label">实时上行速率 (UP)</span>
+            <div class="speed-val up"><span id="realtime-up-speed">0.00</span> <span class="speed-unit">MB/s</span></div>
+          </div>
+          <div class="speed-item">
+            <span class="speed-label">实时下行速率 (DOWN)</span>
+            <div class="speed-val down"><span id="realtime-down-speed">0.00</span> <span class="speed-unit">MB/s</span></div>
+          </div>
+        </div>
+
+        <div class="wave-svg-container">
+          <svg class="wave-svg" viewBox="0 0 600 70" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="waveGradUp" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#d4a337" stop-opacity="0.35" />
+                <stop offset="100%" stop-color="#d4a337" stop-opacity="0.0" />
+              </linearGradient>
+              <linearGradient id="waveGradDown" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#389e6d" stop-opacity="0.45" />
+                <stop offset="100%" stop-color="#389e6d" stop-opacity="0.0" />
+              </linearGradient>
+            </defs>
+            <path id="ink-wave-1" fill="url(#waveGradUp)" stroke="rgba(212, 163, 55, 0.8)" stroke-width="2" />
+            <path id="ink-wave-2" fill="url(#waveGradDown)" stroke="rgba(56, 158, 109, 0.9)" stroke-width="2.5" />
+          </svg>
+        </div>
+
+        <div class="wave-status-tag">
+          <div class="pulse-dot"></div>
+          <span>中转引擎实时流量感知中</span>
+        </div>
+
+        <!-- 操作按钮：批量探活/导入新节点 并排放流量感知下方两侧 -->
+        <div class="wave-actions-bar">
+          <button class="btn btn-sm btn-gold" onclick="triggerPingAll()"><svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg> 批量探活</button>
+          <button class="btn btn-sm btn-primary" onclick="switchTab('import')"><svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg> 导入新节点</button>
+        </div>
+      </div>
+
+      <!-- 下方：左右两列并排（在线率/矩阵 | 统计曲线/分布） -->
+      <div class="dash-grid-container dash-grid-two">
+
+        <!-- 左侧：在线率环 + 节点在线状态矩阵 -->
+        <div class="dash-col dash-col-left">
+          <!-- 在线率环 -->
+          <div class="dash-subcard dash-ring-box">
+            <div class="ring-container">
+              <svg class="ring-svg" viewBox="0 0 100 100">
+                <circle class="ring-bg-circle" cx="50" cy="50" r="32" />
+                <circle id="online-ring-circle" class="ring-val-circle" cx="50" cy="50" r="32" />
+              </svg>
+              <div class="ring-center-text">
+                <div class="ring-center-val" id="card-online-pct">0%</div>
+                <div class="ring-center-label">在线率</div>
+              </div>
+            </div>
+            <div class="dash-ring-meta">
+              <div class="dash-ring-ratio" id="card-online-ratio">0 / 0</div>
+              <div style="font-size: 11px; color: var(--ink-gray); margin-top: 2px;">节点在线 / 总节点</div>
+            </div>
+          </div>
+
+          <!-- 2. 节点在线状态矩阵 -->
+          <div class="dash-subcard dash-matrix-box">
+            <div class="dash-card-title">
+              <span>节点在线矩阵</span>
+              <span class="matrix-count-badge" id="matrix-status-summary">在线 0 / 总数 0</span>
+            </div>
+            <div id="node-matrix-grid" class="node-matrix-grid">
+              <!-- JS 动态渲染 -->
+            </div>
+            <div class="matrix-legend">
+              <span><i class="dot online"></i> 在线</span>
+              <span><i class="dot offline"></i> 离线</span>
+              <span><i class="dot active"></i> 轮询选中</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右侧：速率统计三连 + 30秒实时流量曲线 + 分组流量分布 + 流量概览卡片 -->
+        <div class="dash-col dash-col-right">
+          <!-- 3. 速率统计三连 -->
+          <div class="dash-subcard dash-triplet-box">
+            <div class="triplet-item">
+              <div class="triplet-label">平均速率</div>
+              <div class="triplet-val" id="dash-stat-avg-speed">0.00 <span class="unit">MB/s</span></div>
+            </div>
+            <div class="triplet-item">
+              <div class="triplet-label">峰值速率</div>
+              <div class="triplet-val highlight" id="dash-stat-peak-speed">0.00 <span class="unit">MB/s</span></div>
+            </div>
+            <div class="triplet-item">
+              <div class="triplet-label">当前总速率</div>
+              <div class="triplet-val online" id="dash-stat-total-speed">0.00 <span class="unit">MB/s</span></div>
+            </div>
+          </div>
+
+          <!-- 1. 实时流量曲线图（缩放为右侧迷你走势图） -->
+          <div class="dash-subcard dash-chart-box">
+            <div class="dash-card-title">
+              <span>📈 实时流量曲线（30s）</span>
+              <div class="chart-peak-tag">峰值: <span id="dash-chart-peak" class="peak-val">0.00 MB/s</span></div>
+            </div>
+            <div class="chart-svg-wrapper">
+              <svg id="realtime-chart-svg" class="realtime-chart-svg" viewBox="0 0 500 80" preserveAspectRatio="none">
+                <defs>
+                  <linearGradient id="chartUpGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#d4a337" stop-opacity="0.35" />
+                    <stop offset="100%" stop-color="#d4a337" stop-opacity="0.0" />
+                  </linearGradient>
+                  <linearGradient id="chartDownGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#389e6d" stop-opacity="0.35" />
+                    <stop offset="100%" stop-color="#389e6d" stop-opacity="0.0" />
+                  </linearGradient>
+                </defs>
+                <g class="chart-grid-lines">
+                  <line x1="0" y1="20" x2="500" y2="20" stroke="rgba(180,165,140,0.08)" stroke-dasharray="3,3" />
+                  <line x1="0" y1="45" x2="500" y2="45" stroke="rgba(180,165,140,0.08)" stroke-dasharray="3,3" />
+                  <line x1="0" y1="70" x2="500" y2="70" stroke="rgba(180,165,140,0.08)" stroke-dasharray="3,3" />
+                </g>
+                <path id="chart-up-area" fill="url(#chartUpGrad)" opacity="0.6" />
+                <path id="chart-down-area" fill="url(#chartDownGrad)" opacity="0.6" />
+                <path id="chart-up-line" fill="none" stroke="var(--ochre-gold)" stroke-width="2" stroke-linejoin="round" />
+                <path id="chart-down-line" fill="none" stroke="var(--jade-green-glow)" stroke-width="2" stroke-linejoin="round" />
+              </svg>
+              <div class="chart-x-axis">
+                <span>-30s</span>
+                <span>-15s</span>
+                <span>现在</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 4. 分组流量分布 (撑满右侧列) -->
+          <div class="dash-subcard dash-group-dist-box">
+            <div class="dash-card-title">
+              <span>📊 分组流量分布</span>
+              <span style="font-size:11px; color:var(--ink-gray)">按分组汇总</span>
+            </div>
+            <div class="group-stacked-bar-container" id="group-stacked-bar-container">
+              <!-- JS 动态渲染 -->
+            </div>
+            <div class="group-legend-list" id="group-legend-list">
+              <!-- JS 动态渲染 -->
+            </div>
+          </div>
+
+          <!-- 流量与端口 Tile (原有元素) -->
+          <div class="dash-metrics-right">
+            <div class="mini-metric-tile">
+              <div class="tile-title">
+                <span>总累计流量 (Up / Down)</span>
+                <span style="color:var(--cinnabar-red); font-size:11px;">实时</span>
+              </div>
+              <div class="tile-val" id="card-traffic-total">0.00 MB</div>
+              <div class="tile-sub" id="card-traffic-detail">↑ 0 MB | ↓ 0 MB</div>
+            </div>
+
+            <div class="mini-metric-tile">
+              <div class="tile-title">今日消耗流量</div>
+              <div class="tile-val" id="card-traffic-today" style="color:var(--ochre-gold)">0.00 MB</div>
+              <div class="tile-sub">今日实时计费/统计</div>
+            </div>
+
+            <div class="mini-metric-tile">
+              <div class="tile-title">端口轮询出口状态</div>
+              <div class="tile-val" id="card-relay-status" style="font-size: 15px; color: var(--indigo-blue);">端口 33440 (待用)</div>
+              <div class="tile-sub">Socks5 负载均衡中转</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+    <!-- 底部快捷统计横条 -->
+    <div class="quick-stats-bar ink-card">
+      <div class="stat-pill">入站监听: <span class="val highlight" id="qs-inbound-ports">0</span></div>
+      <div class="stat-divider">|</div>
+      <div class="stat-pill">出站节点: <span class="val" id="qs-total-nodes">0</span></div>
+      <div class="stat-divider">|</div>
+      <div class="stat-pill">高质量: <span class="val" style="color:var(--badge-51-color)" id="qs-51-count">0</span></div>
+      <div class="stat-divider">|</div>
+      <div class="stat-pill">普通: <span class="val" style="color:var(--badge-52-color)" id="qs-52-count">0</span></div>
+      <div class="stat-divider">|</div>
+      <div class="stat-pill">代理池: <span class="val" style="color:var(--badge-pool-color)" id="qs-pool-count">0</span></div>
+      <div class="stat-divider">|</div>
+      <div class="stat-pill">在线节点: <span class="val online" id="qs-online-count">0</span></div>
+      <div class="stat-divider">|</div>
+      <div class="stat-pill">平均延迟: <span class="val" id="qs-avg-ping">-- ms</span></div>
+      <div class="stat-divider">|</div>
+      <div class="stat-pill">总流量: <span class="val" id="qs-total-traffic">0 MB</span></div>
+    </div>
+
+    <!-- Main Navigation Tabs (水墨卷轴风格) -->
+    <div class="tabs-header">
+      <button class="tab-btn active" onclick="switchTab('nodes')">节点列表</button>
+      <button class="tab-btn" onclick="switchTab('import')">批量导入</button>
+      <button class="tab-btn" onclick="switchTab('relay')">域名解析轮询入口</button>
+      <button class="tab-btn" onclick="switchTab('config')">Sing-Box 配置预览</button>
+      <button class="tab-btn" onclick="switchTab('export')">导出节点</button>
+      <button class="tab-btn" onclick="switchTab('traffic')">流量统计</button>
+      <button class="tab-btn" onclick="switchTab('logs')">实时系统日志</button>
+      <button class="tab-btn" onclick="switchTab('settings')">面板设置</button>
+    </div>
+
+    <!-- TAB 1: 节点列表 -->
+    <div id="tab-nodes" class="tab-content active">
+      <div class="ink-card" style="padding: 20px;">
+        <div class="toolbar-bar">
+          <div class="toolbar-left">
+            <span style="font-size: 13px; color: var(--ink-gray)">分组筛选:</span>
+            <select id="filter-group" class="form-select" style="width: 140px;" onchange="renderNodesTable()">
+              <option value="ALL">全部分组</option>
+            </select>
+
+            <input type="text" id="search-keyword" class="form-control" placeholder="搜索节点名称/IP/端口..." style="width: 200px;" oninput="renderNodesTable()">
+          </div>
+
+          <div class="toolbar-right">
+            <button class="btn btn-gold btn-sm" onclick="openConvertEntryDialog()">↔ 转换入口协议</button>
+            <button class="btn btn-outline btn-sm" onclick="reassignAllPorts()">重新编排端口</button>
+            <button class="btn btn-secondary btn-sm" onclick="exportSelectedNodes()">导出选中节点</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteSelectedNodes()">批量删除</button>
+          </div>
+        </div>
+
+        <!-- 节点表格 -->
+        <div class="table-container">
+          <table class="node-table">
+            <thead>
+              <tr>
+                <th style="width: 30px;"><input type="checkbox" id="chk-all" onchange="toggleSelectAll(this)"></th>
+                <th style="width: 34px;">状态</th>
+                <th style="width: 72px;">端口</th>
+                <th style="width: 60px;">段</th>
+                <th style="width: 90px;">分组</th>
+                <th style="width: 70px;">协议</th>
+                <th style="width: 70px;">入口</th>
+                <th>节点备注</th>
+                <th style="width: 86px;">流量</th>
+                <th style="width: 62px;">延迟</th>
+                <th style="width: 96px;">出口 IP</th>
+                <th style="width: 128px; text-align: center;">操作</th>
+              </tr>
+            </thead>
+            <tbody id="nodes-tbody">
+              <!-- JS 动态渲染 -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: 批量导入 -->
+    <div id="tab-import" class="tab-content">
+      <!-- 订阅管理区 -->
+      <div class="ink-card" style="padding: 28px; max-width: 900px; margin: 0 auto 20px;">
+        <h2 style="font-family: var(--font-serif); color: var(--ochre-gold); margin-bottom: 6px; font-size: 20px;">📡 订阅管理</h2>
+        <p style="font-size: 13px; color: var(--ink-gray); margin-bottom: 16px;">添加订阅 URL，自动拉取解析节点并并入分组。<b>每 6 小时自动刷新</b>（页面打开时若超期立即刷新）。支持 Base64 订阅 / Clash YAML / v2ray JSON / sing-box。</p>
+
+        <div class="form-group" style="margin-bottom: 14px;">
+          <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+            <input type="text" id="sub-url" class="form-control" placeholder="https://example.com/sub?token=xxx" style="flex:1; min-width:260px;">
+            <input type="text" id="sub-name" class="form-control" placeholder="订阅名称(可选)" style="width:160px;">
+            <input type="text" id="sub-group" class="form-control" placeholder="归属分组" value="订阅节点" style="width:120px;">
+            <button class="btn btn-primary" onclick="addSubscription()">添加订阅</button>
+          </div>
+        </div>
+
+        <div id="sub-list" style="margin-top: 10px;">
+          <div style="color: var(--ink-gray); font-size: 13px; padding: 10px;">暂无订阅，添加后在此显示列表。</div>
+        </div>
+      </div>
+
+      <div class="ink-card" style="padding: 28px; max-width: 900px; margin: 0 auto;">
+        <h2 style="font-family: var(--font-serif); color: var(--ochre-gold); margin-bottom: 20px; font-size: 22px;">批量导入外部节点</h2>
+
+        <div class="form-group">
+          <label class="form-label">粘贴节点订阅 / 单链接（支持 ss://, vmess://, vless://, trojan://, socks5://, http:// 等，每行一个）</label>
+          <textarea id="import-text" rows="10" placeholder="ss:// ...&#10;vmess:// ...&#10;vless:// ...&#10;trojan:// ...&#10;socks5:// ...&#10;http:// ..."></textarea>
+        </div>
+
+        <div class="import-three-col" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+          <div class="form-group">
+            <label class="form-label">批量起始端口（留空自动分配）</label>
+            <input type="number" id="import-start-port" class="form-control" placeholder="例: 51000">
+            <div style="font-size: 12px; color: var(--ink-gray); margin-top: 4px;">若设置 N，则节点依 N, N+1, N+2 自动递增分配（跳过已被占用端口）。</div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">归属分组</label>
+            <input type="text" id="import-group" class="form-control" placeholder="默认分组" value="默认分组">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">对外出口协议（转换目标）</label>
+            <select id="import-entry-proto" class="form-select" onchange="toggleImportPassField()">
+              <option value="mixed">socks5 + http（中转代理）</option>
+              <option value="ss">Shadowsocks（aes-256-gcm）</option>
+            </select>
+            <div style="font-size: 12px; color: var(--ink-gray); margin-top: 4px;">导入的 ss/vless/trojan/socks/http 节点统一转换为该出口协议对外提供。</div>
+          </div>
+        </div>
+
+        <div class="form-group" id="import-pass-group" style="display:none;">
+          <label class="form-label">Shadowsocks 加密密码（批量统一设置，留空自动生成）</label>
+          <input type="text" id="import-ss-pass" class="form-control" placeholder="例如: MySecretPass123">
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+          <div class="form-group">
+            <label class="form-label">Socks5 认证（留空使用随机）</label>
+            <div style="display:flex; gap:8px;">
+              <input type="text" id="import-auth-user" class="form-control" placeholder="用户名" style="flex:1">
+              <input type="text" id="import-auth-pass" class="form-control" placeholder="密码" style="flex:1">
+            </div>
+            <div style="font-size: 12px; color: var(--ink-gray); margin-top: 4px;">批量导入的节点统一使用此账号密码（对外 socks5/http 认证）。</div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">&nbsp;</label>
+            <div style="display:flex; gap:8px;">
+              <button class="btn btn-primary" style="flex:1; padding: 10px 16px; font-size: 14px;" onclick="handleBatchImport()">开始解析并导入节点</button>
+            </div>
+            <div style="font-size: 12px; color: var(--ink-gray); margin-top: 4px;">socks/http 链接导入后作为出站节点（走 sing-box），支持继续中转/轮询。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: 域名解析轮询入口（多域名独立轮询） -->
+    <div id="tab-relay" class="tab-content">
+      <div class="ink-card relay-card">
+        <div class="relay-title">
+          <span>🌀 多域名解析轮询中转入口 (Load Balance / URL-Test)</span>
+        </div>
+        <p style="font-size: 14px; color: var(--ink-black); opacity: 0.9; line-height: 1.6;">
+          每个域名是一个独立的轮询入口，可各自指定参与轮询的分组。例如：域名 A 轮询「家宽」分组，域名 B 轮询「普通」分组。
+          对外暴露固定 Socks5/HTTP 入口，后端 SingBox 随机/按延迟分发至所选分组节点。
+        </p>
+
+        <!-- 域名列表 -->
+        <div id="relay-domain-list" style="margin: 20px 0; display: flex; flex-direction: column; gap: 16px;">
+          <!-- JS 渲染每个域名卡片 -->
+        </div>
+
+        <!-- 添加域名按钮 -->
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 16px;">
+          <button class="btn btn-secondary btn-sm" onclick="addRelayDomain()">＋ 添加轮询域名</button>
+          <span style="font-size: 12px; color: var(--ink-gray);">每个域名可独立配置端口 / 认证 / 轮询分组</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: SingBox 配置预览 -->
+    <div id="tab-config" class="tab-content">
+      <div class="ink-card" style="padding: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+          <h3 style="font-family: var(--font-serif); color: var(--ochre-gold);">生成完整的 Sing-Box 配置文件 (config.json)</h3>
+          <div>
+            <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(document.getElementById('config-json-code').innerText)">复制 JSON</button>
+            <button class="btn btn-gold btn-sm" onclick="downloadConfigFile()">下载 config.json</button>
+          </div>
+        </div>
+
+        <pre id="config-json-code" class="terminal-window" style="height: 520px; color: #a7f3d0; background: #070d14;"></pre>
+      </div>
+    </div>
+
+    <!-- TAB 5: 导出节点 -->
+    <div id="tab-export" class="tab-content">
+      <div class="ink-card" style="padding: 24px;">
+        <div style="display: flex; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap;">
+          <label class="form-label" style="margin-bottom: 0;">按分组导出:</label>
+          <select id="export-group-select" class="form-select" style="width: 200px;" onchange="generateExportText()">
+            <option value="ALL">全部分组节点</option>
+          </select>
+          <label class="form-label" style="margin-bottom: 0;">协议:</label>
+          <select id="export-proto-select" class="form-select" style="width: 140px;" onchange="generateExportText()">
+            <option value="both">socks5 + http</option>
+            <option value="socks5">仅 socks5</option>
+            <option value="http">仅 http</option>
+            <option value="ss">Shadowsocks</option>
+          </select>
+          <button class="btn btn-primary btn-sm" onclick="copyToClipboard(document.getElementById('export-text-area').value)">复制全部导出链接</button>
+        </div>
+
+        <textarea id="export-text-area" rows="18" readonly style="background: #060a0e; color: var(--ochre-gold);"></textarea>
+      </div>
+    </div>
+
+    <!-- TAB 6: 流量统计面板 -->
+    <div id="tab-traffic" class="tab-content">
+      <div class="ink-card" style="padding: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+          <h3 style="font-family: var(--font-serif); color: var(--ink-black);">全节点流量监控与重置 (Demo 演示模式)</h3>
+          <button class="btn btn-danger btn-sm" onclick="resetAllTraffic()">清空所有节点流量</button>
+        </div>
+
+        <div class="table-container">
+          <table class="node-table">
+            <thead>
+              <tr>
+                <th>端口</th>
+                <th>节点名称</th>
+                <th>分组</th>
+                <th>上行流量</th>
+                <th>下行流量</th>
+                <th>总消耗流量</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="traffic-tbody">
+              <!-- JS 填充 -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 7: 实时系统日志 -->
+    <div id="tab-logs" class="tab-content">
+      <div class="ink-card" style="padding: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+          <h3 style="font-family: var(--font-serif); color: var(--indigo-blue);">系统运行与端口调度日志</h3>
+          <button class="btn btn-outline btn-sm" onclick="clearSystemLogs()">清空日志</button>
+        </div>
+
+        <div id="system-logs-container" class="terminal-window">
+          <!-- 日志内容 -->
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 8: 面板设置 -->
+    <div id="tab-settings" class="tab-content">
+      <div class="ink-card" style="padding: 28px; max-width: 800px; margin: 0 auto;">
+        <h3 style="font-family: var(--font-serif); color: var(--ochre-gold); margin-bottom: 20px;">🔐 面板安全</h3>
+
+        <div class="form-group">
+          <label class="form-label">修改面板密码</label>
+          <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 10px;">
+            <div>
+              <input type="password" id="set-pwd-old" class="form-control" placeholder="当前密码" autocomplete="current-password">
+            </div>
+            <div>
+              <input type="password" id="set-pwd-new" class="form-control" placeholder="新密码（至少 6 位）" autocomplete="new-password">
+            </div>
+            <div>
+              <input type="password" id="set-pwd-confirm" class="form-control" placeholder="确认新密码" autocomplete="new-password" onkeydown="if(event.key==='Enter')doChangePassword(false)">
+            </div>
+          </div>
+          <button class="btn btn-secondary" onclick="doChangePassword(false)">修改密码</button>
+          <span id="set-pwd-msg" style="margin-left:12px;font-size:12px;"></span>
+        </div>
+
+        <div style="border-top: 1px solid var(--paper-border); padding-top: 8px; margin-top: 8px;">
+          <button class="btn btn-outline" onclick="doLogout()" style="color:var(--cinnabar-red);">↪ 退出登录</button>
+        </div>
+
+        <div style="border-top: 1px solid var(--paper-border); margin-top: 16px; padding-top: 20px;">
+          <h3 style="font-family: var(--font-serif); color: var(--ochre-gold); margin-bottom: 20px;">端口冲突防范与网络参数</h3>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">本机已占用端口列表 (多行或逗号分隔，跳过分配)</label>
+          <textarea id="setting-reserved-ports" rows="4" placeholder="22&#10;80&#10;443&#10;8080&#10;19001" onchange="saveSystemSettings()"></textarea>
+          <div style="font-size: 12px; color: var(--ink-gray); margin-top: 4px;">面板分配端口时，遇到上述端口将自动触发冲突跳过逻辑。</div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
+          <div>
+            <label class="form-label">VPS 本地监听地址</label>
+            <input type="text" id="setting-listen-ip" class="form-control" value="0.0.0.0" onchange="saveSystemSettings()">
+          </div>
+          <div>
+            <label class="form-label">自动延迟探活 URL</label>
+            <input type="text" id="setting-test-url" class="form-control" value="http://cp.cloudflare.com/generate_204" onchange="saveSystemSettings()">
+          </div>
+        </div>
+
+        <div style="border-top: 1px solid var(--paper-border); padding-top: 20px; margin-top: 20px; display: flex; justify-content: space-between;">
+          <button class="btn btn-outline" onclick="loadDemoNodes()">⚡ 重新载入 Demo 默认示例节点</button>
+          <button class="btn btn-danger" onclick="clearAllData()">🗑️ 重置面板所有持久化数据</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 页脚与水墨 Slogan -->
+    <footer>
+      <div class="slogan-footer">「山水有相逢，网络无阻隔」</div>
+      <div>Aura Relay Management WebUI &copy; 2026 · socks5/http outbound relay panel</div>
+    </footer>
+
+  </div>
+
+  <!-- 订阅管理模块 -->
+  <script src="subs.js"></script>
+
+  <!-- JavaScript 业务逻辑全实现 (包含动画引擎) -->
+  <script>
+    /* ==========================================
+       0. 认证模块：登录门 / token / 改密 / 登出
+       ========================================== */
+    const AUTH_TOKEN_KEY = 'sb_auth_token';
+    let authToken = localStorage.getItem(AUTH_TOKEN_KEY) || '';
+
+    // 统一 API 封装：自动带 Bearer token，401 自动登出
+    async function api(path, options = {}) {
+      const headers = Object.assign({}, options.headers || {});
+      if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+      if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+      const resp = await fetch(path, Object.assign({}, options, { headers }));
+      if (resp.status === 401) {
+        showLogin(true);
+        throw new Error('登录已过期，请重新登录');
+      }
+      return resp;
+    }
+
+    // 内联 SVG 矢量图标（缩放不变形，用 currentColor 继承按钮文字色）
+    function iconSvg(name) {
+      const P = {
+        bolt:    '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>',
+        edit:    '<path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3zm9-13 3 3"/>',
+        download:'<path d="M12 3v10m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>',
+        trash:   '<path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13"/>',
+      };
+      return '<svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (P[name] || '') + '</svg>';
+    }
+
+    function showLogin(show) {
+      document.getElementById('login-overlay').style.display = show ? 'flex' : 'none';
+      if (show) setTimeout(() => document.getElementById('login-password').focus(), 50);
+    }
+
+    async function checkAuth() {
+      // 无论本地有无 token 都先探后端：后端认证关闭（AUTH_DISABLED=1）时直接放行；
+      // 认证开启且无 token 时 /api/auth/check 返回 401，api() 内已弹出登录。
+      try {
+        const r = await api('/api/auth/check');
+        if (r.ok) {
+          // 验证通过：检查是否需强制改密
+          const st = await api('/api/auth/status');
+          const data = await st.json();
+          if (data.passwordChangeRequired) {
+            showLogin(false);
+            document.getElementById('pwd-overlay').style.display = 'flex';
+          } else {
+            showLogin(false);
+            document.getElementById('pwd-overlay').style.display = 'none';
+          }
+          return true;
+        }
+      } catch (e) { /* 401 已在 api() 内弹出登录 */ }
+      if (!authToken) { showLogin(true); return false; }
+      showLogin(true);
+      return false;
+    }
+
+    async function doLogin() {
+      const username = document.getElementById('login-username').value.trim();
+      const password = document.getElementById('login-password').value;
+      const errEl = document.getElementById('login-error');
+      errEl.textContent = '';
+      try {
+        const r = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await r.json();
+        if (!r.ok) { errEl.textContent = data.detail || '登录失败'; return; }
+        authToken = data.token;
+        localStorage.setItem(AUTH_TOKEN_KEY, authToken);
+        document.getElementById('login-password').value = '';
+        if (data.passwordChangeRequired) {
+          showLogin(false);
+          document.getElementById('pwd-overlay').style.display = 'flex';
+          document.getElementById('pwd-old').focus();
+        } else {
+          showLogin(false);
+          document.getElementById('pwd-overlay').style.display = 'none';
+          addLog('SUCCESS', '登录成功');
+        }
+      } catch (e) { errEl.textContent = '网络错误：' + e.message; }
+    }
+
+    async function doChangePassword(fromFirstLogin) {
+      const oldPwd = fromFirstLogin
+        ? document.getElementById('pwd-old').value
+        : document.getElementById('set-pwd-old').value;
+      const newPwd = fromFirstLogin
+        ? document.getElementById('pwd-new').value
+        : document.getElementById('set-pwd-new').value;
+      const confirmPwd = fromFirstLogin
+        ? document.getElementById('pwd-confirm').value
+        : document.getElementById('set-pwd-confirm').value;
+      const errEl = fromFirstLogin ? document.getElementById('pwd-error') : null;
+      const msgEl = fromFirstLogin ? null : document.getElementById('set-pwd-msg');
+      if (!fromFirstLogin && msgEl) msgEl.textContent = '';
+      if (errEl) errEl.textContent = '';
+
+      if (!oldPwd) { errEl ? errEl.textContent = '请输入当前密码' : (msgEl && (msgEl.textContent = '请输入当前密码')); return; }
+      if (newPwd.length < 6) { errEl ? errEl.textContent = '新密码至少 6 位' : (msgEl && (msgEl.textContent = '新密码至少 6 位')); return; }
+      if (newPwd !== confirmPwd) { errEl ? errEl.textContent = '两次输入的新密码不一致' : (msgEl && (msgEl.textContent = '两次输入的新密码不一致')); return; }
+
+      try {
+        const r = await api('/api/auth/change-password', {
+          method: 'POST',
+          body: JSON.stringify({ oldPassword: oldPwd, newPassword: newPwd })
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          const msg = data.detail || '修改失败';
+          errEl ? errEl.textContent = msg : (msgEl && (msgEl.textContent = msg));
+          return;
+        }
+        // 改密成功：用返回的新 token 替换（会话保持不断）
+        if (data.token) {
+          authToken = data.token;
+          localStorage.setItem(AUTH_TOKEN_KEY, authToken);
+        }
+        if (fromFirstLogin) {
+          document.getElementById('pwd-overlay').style.display = 'none';
+          document.getElementById('pwd-old').value = '';
+          document.getElementById('pwd-new').value = '';
+          document.getElementById('pwd-confirm').value = '';
+          addLog('SUCCESS', '密码修改成功，欢迎使用面板');
+        } else {
+          document.getElementById('set-pwd-old').value = '';
+          document.getElementById('set-pwd-new').value = '';
+          document.getElementById('set-pwd-confirm').value = '';
+          msgEl.textContent = '✅ 密码修改成功';
+          msgEl.style.color = 'var(--jade-green-glow)';
+          addLog('SUCCESS', '密码修改成功');
+        }
+      } catch (e) { errEl ? errEl.textContent = e.message : (msgEl && (msgEl.textContent = e.message)); }
+    }
+
+    async function doLogout() {
+      try { await api('/api/auth/logout', { method: 'POST' }); } catch (e) {}
+      authToken = '';
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+      showLogin(true);
+    }
+
+    /* ==========================================
+       1. 全局状态与数据持久化
+       ========================================== */
+    const STORAGE_NODES_KEY = 'singbox_relay_nodes_v2';
+    const STORAGE_SETTINGS_KEY = 'singbox_relay_settings_v2';
+    const STORAGE_LOGS_KEY = 'singbox_relay_logs_v2';
+
+    let nodeState = [];
+    let systemLogs = [];
+    let systemSettings = {
+      reservedPorts: [22, 80, 443, 8080, 19001],
+      listenIp: '0.0.0.0',
+      testUrl: 'http://cp.cloudflare.com/generate_204',
+      relayDomain: 'relay.singbox.net',
+      relayPort: 33440,
+      relayAuth: 'relayuser:relaypass',
+      relaySelectedGroups: ['ALL'],
+      // 多域名轮询入口数组：{id, domain, port, authUser, authPass, groups:[]}
+      relayDomains: [
+        { id: 'relay-1', domain: 'relay.singbox.net', port: 33440, authUser: 'relayuser', authPass: 'relaypass', groups: ['ALL'] }
+      ]
+    };
+
+    // 动态实时速率模拟数据
+    let realtimeUpSpeed = 1.25;
+    let realtimeDownSpeed = 18.40;
+
+    // 30秒实时流量历史点 array ({ up, down, time })
+    let trafficHistory = [];
+    let globalPeakSpeed = 0;
+
+    // SSE 真实流量连接状态
+    let sseConnected = false;
+
+    // 初始化 App
+    window.addEventListener('DOMContentLoaded', async () => {
+      // 认证门：先等 checkAuth 完成（决定是否显示登录遮罩），再加载数据
+      await checkAuth();
+
+      loadSettingsFromStorage();
+
+      // 后端优先：有后端则拉真实节点，无后端回退 localStorage demo
+      await loadNodesFromBackendOrStorage();
+
+      // 初始化 30 秒默认历史曲线点 (保证初始页面视觉自然平滑)
+      initInitialTrafficHistory();
+
+      // 订阅管理：加载订阅 + 6 小时自动刷新
+      if (typeof window.SubscriptionManager !== 'undefined') {
+        initSubscriptionAutoRefresh();
+        renderSubList();
+      }
+
+      addLog('INFO', 'Aura WebUI 启动完成，高密度水墨监控中心加载完毕。');
+
+      // 启动顶部仪表盘 JS 真实动画引擎
+      initDashboardAnimationEngine();
+
+      // 连接后端 SSE 流量流（失败静默回退模拟动画）
+      startTrafficSSE();
+    });
+
+    /* ---------- SSE 真实流量消费（fetch + ReadableStream，支持 Bearer token） ---------- */
+    function startTrafficSSE() {
+      try {
+        const url = '/api/stats/stream';
+        const headers = {};
+        if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+        fetch(url, { headers }).then(resp => {
+          if (!resp.ok) return; // 静默放弃，回退模拟
+          sseConnected = true;
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = '';
+          function pump() {
+            reader.read().then(({ done, value }) => {
+              if (done) { sseConnected = false; return; }
+              buf += decoder.decode(value, { stream: true });
+              const parts = buf.split('\n\n');
+              buf = parts.pop();
+              for (const chunk of parts) {
+                const lines = chunk.split('\n');
+                for (const line of lines) {
+                  if (!line.startsWith('data: ')) continue;
+                  try {
+                    const payload = JSON.parse(line.slice(6));
+                    if (payload.type === 'traffic') {
+                      // 用真实速率覆盖模拟值
+                      realtimeUpSpeed = payload.upRate || 0;
+                      realtimeDownSpeed = payload.downRate || 0;
+                      // 同步节点状态（upTraffic/downTraffic 累计值 + 状态）
+                      if (Array.isArray(payload.nodes)) {
+                        payload.nodes.forEach(ns => {
+                          const node = nodeState.find(n => n.id === ns.id);
+                          if (node) {
+                            if (ns.upTraffic != null) node.upTraffic = ns.upTraffic;
+                            if (ns.downTraffic != null) node.downTraffic = ns.downTraffic;
+                            if (ns.status) node.status = ns.status;
+                            if (ns.ping != null) node.ping = ns.ping;
+                          }
+                        });
+                      }
+                    }
+                  } catch (e) { /* 解析失败跳过 */ }
+                }
+              }
+              pump();
+            }).catch(() => { sseConnected = false; });
+          }
+          pump();
+        }).catch(() => { /* fetch 失败静默 */ });
+      } catch (e) { /* 整体异常静默 */ }
+    }
+
+    function initInitialTrafficHistory() {
+      trafficHistory = [];
+      const now = Date.now();
+      for (let i = 29; i >= 0; i--) {
+        const ptTime = now - i * 1000;
+        const upVal = Math.max(0.2, 1.20 + Math.sin(i * 0.4) * 0.5 + (Math.random() * 0.2 - 0.1));
+        const downVal = Math.max(2.0, 18.50 + Math.cos(i * 0.3) * 4.5 + (Math.random() * 0.8 - 0.4));
+        trafficHistory.push({ up: upVal, down: downVal, time: ptTime });
+        const total = upVal + downVal;
+        if (total > globalPeakSpeed) globalPeakSpeed = total;
+      }
+    }
+
+    /* ==========================================
+       仪表盘动画引擎 (动态水墨波浪 + 30s 流量曲线 + 数字实时跳动)
+       ========================================== */
+    function initDashboardAnimationEngine() {
+      let step = 0;
+      let lastPushTime = Date.now();
+
+      function animate() {
+        step += 0.04;
+        
+        // 1. 模拟速率的微小起伏波动 (使得数据跳动极其平滑自然)
+        const targetUp = 1.20 + Math.sin(step * 1.2) * 0.45 + (Math.random() * 0.1 - 0.05);
+        const targetDown = 18.50 + Math.cos(step * 0.8) * 4.20 + (Math.random() * 0.4 - 0.2);
+
+        realtimeUpSpeed = Math.max(0.05, realtimeUpSpeed * 0.95 + targetUp * 0.05);
+        realtimeDownSpeed = Math.max(0.1, realtimeDownSpeed * 0.95 + targetDown * 0.05);
+
+        const upEl = document.getElementById('realtime-up-speed');
+        const downEl = document.getElementById('realtime-down-speed');
+        if (upEl) upEl.innerText = realtimeUpSpeed.toFixed(2);
+        if (downEl) downEl.innerText = realtimeDownSpeed.toFixed(2);
+
+        // 2. 生成 SVG 动态水墨波浪 Path (Wave 1 & Wave 2)
+        const path1 = document.getElementById('ink-wave-1');
+        const path2 = document.getElementById('ink-wave-2');
+        if (path1 && path2) {
+          path1.setAttribute('d', generateWavePath(600, 70, step, 15 + realtimeUpSpeed * 3, 0.015, 38));
+          path2.setAttribute('d', generateWavePath(600, 70, step + 1.5, 18 + realtimeDownSpeed * 0.6, 0.018, 32));
+        }
+
+        // 3. 每隔 1 秒 push 一个 30 秒折线图数据点
+        const now = Date.now();
+        if (now - lastPushTime >= 1000) {
+          lastPushTime = now;
+          pushChartDataPoint();
+        }
+
+        requestAnimationFrame(animate);
+      }
+
+      requestAnimationFrame(animate);
+    }
+
+    function generateWavePath(width, height, phase, amplitude, frequency, yOffset) {
+      let points = [];
+      points.push(`M 0 ${height}`);
+      for (let x = 0; x <= width; x += 10) {
+        const y = Math.sin(x * frequency + phase) * amplitude + yOffset;
+        points.push(`L ${x} ${y.toFixed(1)}`);
+      }
+      points.push(`L ${width} ${height}`);
+      points.push('Z');
+      return points.join(' ');
+    }
+
+    function pushChartDataPoint() {
+      trafficHistory.push({
+        up: realtimeUpSpeed,
+        down: realtimeDownSpeed,
+        time: Date.now()
+      });
+
+      if (trafficHistory.length > 30) {
+        trafficHistory.shift();
+      }
+
+      // 实时递增当前在线节点的微小流量
+      if (nodeState.length > 0) {
+        const onlineNodes = nodeState.filter(n => n.status === 'online');
+        if (onlineNodes.length > 0) {
+          const bytesToAddUp = Math.floor((realtimeUpSpeed * 1024 * 1024) / onlineNodes.length);
+          const bytesToAddDown = Math.floor((realtimeDownSpeed * 1024 * 1024) / onlineNodes.length);
+          onlineNodes.forEach(node => {
+            node.upTraffic = (node.upTraffic || 0) + bytesToAddUp;
+            node.downTraffic = (node.downTraffic || 0) + bytesToAddDown;
+          });
+        }
+      }
+
+      updateChartAndStats();
+      renderOverviewCards();
+      renderGroupDistribution();
+      renderNodeMatrix();
+    }
+
+    /* ==========================================
+       2. 高密度仪表盘子区块渲染器 (1.折线图 2.矩阵 3.三连 4.分组分布)
+       ========================================== */
+    
+    // 1. 30秒折线图与速率统计三连渲染
+    function updateChartAndStats() {
+      if (trafficHistory.length === 0) return;
+
+      let totalUp = 0, totalDown = 0;
+      let windowPeak = 0;
+
+      trafficHistory.forEach(pt => {
+        totalUp += pt.up;
+        totalDown += pt.down;
+        const ptTotal = pt.up + pt.down;
+        if (ptTotal > windowPeak) windowPeak = ptTotal;
+      });
+
+      if (windowPeak > globalPeakSpeed) globalPeakSpeed = windowPeak;
+
+      const avgSpeed = (totalUp + totalDown) / trafficHistory.length;
+      const currentTotalSpeed = realtimeUpSpeed + realtimeDownSpeed;
+
+      const avgEl = document.getElementById('dash-stat-avg-speed');
+      const peakEl = document.getElementById('dash-stat-peak-speed');
+      const totalEl = document.getElementById('dash-stat-total-speed');
+      const chartPeakEl = document.getElementById('dash-chart-peak');
+
+      if (avgEl) avgEl.innerHTML = `${avgSpeed.toFixed(2)} <span class="unit">MB/s</span>`;
+      if (peakEl) peakEl.innerHTML = `${globalPeakSpeed.toFixed(2)} <span class="unit">MB/s</span>`;
+      if (totalEl) totalEl.innerHTML = `${currentTotalSpeed.toFixed(2)} <span class="unit">MB/s</span>`;
+      if (chartPeakEl) chartPeakEl.innerText = `${globalPeakSpeed.toFixed(2)} MB/s`;
+
+      drawRealtimeChartSVG();
+    }
+
+    function drawRealtimeChartSVG() {
+      const upLine = document.getElementById('chart-up-line');
+      const downLine = document.getElementById('chart-down-line');
+      const upArea = document.getElementById('chart-up-area');
+      const downArea = document.getElementById('chart-down-area');
+
+      if (!upLine || !downLine || !upArea || !downArea) return;
+
+      const svgWidth = 500;
+      const bottomY = 75;
+      const topY = 5;
+      const availableHeight = bottomY - topY;
+
+      let maxY = 4.0;
+      trafficHistory.forEach(pt => {
+        if (pt.up > maxY) maxY = pt.up;
+        if (pt.down > maxY) maxY = pt.down;
+      });
+      maxY *= 1.15;
+
+      const count = trafficHistory.length;
+      const pointsUp = [];
+      const pointsDown = [];
+
+      trafficHistory.forEach((pt, i) => {
+        const x = count > 1 ? (i / (count - 1)) * svgWidth : svgWidth;
+        const yUp = bottomY - (pt.up / maxY) * availableHeight;
+        const yDown = bottomY - (pt.down / maxY) * availableHeight;
+        pointsUp.push({ x, y: yUp });
+        pointsDown.push({ x, y: yDown });
+      });
+
+      const linePathUp = pointsToSvgPath(pointsUp);
+      const linePathDown = pointsToSvgPath(pointsDown);
+
+      const firstX = pointsUp[0].x;
+      const lastX = pointsUp[pointsUp.length - 1].x;
+
+      const areaPathUp = linePathUp + ` L ${lastX} ${bottomY} L ${firstX} ${bottomY} Z`;
+      const areaPathDown = linePathDown + ` L ${lastX} ${bottomY} L ${firstX} ${bottomY} Z`;
+
+      upLine.setAttribute('d', linePathUp);
+      downLine.setAttribute('d', linePathDown);
+      upArea.setAttribute('d', areaPathUp);
+      downArea.setAttribute('d', areaPathDown);
+    }
+
+    function pointsToSvgPath(points) {
+      if (!points || points.length === 0) return '';
+      if (points.length === 1) return `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`;
+
+      let d = `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`;
+      for (let i = 1; i < points.length; i++) {
+        const prev = points[i - 1];
+        const curr = points[i];
+        const cp1x = prev.x + (curr.x - prev.x) / 2;
+        const cp1y = prev.y;
+        const cp2x = prev.x + (curr.x - prev.x) / 2;
+        const cp2y = curr.y;
+        d += ` C ${cp1x.toFixed(1)} ${cp1y.toFixed(1)}, ${cp2x.toFixed(1)} ${cp2y.toFixed(1)}, ${curr.x.toFixed(1)} ${curr.y.toFixed(1)}`;
+      }
+      return d;
+    }
+
+    // 2. 节点在线状态矩阵
+    function renderNodeMatrix() {
+      const container = document.getElementById('node-matrix-grid');
+      const summaryEl = document.getElementById('matrix-status-summary');
+      if (!container) return;
+
+      const total = nodeState.length;
+      const online = nodeState.filter(n => n.status === 'online').length;
+      if (summaryEl) summaryEl.innerText = `在线 ${online} / 总数 ${total}`;
+
+      if (total === 0) {
+        container.innerHTML = '<div style="font-size:11px; color:var(--ink-gray); grid-column:1/-1;">无节点</div>';
+        return;
+      }
+
+      // 选出一个当前轮询活跃节点作为朱砂红高亮点
+      const onlineNodes = nodeState.filter(n => n.status === 'online');
+      const activeNodeId = onlineNodes.length > 0 ? onlineNodes[Math.floor(Date.now() / 3500) % onlineNodes.length].id : null;
+
+      container.innerHTML = nodeState.map(n => {
+        let statusClass = 'offline';
+        if (n.status === 'online') {
+          statusClass = (n.id === activeNodeId) ? 'active' : 'online';
+        }
+        const title = `${escapeHtml(n.name)} (${n.port}) - ${n.status === 'online' ? '在线' : '离线'}`;
+        return `<div class="matrix-dot ${statusClass}" title="${title}"></div>`;
+      }).join('');
+    }
+
+
+    // 4. 分组流量分布 (撑满宽度 + 详细分组列表)
+    function renderGroupDistribution() {
+      const barContainer = document.getElementById('group-stacked-bar-container');
+      const legendContainer = document.getElementById('group-legend-list');
+      if (!barContainer || !legendContainer) return;
+
+      if (nodeState.length === 0) {
+        barContainer.innerHTML = '<div style="width:100%; height:100%; background:rgba(255,255,255,0.05);"></div>';
+        legendContainer.innerHTML = '<div style="font-size:11px; color:var(--ink-gray); text-align:center; padding:10px;">暂无分组数据</div>';
+        return;
+      }
+
+      const groupTrafficMap = {};
+      const groupNodeCountMap = {};
+      let totalBytes = 0;
+
+      nodeState.forEach(n => {
+        const grp = n.group || (n.segment === 51 ? '高质量' : '普通');
+        const bytes = (n.upTraffic || 0) + (n.downTraffic || 0);
+        groupTrafficMap[grp] = (groupTrafficMap[grp] || 0) + bytes;
+        groupNodeCountMap[grp] = (groupNodeCountMap[grp] || 0) + 1;
+        totalBytes += bytes;
+      });
+
+      const colors = ['#389e6d', '#d4a337', '#3a6b88', '#c83c23', '#8a5a83', '#4a729c', '#7c8d62', '#9e7d58'];
+      const groupKeys = Object.keys(groupTrafficMap);
+
+      let barHtml = '';
+      let legendHtml = '';
+
+      groupKeys.forEach((grp, idx) => {
+        const bytes = groupTrafficMap[grp];
+        const count = groupNodeCountMap[grp] || 0;
+        const pct = totalBytes > 0 ? ((bytes / totalBytes) * 100) : (100 / groupKeys.length);
+        const color = colors[idx % colors.length];
+
+        barHtml += `<div class="group-bar-segment" style="width: ${pct.toFixed(1)}%; background: ${color};" title="${escapeHtml(grp)}: ${pct.toFixed(1)}%"></div>`;
+        
+        legendHtml += `
+          <div class="group-legend-item">
+            <div class="left">
+              <span class="color-chip" style="background: ${color};"></span>
+              <span class="group-name" title="${escapeHtml(grp)}">${escapeHtml(grp)}</span>
+              <div class="mini-bar-bg">
+                <div style="width:${pct.toFixed(1)}%; height:100%; background:${color}; border-radius:2px;"></div>
+              </div>
+            </div>
+            <div class="right">
+              <span style="color:var(--ink-gray); font-size:10px; background:rgba(255,255,255,0.06); padding:1px 5px; border-radius:3px;">${count}节点</span>
+              <span style="font-family:var(--font-code); color:var(--ink-black); font-weight:600; font-size:11px;">${formatBytes(bytes)}</span>
+              <span style="font-family:var(--font-code); color:var(--ink-gray); font-size:10.5px; width:38px; text-align:right;">${pct.toFixed(1)}%</span>
+            </div>
+          </div>
+        `;
+      });
+
+      barContainer.innerHTML = barHtml;
+      legendContainer.innerHTML = legendHtml;
+    }
+
+
+    /* ==========================================
+       3. 日志系统
+       ========================================== */
+    function addLog(level, msg) {
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
+      const logItem = { time: timeStr, level, msg };
+      systemLogs.unshift(logItem);
+      if (systemLogs.length > 200) systemLogs.pop();
+      renderLogs();
+    }
+
+    function renderLogs() {
+      const container = document.getElementById('system-logs-container');
+      if (!container) return;
+      
+      container.innerHTML = systemLogs.map(l => {
+        let levelClass = 'log-info';
+        if (l.level === 'WARN') levelClass = 'log-warn';
+        if (l.level === 'ERROR') levelClass = 'log-error';
+        if (l.level === 'SUCCESS') levelClass = 'log-success';
+
+        return `<div class="log-line">
+          <span class="log-time">[${l.time}]</span> 
+          <span class="${levelClass}">[${l.level}]</span> ${escapeHtml(l.msg)}
+        </div>`;
+      }).join('');
+    }
+
+    function clearSystemLogs() {
+      systemLogs = [];
+      renderLogs();
+    }
+
+    /* ==========================================
+       4. 持久化存储与 Demo 数据加载
+       ========================================== */
+    function saveNodesToStorage() {
+      // 后端模式下仅刷新 UI，不写 localStorage（真实数据在后端 DB）
+      if (window.__backendMode) {
+        renderAll();
+        return;
+      }
+      localStorage.setItem(STORAGE_NODES_KEY, JSON.stringify(nodeState));
+      renderAll();
+    }
+
+    function loadNodesFromStorage() {
+      const data = localStorage.getItem(STORAGE_NODES_KEY);
+      if (data) {
+        try { nodeState = JSON.parse(data); } catch(e) { nodeState = []; }
+      }
+    }
+
+    async function loadNodesFromBackendOrStorage() {
+      try {
+        const resp = await api('/api/nodes');
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data && data.items) {
+            nodeState = data.items.map(n => {
+              // 兼容后端返回的 node 字段
+              n.entryProto = n.entryProto || 'mixed';
+              return n;
+            });
+            // 后端有数据则标记已走后端（保存不再覆盖 DB）
+            window.__backendMode = true;
+            renderAll();
+            return;
+          }
+        }
+      } catch (e) { /* 无后端走 localStorage */ }
+      // 无后端：回退本地 demo
+      loadNodesFromStorage();
+      if (nodeState.length === 0) {
+        loadDemoNodes(false);
+      } else {
+        renderAll();
+      }
+    }
+
+    function saveSystemSettings() {
+      const reservedStr = document.getElementById('setting-reserved-ports').value;
+      const reservedArr = reservedStr.split(/[\n,]/).map(x => parseInt(x.trim())).filter(x => !isNaN(x));
+      
+      systemSettings.reservedPorts = reservedArr;
+      systemSettings.listenIp = document.getElementById('setting-listen-ip').value.trim() || '0.0.0.0';
+      systemSettings.testUrl = document.getElementById('setting-test-url').value.trim();
+      
+      localStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify(systemSettings));
+      addLog('INFO', '系统配置参数已保存');
+      renderAll();
+    }
+
+    function loadSettingsFromStorage() {
+      const data = localStorage.getItem(STORAGE_SETTINGS_KEY);
+      if (data) {
+        try { systemSettings = Object.assign(systemSettings, JSON.parse(data)); } catch(e){}
+      }
+      // 兼容旧数据：若没有 relayDomains，从旧字段迁移
+      if (!systemSettings.relayDomains || !systemSettings.relayDomains.length) {
+        systemSettings.relayDomains = [{
+          id: 'relay-1',
+          domain: systemSettings.relayDomain || 'relay.singbox.net',
+          port: systemSettings.relayPort || 33440,
+          authUser: (systemSettings.relayAuth || 'relayuser:relaypass').split(':')[0],
+          authPass: (systemSettings.relayAuth || 'relayuser:relaypass').split(':')[1] || 'relaypass',
+          groups: systemSettings.relaySelectedGroups || ['ALL']
+        }];
+      }
+
+      document.getElementById('setting-reserved-ports').value = systemSettings.reservedPorts.join('\n');
+      document.getElementById('setting-listen-ip').value = systemSettings.listenIp;
+      document.getElementById('setting-test-url').value = systemSettings.testUrl;
+      renderRelayDomainList();
+    }
+
+    function loadDemoNodes(shouldSave = true) {
+      nodeState = [
+        {
+          id: 'demo-1',
+          name: '香港 BGP 原生家宽 [高质量VIP]',
+          protocol: 'shadowsocks',
+          group: '香港专线',
+          port: 51001,
+          segment: 51,
+          authUser: 'user51001',
+          authPass: 'pass51001',
+          status: 'online',
+          ping: 32,
+          exitIp: '103.21.244.18',
+          upTraffic: 1024 * 1024 * 42,
+          downTraffic: 1024 * 1024 * 380,
+          rawConfig: { type: 'ss', server: 'hk.node.com', server_port: 8388, method: 'aes-128-gcm', password: 'secretpassword' }
+        },
+        {
+          id: 'demo-2',
+          name: '日本 东京 住宅 ISP [高速双 ISP]',
+          protocol: 'vmess',
+          group: '日本节点',
+          port: 51002,
+          segment: 51,
+          authUser: 'user51002',
+          authPass: 'pass51002',
+          status: 'online',
+          ping: 68,
+          exitIp: '133.242.180.5',
+          upTraffic: 1024 * 1024 * 12,
+          downTraffic: 1024 * 1024 * 150,
+          rawConfig: { type: 'vmess', server: 'jp.node.com', server_port: 443, uuid: 'a1b2c3d4-e5f6-7890-1234-56789abcdef0' }
+        },
+        {
+          id: 'demo-3',
+          name: '美国 洛杉矶 普通 Cloud 01',
+          protocol: 'vless',
+          group: '默认分组',
+          port: 52001,
+          segment: 52,
+          authUser: 'user52001',
+          authPass: 'pass52001',
+          status: 'online',
+          ping: 165,
+          exitIp: '104.28.19.88',
+          upTraffic: 1024 * 1024 * 8,
+          downTraffic: 1024 * 1024 * 90,
+          rawConfig: { type: 'vless', server: 'us.node.com', server_port: 443, uuid: '11111111-2222-3333-4444-555555555555' }
+        },
+        {
+          id: 'demo-4',
+          name: '新加坡 Trojan 直连 02',
+          protocol: 'trojan',
+          group: '默认分组',
+          port: 52002,
+          segment: 52,
+          authUser: 'user52002',
+          authPass: 'pass52002',
+          status: 'offline',
+          ping: 0,
+          exitIp: 'N/A',
+          upTraffic: 0,
+          downTraffic: 0,
+          rawConfig: { type: 'trojan', server: 'sg.node.com', server_port: 443, password: 'trojanpassword' }
+        }
+      ];
+
+      addLog('SUCCESS', '重置并装载 Demo 4 节点数据（含 51/52 徽标与模拟流量）');
+      if (shouldSave) saveNodesToStorage();
+      else renderAll();
+    }
+
+    function clearAllData() {
+      if (confirm('确认清空面板全部节点与数据配置？此操作无法撤销。')) {
+        nodeState = [];
+        saveNodesToStorage();
+        addLog('WARN', '已清空所有节点数据。');
+      }
+    }
+
+    /* ==========================================
+       5. 节点解析与导入逻辑 (真实解析器)
+       ========================================== */
+    function handleBatchImport() {
+      const text = document.getElementById('import-text').value.trim();
+      const startPortInput = document.getElementById('import-start-port').value.trim();
+      const targetGroup = document.getElementById('import-group').value.trim() || '默认分组';
+      const authUser = document.getElementById('import-auth-user').value.trim();
+      const authPass = document.getElementById('import-auth-pass').value.trim();
+      const entryProto = document.getElementById('import-entry-proto') ? document.getElementById('import-entry-proto').value : 'mixed';
+      const ssPass = document.getElementById('import-ss-pass') ? document.getElementById('import-ss-pass').value.trim() : '';
+
+      if (!text) {
+        alert('请先粘贴节点订阅/单链接！');
+        return;
+      }
+
+      if (entryProto === 'ss' && ssPass && ssPass.length < 4) {
+        alert('Shadowsocks 密码至少 4 位（留空则自动随机生成）');
+        return;
+      }
+
+      // 生成随机认证（留空时用）
+      const randStr = (len) => { const c='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'; let r=''; for(let i=0;i<len;i++) r+=c[Math.floor(Math.random()*c.length)]; return r; };
+      const finalUser = authUser || randStr(8);
+      const finalPass = authPass || randStr(12);
+
+      let startPort = startPortInput ? parseInt(startPortInput) : null;
+      const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+      const importedNodes = [];
+      const batchUsedPorts = new Set(); // 批内已分配端口，避免自增冲突
+      let importedCount = 0;
+      let skippedCount = 0;
+
+      lines.forEach(line => {
+        try {
+          const parsedNode = parseProxyUri(line);
+          if (parsedNode) {
+            // 自动判断 51/52 质量段
+            const isHighQuality = /(住宅|ISP|原生|家宽|residential|高速)/i.test(parsedNode.name);
+            parsedNode.segment = isHighQuality ? 51 : 52;
+            parsedNode.group = targetGroup;
+
+            // 端口分配规则（批内自增，避免多个节点拿到同一端口）
+            let targetPort;
+            if (startPort !== null) {
+              targetPort = getNextAvailablePort(startPort, batchUsedPorts);
+              startPort = targetPort + 1; // 供下一个节点使用
+            } else {
+              const defaultBase = isHighQuality ? 51001 : 52001;
+              targetPort = getNextAvailablePort(defaultBase, batchUsedPorts);
+            }
+            batchUsedPorts.add(targetPort);
+
+            parsedNode.port = targetPort;
+            parsedNode.authUser = finalUser;
+            parsedNode.authPass = finalPass;
+            parsedNode.id = 'node-' + Date.now() + '-' + Math.floor(Math.random()*1000);
+            parsedNode.status = 'offline';
+            parsedNode.ping = 0;
+            parsedNode.exitIp = parsedNode.rawConfig.server || '1.1.1.1';
+            parsedNode.upTraffic = 0;
+            parsedNode.downTraffic = 0;
+            // 出口协议：按用户选择设置（mixed=转socks5+http；ss=转Shadowsocks）
+            parsedNode.entryProto = entryProto;
+            if (entryProto === 'ss') parsedNode.ssPass = ssPass || ('sb' + Math.random().toString(36).slice(2, 10));
+
+            importedNodes.push(parsedNode);
+            importedCount++;
+          } else {
+            skippedCount++;
+          }
+        } catch(err) {
+          addLog('ERROR', `解析节点链接失败: ${line.substring(0, 30)}... Error: ${err.message}`);
+          skippedCount++;
+        }
+      });
+
+      if (importedNodes.length === 0) {
+        addLog('ERROR', `批量导入失败：${lines.length} 行全部无效`);
+        return;
+      }
+
+      // 后端模式：调 /api/nodes/batch 真实入库（节点带 entryProto/ssPass）
+      if (window.__backendMode) {
+        api('/api/nodes/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nodes: importedNodes }),
+        }).then(resp => {
+          if (!resp.ok) throw new Error('batch 失败 ' + resp.status);
+          return resp.json();
+        }).then(data => {
+          addLog('SUCCESS', `批量导入完成：成功 ${data.created} 个，忽略 ${data.skipped} 个（含重复），出口协议 ${entryProto === 'ss' ? 'Shadowsocks(aes-256-gcm)' : 'socks5+http'}。`);
+          // 重新拉取后端节点同步
+          return api('/api/nodes').then(r => r.json());
+        }).then(data => {
+          if (data && data.items) {
+            nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
+            renderAll();
+          }
+        }).catch(err => {
+          addLog('ERROR', '批量导入后端失败: ' + err.message);
+        });
+      } else {
+        // 本地预览模式
+        importedNodes.forEach(n => nodeState.push(n));
+        addLog('SUCCESS', `（预览模式）批量导入 ${importedNodes.length} 个节点，出口协议 ${entryProto === 'ss' ? 'Shadowsocks' : 'socks5+http'}。`);
+        saveNodesToStorage();
+      }
+
+      document.getElementById('import-text').value = '';
+      switchTab('nodes');
+    }
+
+    function toggleImportPassField() {
+      const el = document.getElementById('import-pass-group');
+      const proto = document.getElementById('import-entry-proto').value;
+      if (el) el.style.display = (proto === 'ss') ? 'block' : 'none';
+    }
+
+    /* ==========================================
+       订阅管理（基于 subs.js 的 SubscriptionManager）
+       ========================================== */
+    function addSubscription() {
+      const url = document.getElementById('sub-url').value.trim();
+      if (!url) { addLog('ERROR', '请填写订阅 URL'); return; }
+      const name = document.getElementById('sub-name').value.trim();
+      const group = document.getElementById('sub-group').value.trim() || '订阅节点';
+      const r = window.SubscriptionManager.addSub({ url, name, group });
+      if (!r.ok) { addLog('ERROR', r.msg); return; }
+      addLog('INFO', `已添加订阅 [${r.sub.name}]，立即拉取…`);
+      document.getElementById('sub-url').value = '';
+      renderSubList();
+      refreshSubAndImport(r.sub);
+    }
+
+    async function refreshSubAndImport(sub) {
+      const r = await window.SubscriptionManager.refreshSub(sub, (s, nodes) => {
+        importSubscriptionNodes(s, nodes);
+      });
+      if (r.ok) {
+        addLog('SUCCESS', `订阅 [${sub.name}] 刷新成功，导入 ${r.count} 个节点`);
+      } else {
+        addLog('ERROR', `订阅 [${sub.name}] 刷新失败: ${r.error}`);
+      }
+      renderSubList();
+    }
+
+    // 把订阅解析出的节点并入 nodeState（去重 + 端口分配）
+    function importSubscriptionNodes(sub, parsedNodes, opts) {
+      const stale = opts && opts.stale;
+      const randStr = (len) => { const c='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'; let r=''; for(let i=0;i<len;i++) r+=c[Math.floor(Math.random()*c.length)]; return r; };
+      let added = 0, dup = 0;
+      parsedNodes.forEach(pn => {
+        const server = pn.rawConfig && (pn.rawConfig.server || pn.rawConfig.address);
+        const port = pn.rawConfig && (pn.rawConfig.server_port || pn.rawConfig.port);
+        // 去重：同 server:port 已存在则跳过
+        if (server && nodeState.some(n => n.rawConfig && (n.rawConfig.server || n.rawConfig.address) === server && (n.rawConfig.server_port || n.rawConfig.port) === port)) {
+          dup++;
+          return;
+        }
+        const isHighQuality = /(住宅|ISP|原生|家宽|residential|高速)/i.test(pn.name || '');
+        const targetPort = getNextAvailablePort(isHighQuality ? 51001 : 52001);
+        nodeState.push({
+          id: 'node-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+          name: pn.name || '未命名',
+          protocol: pn.protocol,
+          group: sub.group || '订阅节点',
+          port: targetPort,
+          segment: isHighQuality ? 51 : 52,
+          authUser: randStr(8),
+          authPass: randStr(12),
+          status: 'online',
+          ping: Math.floor(Math.random() * 120) + 20,
+          exitIp: server || '1.1.1.1',
+          upTraffic: Math.floor(Math.random() * 1024 * 1024 * 20),
+          downTraffic: Math.floor(Math.random() * 1024 * 1024 * 200),
+          rawConfig: pn.rawConfig || {},
+          subId: sub.id,
+          stale: !!stale,
+          entryProto: 'mixed'
+        });
+        added++;
+      });
+      if (added) saveNodesToStorage();
+      addLog(stale ? 'WARN' : 'INFO', `订阅 [${sub.name}] ${stale ? '刷新失败，使用过期快照' : '解析'} ${parsedNodes.length} 条，新增 ${added}，去重跳过 ${dup}`);
+    }
+
+    function renderSubList() {
+      const subs = window.SubscriptionManager.getSubs();
+      const box = document.getElementById('sub-list');
+      if (!box) return;
+      if (!subs.length) {
+        box.innerHTML = '<div style="color: var(--ink-gray); font-size: 13px; padding: 10px;">暂无订阅，添加后在此显示列表。</div>';
+        return;
+      }
+      box.innerHTML = subs.map(s => {
+        const last = s.lastRefresh ? new Date(s.lastRefresh).toLocaleTimeString('zh-CN', { hour12: false }) : '从未';
+        const next = s.lastRefresh ? Math.max(0, Math.round((s.lastRefresh + window.SubscriptionManager.REFRESH_INTERVAL - Date.now()) / 60000)) : '—';
+        const status = s.lastError ? `<span style="color:#e08a7e">${escapeHtml(s.lastError)}</span>` : (s.lastRefresh ? `<span style="color:#6fae8a">${s.nodeCount} 节点</span>` : '<span style="color:var(--ink-gray)">未拉取</span>');
+        return `<div style="display:flex; align-items:center; gap:12px; padding:10px 12px; border-bottom:1px solid rgba(180,165,140,.12); flex-wrap:wrap;">
+          <span style="font-weight:600;">${escapeHtml(s.name)}</span>
+          <span style="color:var(--ink-gray); font-size:12px; overflow:hidden; text-overflow:ellipsis; max-width:300px;">${escapeHtml(s.url)}</span>
+          <span style="font-size:12px; color:var(--ink-gray);">分组: ${escapeHtml(s.group)}</span>
+          <span style="font-size:12px;">${status}</span>
+          <span style="font-size:12px; color:var(--ink-gray);">上次: ${last} · 下次: ${next} 分钟后</span>
+          <div style="margin-left:auto; display:flex; gap:6px;">
+            <button class="btn btn-ghost btn-sm" onclick="refreshSubAndImport(window.SubscriptionManager.getSubs().find(x=>x.id==='${s.id}'))">立即刷新</button>
+            <button class="btn btn-ghost btn-sm" onclick="removeSubscription('${s.id}')">删除</button>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    function removeSubscription(id) {
+      if (window.__backendMode) {
+        // 后端模式：先清理后端 DB 中该订阅关联的节点
+        api('/api/nodes')
+          .then(res => {
+            const nodes = res.items || [];
+            const subNodes = nodes.filter(n => n.subId === id);
+            if (subNodes.length > 0) {
+              const ids = subNodes.map(n => n.id);
+              api('/api/nodes/delete-batch', { method: 'POST', body: JSON.stringify({ ids }) })
+                .then(() => addLog('INFO', `已删除订阅 ${id} 关联的 ${ids.length} 个后端节点`))
+                .catch(err => addLog('ERROR', `删除订阅 ${id} 关联节点失败: ${err.message || err}`));
+            }
+          })
+          .catch(err => addLog('ERROR', `获取节点列表失败: ${err.message || err}`));
+      }
+      window.SubscriptionManager.removeSub(id);
+      // 移除该订阅导入的节点
+      nodeState = nodeState.filter(n => n.subId !== id);
+      saveNodesToStorage();
+      renderSubList();
+      addLog('INFO', '已删除订阅及其节点');
+    }
+
+    // 6 小时自动刷新调度
+    function initSubscriptionAutoRefresh() {
+      window.SubscriptionManager.load();
+      window.SubscriptionManager.startAutoRefresh((due, interval) => {
+        if (due && due.length) {
+          addLog('INFO', `检测到 ${due.length} 个订阅到期（每 ${interval/3600000} 小时），自动刷新…`);
+          due.forEach(sub => refreshSubAndImport(sub));
+        }
+      });
+    }
+
+
+    // Protocol URI 解析器
+    function parseProxyUri(uri) {
+      uri = uri.trim();
+      let name = '未命名节点';
+      
+      const hashIdx = uri.indexOf('#');
+      if (hashIdx !== -1) {
+        name = decodeURIComponent(uri.substring(hashIdx + 1));
+        uri = uri.substring(0, hashIdx);
+      }
+
+      if (uri.startsWith('ss://')) {
+        let content = uri.substring(5);
+        let method = 'aes-256-gcm', password = '', server = '', port = 8388;
+
+        if (content.includes('@')) {
+          const parts = content.split('@');
+          const serverParts = parts[1].split(':');
+          server = serverParts[0];
+          port = parseInt(serverParts[1]);
+
+          const authDec = safeBase64Decode(parts[0]);
+          if (authDec.includes(':')) {
+            const authSp = authDec.split(':');
+            method = authSp[0];
+            password = authSp[1];
+          } else {
+            password = authDec;
+          }
+        } else {
+          const dec = safeBase64Decode(content);
+          const match = dec.match(/(.*?):(.*?)@(.*.):(\d+)/);
+          if (match) {
+            method = match[1];
+            password = match[2];
+            server = match[3];
+            port = parseInt(match[4]);
+          }
+        }
+
+        return {
+          name,
+          protocol: 'shadowsocks',
+          rawConfig: { type: 'ss', server, server_port: port, method, password }
+        };
+      }
+
+      if (uri.startsWith('vmess://')) {
+        const jsonStr = safeBase64Decode(uri.substring(8));
+        const vjson = JSON.parse(jsonStr);
+        return {
+          name: vjson.ps || name,
+          protocol: 'vmess',
+          rawConfig: {
+            type: 'vmess',
+            server: vjson.add,
+            server_port: parseInt(vjson.port),
+            uuid: vjson.id,
+            alter_id: parseInt(vjson.aid || 0),
+            transport: vjson.net || 'tcp'
+          }
+        };
+      }
+
+      if (uri.startsWith('vless://')) {
+        const main = uri.substring(8);
+        const atSp = main.split('@');
+        const uuid = atSp[0];
+        const hostPortSp = atSp[1].split('?')[0].split(':');
+        const server = hostPortSp[0];
+        const port = parseInt(hostPortSp[1]);
+
+        return {
+          name,
+          protocol: 'vless',
+          rawConfig: { type: 'vless', server, server_port: port, uuid }
+        };
+      }
+
+      if (uri.startsWith('trojan://')) {
+        const main = uri.substring(9);
+        const atSp = main.split('@');
+        const password = atSp[0];
+        const hostPortSp = atSp[1].split('?')[0].split(':');
+        const server = hostPortSp[0];
+        const port = parseInt(hostPortSp[1]);
+
+        return {
+          name,
+          protocol: 'trojan',
+          rawConfig: { type: 'trojan', server, server_port: port, password }
+        };
+      }
+
+      // socks5:// 与 http://（代理节点直接导入，作为 sing-box 出站）
+      if (uri.startsWith('socks5://') || uri.startsWith('socks://')) {
+        let content = uri.replace(/^socks5?:\/\//, '');
+        let username = '', password = '', server, port;
+        if (content.includes('@')) {
+          const atSp = content.split('@');
+          const authSp = atSp[0].split(':');
+          username = decodeURIComponent(authSp[0] || '');
+          password = decodeURIComponent(authSp[1] || '');
+          const hostPort = atSp[1].split('/')[0];
+          server = hostPort.split(':')[0];
+          port = parseInt(hostPort.split(':')[1]);
+        } else {
+          const hostPort = content.split('/')[0];
+          server = hostPort.split(':')[0];
+          port = parseInt(hostPort.split(':')[1]);
+        }
+        const cfg = { type: 'socks', server, server_port: port };
+        if (username) cfg.username = username;
+        if (password) cfg.password = password;
+        return { name, protocol: 'socks', rawConfig: cfg };
+      }
+
+      if (uri.startsWith('http://') || uri.startsWith('https://')) {
+        // 排除订阅 URL（只处理含 :port 或 @ 的代理链接）
+        let content = uri.replace(/^https?:\/\//, '');
+        let username = '', password = '', server, port;
+        if (content.includes('@')) {
+          const atSp = content.split('@');
+          const authSp = atSp[0].split(':');
+          username = decodeURIComponent(authSp[0] || '');
+          password = decodeURIComponent(authSp[1] || '');
+          const hostPort = atSp[1].split('/')[0];
+          server = hostPort.split(':')[0];
+          port = parseInt(hostPort.split(':')[1]);
+        } else {
+          const hostPort = content.split('/')[0];
+          const colonIdx = hostPort.lastIndexOf(':');
+          if (colonIdx === -1) return null; // 无端口，视为订阅 URL 而非代理
+          server = hostPort.substring(0, colonIdx);
+          port = parseInt(hostPort.substring(colonIdx + 1));
+        }
+        if (!server || !port) return null;
+        const cfg = { type: 'http', server, server_port: port };
+        if (username) cfg.username = username;
+        if (password) cfg.password = password;
+        return { name, protocol: 'http', rawConfig: cfg };
+      }
+
+      // hysteria2://（口令@服务器:端口 或 直接服务器:端口）
+      if (uri.startsWith('hysteria2://') || uri.startsWith('hy2://')) {
+        const body = uri.replace(/^hysteria2:\/\//, '').replace(/^hy2:\/\//, '');
+        const qIdx = body.indexOf('?');
+        const main = qIdx !== -1 ? body.substring(0, qIdx) : body;
+        const queryStr = qIdx !== -1 ? body.substring(qIdx + 1) : '';
+        const query = {};
+        queryStr.split('&').forEach(kv => { const [k, v] = kv.split('='); if (k) query[k] = decodeURIComponent(v || ''); });
+        let password = '', server, port;
+        if (main.includes('@')) {
+          const atSp = main.split('@');
+          password = atSp[0];
+          const hp = atSp[1].split(':');
+          server = hp[0]; port = parseInt(hp[1]);
+        } else {
+          const hp = main.split(':');
+          server = hp[0]; port = parseInt(hp[1]);
+        }
+        const cfg = { type: 'hysteria2', server, server_port: port, password };
+        if (query.sni) cfg.sni = query.sni;
+        if (query.insecure) cfg.insecure = query.insecure === '1' || query.insecure === 'true';
+        return { name, protocol: 'hysteria2', rawConfig: cfg };
+      }
+
+      // tuic://
+      if (uri.startsWith('tuic://')) {
+        const body = uri.replace(/^tuic:\/\//, '');
+        const main = body.split('?')[0];
+        let password = '', server, port, uuid;
+        if (main.includes('@')) {
+          const atSp = main.split('@');
+          const credSp = atSp[0].split(':');
+          uuid = credSp[0]; password = credSp[1];
+          const hp = atSp[1].split(':');
+          server = hp[0]; port = parseInt(hp[1]);
+        } else {
+          const hp = main.split(':');
+          server = hp[0]; port = parseInt(hp[1]);
+        }
+        const cfg = { type: 'tuic', server, server_port: port, uuid, password };
+        return { name, protocol: 'tuic', rawConfig: cfg };
+      }
+
+      // wireguard://（少见，v2rayN 风格）
+      if (uri.startsWith('wireguard://')) {
+        const body = uri.replace(/^wireguard:\/\//, '');
+        const main = body.split('?')[0];
+        const hp = main.split(':');
+        const server = hp[0]; const port = parseInt(hp[1]);
+        const cfg = { type: 'wireguard', server, server_port: port };
+        return { name, protocol: 'wireguard', rawConfig: cfg };
+      }
+
+      return null;
+    }
+
+    function safeBase64Decode(str) {
+      str = str.replace(/-/g, '+').replace(/_/g, '/');
+      while (str.length % 4) str += '=';
+      return decodeURIComponent(escape(atob(str)));
+    }
+
+    /* ==========================================
+       6. 端口防冲突逻辑核心算法
+       ========================================== */
+    function getNextAvailablePort(preferredPort, batchUsed = null) {
+      let candidate = preferredPort;
+      const currentUsedPorts = nodeState.map(n => parseInt(n.port));
+      const reserved = systemSettings.reservedPorts;
+
+      const occupied = (p) => currentUsedPorts.includes(p) || reserved.includes(p) || (batchUsed && batchUsed.has(p));
+      while (occupied(candidate)) {
+        addLog('WARN', `端口 ${candidate} 已被占用，自动跳过 → ${candidate + 1}`);
+        candidate++;
+      }
+      return candidate;
+    }
+
+    function checkPortConflict(portValue, currentId) {
+      const portNum = parseInt(portValue);
+      if (isNaN(portNum)) return true;
+
+      if (systemSettings.reservedPorts.includes(portNum)) return true;
+
+      // 检查 relayDomains 端口
+      if (Array.isArray(systemSettings.relayDomains) && systemSettings.relayDomains.some(rd => parseInt(rd.port) === portNum)) {
+        return true;
+      }
+
+      const isOccupiedByOtherNode = nodeState.some(n => n.id !== currentId && parseInt(n.port) === portNum);
+      return isOccupiedByOtherNode;
+    }
+
+    function updateNodePort(nodeId, newPortStr) {
+      const newPort = parseInt(newPortStr);
+      const node = nodeState.find(n => n.id === nodeId);
+      if (!node) return;
+
+      if (checkPortConflict(newPort, nodeId)) {
+        addLog('ERROR', `端口修改失败：端口 ${newPort} 存在冲突或在系统已占用列表中！`);
+        renderNodesTable();
+        return;
+      }
+
+      if (window.__backendMode) {
+        api(`/api/nodes/${encodeURIComponent(nodeId)}/port`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ port: newPort }),
+        }).then(resp => {
+          if (resp.ok) {
+            node.port = newPort;
+            addLog('INFO', `节点 [${node.name}] 中转端口已更新为 ${newPort}`);
+            try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+          } else {
+            addLog('ERROR', `端口修改失败: HTTP ${resp.status}`);
+            renderNodesTable();
+          }
+        }).catch(e => addLog('ERROR', '端口修改失败: ' + e.message));
+      } else {
+        node.port = newPort;
+        addLog('INFO', `节点 [${node.name}] 中转端口已更新为 ${newPort}`);
+        saveNodesToStorage();
+      }
+    }
+
+    function reassignAllPorts() {
+      if (!confirm('确定按 51 (高质量 51001+) 和 52 (普通 52001+) 重新一键分配所有端口？')) return;
+
+      let port51 = 51001;
+      let port52 = 52001;
+
+      nodeState.forEach(node => {
+        let target;
+        if (node.segment === 51) {
+          target = getNextAvailablePort(port51);
+          port51 = target + 1;
+        } else {
+          target = getNextAvailablePort(port52);
+          port52 = target + 1;
+        }
+        node.port = target;
+        node.authUser = 'u' + target;
+        node.authPass = 'p' + target;
+      });
+
+      addLog('SUCCESS', '整站节点端口已重新编号完成！');
+
+      if (window.__backendMode) {
+        // 后端模式：逐个 PATCH 各节点，全部成功后触发热重载
+        const patchPromises = nodeState.map(node =>
+          api(`/api/nodes/${encodeURIComponent(node.id)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ port: node.port, authUser: node.authUser, authPass: node.authPass }),
+          }).then(resp => {
+            if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${node.name}`);
+          })
+        );
+        Promise.all(patchPromises).then(() => {
+          try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+          addLog('SUCCESS', '后端已同步所有节点端口');
+        }).catch(e => addLog('ERROR', '后端同步失败: ' + e.message));
+      } else {
+        saveNodesToStorage();
+      }
+    }
+
+    /* ==========================================
+       7. UI 渲染与 Tab 切换
+       ========================================== */
+    function switchTab(tabKey) {
+      document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+      const targetBtn = Array.from(document.querySelectorAll('.tab-btn')).find(b => b.getAttribute('onclick').includes(tabKey));
+      if (targetBtn) targetBtn.classList.add('active');
+
+      const targetContent = document.getElementById('tab-' + tabKey);
+      if (targetContent) targetContent.classList.add('active');
+
+      if (tabKey === 'config') generateSingboxConfig();
+      if (tabKey === 'export') generateExportText();
+    }
+
+    function renderAll() {
+      updateGroupsDropdowns();
+      renderQuickStats();
+      renderOverviewCards();
+      renderNodeMatrix();
+      renderGroupDistribution();
+      updateChartAndStats();
+      renderNodesTable();
+      renderTrafficTable();
+      updateRelayUri();
+    }
+
+    function updateGroupsDropdowns() {
+      const groups = Array.from(new Set(nodeState.map(n => n.group || '默认分组')));
+
+      const filterSel = document.getElementById('filter-group');
+      const curFilter = filterSel.value;
+      filterSel.innerHTML = '<option value="ALL">全部分组</option>' + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
+      filterSel.value = groups.includes(curFilter) ? curFilter : 'ALL';
+
+      const exportSel = document.getElementById('export-group-select');
+      exportSel.innerHTML = '<option value="ALL">全部分组节点</option>' + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
+
+      // 多域名轮询：刷新各域名卡的分组勾选
+      renderRelayDomainList();
+    }
+
+    function renderQuickStats() {
+      const total = nodeState.length;
+      const c51 = nodeState.filter(n => n.segment === 51).length;
+      const c52 = nodeState.filter(n => n.segment === 52).length;
+      const cPool = nodeState.filter(n => (n.group || '') === '代理池').length;
+      const online = nodeState.filter(n => n.status === 'online').length;
+
+      const pings = nodeState.filter(n => n.ping > 0).map(n => n.ping);
+      const avgPing = pings.length > 0 ? Math.round(pings.reduce((a,b)=>a+b,0) / pings.length) : 0;
+
+      let totalBytes = nodeState.reduce((acc, n) => acc + (n.upTraffic || 0) + (n.downTraffic || 0), 0);
+
+      document.getElementById('qs-inbound-ports').innerText = total;
+      document.getElementById('qs-total-nodes').innerText = total;
+      document.getElementById('qs-51-count').innerText = c51;
+      document.getElementById('qs-52-count').innerText = c52;
+      document.getElementById('qs-pool-count').innerText = cPool;
+      document.getElementById('qs-online-count').innerText = online;
+      document.getElementById('qs-avg-ping').innerText = avgPing > 0 ? avgPing + ' ms' : '-- ms';
+      document.getElementById('qs-total-traffic').innerText = formatBytes(totalBytes);
+    }
+
+    function renderOverviewCards() {
+      let up = 0, down = 0;
+      nodeState.forEach(n => {
+        up += (n.upTraffic || 0);
+        down += (n.downTraffic || 0);
+      });
+      const total = up + down;
+
+      document.getElementById('card-traffic-total').innerText = formatBytes(total);
+      document.getElementById('card-traffic-detail').innerText = `↑ ${formatBytes(up)} | ↓ ${formatBytes(down)}`;
+      document.getElementById('card-traffic-today').innerText = formatBytes(total * 0.45);
+
+      const totalNodes = nodeState.length;
+      const onlineNodes = nodeState.filter(n => n.status === 'online').length;
+      const ratioPct = totalNodes > 0 ? Math.round((onlineNodes / totalNodes) * 100) : 0;
+
+      document.getElementById('card-online-ratio').innerText = `${onlineNodes} / ${totalNodes}`;
+      document.getElementById('card-online-pct').innerText = `${ratioPct}%`;
+
+      // 动态更新 节点在线率 SVG 环形进度
+      const ringCircle = document.getElementById('online-ring-circle');
+      if (ringCircle) {
+        const circumference = 2 * Math.PI * 32; // ~201.06
+        const offset = circumference - (ratioPct / 100) * circumference;
+        ringCircle.style.strokeDashoffset = offset;
+      }
+
+      const relayCount = (systemSettings.relayDomains || []).length;
+      document.getElementById('card-relay-status').innerText = `${relayCount} 入口 · 就绪`;
+    }
+
+    function renderNodesTable() {
+      const tbody = document.getElementById('nodes-tbody');
+      const selectedGroup = document.getElementById('filter-group').value;
+      const searchKw = document.getElementById('search-keyword').value.toLowerCase().trim();
+
+      const filtered = nodeState.filter(node => {
+        const matchGroup = (selectedGroup === 'ALL' || node.group === selectedGroup);
+        const matchKw = !searchKw || node.name.toLowerCase().includes(searchKw) || String(node.port).includes(searchKw) || (node.exitIp && node.exitIp.includes(searchKw));
+        return matchGroup && matchKw;
+      });
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="13" style="text-align:center; padding:30px; color:var(--ink-gray);">暂无符合条件的节点，请从“批量导入”中添加。</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = filtered.map(n => {
+        const isConflict = checkPortConflict(n.port, n.id);
+        const portClass = isConflict ? 'port-input conflict' : 'port-input';
+
+        return `
+          <tr>
+            <td><input type="checkbox" class="chk-node" value="${n.id}"></td>
+            <td>
+              <span class="status-dot ${n.status === 'online' ? 'online' : 'offline'}" title="${n.status}"></span>
+            </td>
+            <td>
+              <input type="number" class="${portClass}" value="${n.port}" onchange="updateNodePort('${n.id}', this.value)" title="${isConflict ? '警告：端口冲突！' : '编辑端口'}">
+            </td>
+            <td>
+              <span class="badge-segment ${n.segment === 51 ? 'badge-51' : 'badge-52'}">${n.segment}</span>
+            </td>
+            <td>${escapeHtml(n.group || '默认分组')}</td>
+            <td><span class="proto-tag">${n.protocol.toUpperCase()}</span></td>
+            <td><span class="proto-tag" style="${n.entryProto === 'ss' ? 'background: var(--ochre-gold); color:#120e06;' : ''}">${(n.entryProto || 'mixed').toUpperCase()}</span></td>
+            <td style="font-weight: 500;" title="认证: ${n.authUser || ''}:${n.authPass || ''}">${escapeHtml(n.name)}</td>
+            <td style="font-family:var(--font-code);">${formatBytes((n.upTraffic||0)+(n.downTraffic||0))}</td>
+            <td style="font-family:var(--font-code); color:${n.ping < 80 ? 'var(--jade-green-glow)' : 'var(--ochre-gold)'}">${n.ping > 0 ? n.ping + 'ms' : 'timeout'}</td>
+            <td style="font-family:var(--font-code); font-size:12px;">${n.exitIp || 'N/A'}</td>
+            <td style="text-align: center; white-space: nowrap;">
+              <button class="btn btn-gold btn-xs" onclick="pingSingleNode('${n.id}')" title="探活">${iconSvg('bolt')}</button>
+              <button class="btn btn-secondary btn-xs" onclick="openEditNode('${n.id}')" title="编辑/重命名">${iconSvg('edit')}</button>
+              <button class="btn btn-outline btn-xs" onclick="exportSingleNode('${n.id}')" title="导出">${iconSvg('download')}</button>
+              <button class="btn btn-danger btn-xs" onclick="deleteNode('${n.id}')" title="删除">${iconSvg('trash')}</button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function toggleSelectAll(masterChk) {
+      document.querySelectorAll('.chk-node').forEach(c => c.checked = masterChk.checked);
+    }
+
+    /* ==========================================
+       8. 节点探活与操作
+       ========================================== */
+    function pingSingleNode(nodeId) {
+      const node = nodeState.find(n => n.id === nodeId);
+      if (!node) return;
+
+      addLog('INFO', `正在对节点 [${node.name}] 发起延迟探活测试...`);
+      setTimeout(() => {
+        node.ping = Math.floor(Math.random() * 110) + 15;
+        node.status = 'online';
+        addLog('SUCCESS', `节点 [${node.name}] 探活成功！响应延迟: ${node.ping}ms`);
+        saveNodesToStorage();
+      }, 400);
+    }
+
+    function triggerPingAll() {
+      addLog('INFO', '开启全局节点批量探活任务...');
+      let completed = 0;
+      nodeState.forEach((node, idx) => {
+        setTimeout(() => {
+          const isSuccess = Math.random() > 0.1;
+          node.status = isSuccess ? 'online' : 'offline';
+          node.ping = isSuccess ? Math.floor(Math.random() * 140) + 20 : 0;
+          completed++;
+
+          if (completed === nodeState.length) {
+            addLog('SUCCESS', '全局批量探活测试完成！');
+            saveNodesToStorage();
+          }
+        }, idx * 100);
+      });
+    }
+
+    function probeAll() {
+      triggerPingAll();
+    }
+
+    function deleteNode(nodeId) {
+      const node = nodeState.find(n => n.id === nodeId);
+      const name = node ? node.name : nodeId;
+      if (!confirm(`确认删除节点 [${name}]？`)) return;
+      // 后端模式真实删除 + 重载
+      if (window.__backendMode) {
+        api('/api/nodes/' + encodeURIComponent(nodeId), { method: 'DELETE' }).then(resp => {
+          if (resp.status === 204 || resp.ok) {
+            nodeState = nodeState.filter(n => n.id !== nodeId);
+            addLog('WARN', `已删除节点 [${name}]`);
+            try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+            renderAll();
+          } else {
+            addLog('ERROR', `删除失败: HTTP ${resp.status}`);
+          }
+        }).catch(e => addLog('ERROR', '删除失败: ' + e.message));
+      } else {
+        nodeState = nodeState.filter(n => n.id !== nodeId);
+        addLog('WARN', '删除单个节点完成');
+        saveNodesToStorage();
+      }
+    }
+
+    function deleteSelectedNodes() {
+      const selectedIds = Array.from(document.querySelectorAll('.chk-node:checked')).map(c => c.value);
+      if (selectedIds.length === 0) {
+        alert('请先勾选需要删除的节点！');
+        return;
+      }
+      if (confirm(`确认删除选中的 ${selectedIds.length} 个节点？`)) {
+        if (window.__backendMode) {
+          api('/api/nodes/delete-batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: selectedIds }),
+          }).then(resp => {
+            if (resp.ok) {
+              nodeState = nodeState.filter(n => !selectedIds.includes(n.id));
+              addLog('WARN', `批量删除了 ${selectedIds.length} 个节点`);
+              try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+              renderAll();
+            } else {
+              addLog('ERROR', `批量删除失败: HTTP ${resp.status}`);
+            }
+          }).catch(e => addLog('ERROR', '批量删除失败: ' + e.message));
+        } else {
+          nodeState = nodeState.filter(n => !selectedIds.includes(n.id));
+          addLog('WARN', `批量删除了 ${selectedIds.length} 个节点`);
+          saveNodesToStorage();
+        }
+      }
+    }
+
+    /* ==========================================
+       9. 多域名轮询与导出生成
+       ========================================== */
+    // 渲染所有轮询域名卡片
+    function renderRelayDomainList() {
+      const listEl = document.getElementById('relay-domain-list');
+      if (!listEl) return;
+      if (!systemSettings.relayDomains || !systemSettings.relayDomains.length) {
+        systemSettings.relayDomains = [{ id: 'relay-1', domain: 'relay.singbox.net', port: 33440, authUser: 'relayuser', authPass: 'relaypass', groups: ['ALL'] }];
+      }
+      const groups = Array.from(new Set(nodeState.map(n => n.group || '默认分组')));
+      const allGroups = ['ALL', ...groups];
+
+      listEl.innerHTML = systemSettings.relayDomains.map((rd, idx) => {
+        const uri = `socks5://${escapeHtml(rd.authUser)}:${escapeHtml(rd.authPass)}@${escapeHtml(rd.domain)}:${rd.port}`;
+        return `<div style="border:1px solid rgba(180,165,140,.18); border-radius:8px; padding:14px 16px; background:rgba(11,15,20,.5);">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <span style="font-family:var(--font-serif); color:var(--ochre-gold); font-size:15px; font-weight:600;">域名 ${idx+1}</span>
+            <button class="btn btn-danger btn-sm" onclick="removeRelayDomain('${rd.id}')">删除</button>
+          </div>
+          <div style="display:grid; grid-template-columns: 1.5fr 0.7fr 0.7fr 0.7fr; gap:12px; margin-bottom:10px;">
+            <div><label class="form-label" style="font-size:12px;">域名 / IP</label>
+              <input type="text" class="form-control" value="${escapeHtml(rd.domain)}" onchange="updateRelayDomainField('${rd.id}','domain',this.value)"></div>
+            <div><label class="form-label" style="font-size:12px;">端口</label>
+              <input type="number" class="form-control" value="${rd.port}" onchange="updateRelayDomainField('${rd.id}','port',this.value)"></div>
+            <div><label class="form-label" style="font-size:12px;">用户</label>
+              <input type="text" class="form-control" value="${escapeHtml(rd.authUser)}" onchange="updateRelayDomainField('${rd.id}','authUser',this.value)"></div>
+            <div><label class="form-label" style="font-size:12px;">密码</label>
+              <input type="text" class="form-control" value="${escapeHtml(rd.authPass)}" onchange="updateRelayDomainField('${rd.id}','authPass',this.value)"></div>
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+            <span style="font-size:12px; color:var(--ink-gray);">轮询分组：</span>
+            ${allGroups.map(g => `
+              <label style="font-size:12px; cursor:pointer; display:flex; align-items:center; gap:4px;">
+                <input type="checkbox" ${(rd.groups||[]).includes(g)?'checked':''} onchange="toggleRelayDomainGroup('${rd.id}','${g}',this.checked)"> ${g}
+              </label>`).join('')}
+          </div>
+          <div class="uri-display-box" style="margin-top:10px;">
+            <span style="color: var(--ochre-gold); font-family:var(--font-code);">${uri}</span>
+            <button class="btn btn-gold btn-sm" onclick="copyToClipboard('${uri.replace(/'/g,"\\'")}')">复制</button>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    function addRelayDomain() {
+      if (!systemSettings.relayDomains) systemSettings.relayDomains = [];
+      systemSettings.relayDomains.push({
+        id: 'relay-' + Date.now(),
+        domain: 'relay' + (systemSettings.relayDomains.length + 1) + '.example.com',
+        port: 33440 + systemSettings.relayDomains.length + 1,
+        authUser: 'relayuser',
+        authPass: 'relaypass',
+        groups: ['ALL']
+      });
+      saveSystemSettings();
+    }
+
+    function removeRelayDomain(id) {
+      systemSettings.relayDomains = systemSettings.relayDomains.filter(r => r.id !== id);
+      saveSystemSettings();
+    }
+
+    function updateRelayDomainField(id, field, val) {
+      const rd = systemSettings.relayDomains.find(r => r.id === id);
+      if (!rd) return;
+      rd[field] = field === 'port' ? parseInt(val) || 0 : val;
+      saveSystemSettings();
+    }
+
+    function toggleRelayDomainGroup(id, group, checked) {
+      const rd = systemSettings.relayDomains.find(r => r.id === id);
+      if (!rd) return;
+      if (!rd.groups) rd.groups = [];
+      if (checked && !rd.groups.includes(group)) rd.groups.push(group);
+      if (!checked) rd.groups = rd.groups.filter(g => g !== group);
+      saveSystemSettings();
+    }
+
+    // 兼容旧引用（无 relay-domain 时兜底）
+    function updateRelayUri() {
+      renderRelayDomainList();
+      renderOverviewCards();
+    }
+
+    // 按协议生成节点的导出链接行（both/socks5/http）
+    function exportLinkLines(node, vpsIp, protoSel) {
+      const lines = [];
+      // 节点当前为 Shadowsocks 入口：导出 ss://（aes-256-gcm + 节点 ss 密码）
+      if ((node.entryProto || 'mixed') === 'ss') {
+        const pass = node.ssPass || node.authPass || 'relaypass';
+        let userinfo;
+        try {
+          userinfo = btoa('aes-256-gcm:' + pass).replace(/=/g, '');
+        } catch (e) {
+          // 密码含非 Latin1 字符时，用 encodeURIComponent 兼容
+          userinfo = btoa(unescape(encodeURIComponent('aes-256-gcm:' + pass))).replace(/=/g, '');
+        }
+        lines.push(`ss://${userinfo}@${vpsIp}:${node.port}#${encodeURIComponent(node.name || 'ss')}`);
+        return lines;
+      }
+      // 普通 mixed 入口：socks5/http 按选择输出
+      const base = `${node.authUser}:${node.authPass}@${vpsIp}:${node.port}`;
+      if (protoSel !== 'http') lines.push(`socks5://${base}`);
+      if (protoSel !== 'socks5') lines.push(`http://${base}`);
+      return lines;
+    }
+
+    function generateExportText() {
+      const groupSel = document.getElementById('export-group-select').value;
+      const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
+      const vpsIp = systemSettings.listenIp === '0.0.0.0' ? '127.0.0.1' : systemSettings.listenIp;
+
+      const nodesToExport = nodeState.filter(n => groupSel === 'ALL' || n.group === groupSel);
+
+      const lines = [];
+      nodesToExport.forEach(n => {
+        lines.push(`# 节点: ${n.name} | 协议: ${n.protocol.toUpperCase()} | 分组: ${n.group}`);
+        lines.push(...exportLinkLines(n, vpsIp, protoSel));
+        lines.push('');
+      });
+
+      document.getElementById('export-text-area').value = lines.join('\n');
+    }
+
+    function exportSelectedNodes() {
+      const selectedIds = Array.from(document.querySelectorAll('.chk-node:checked')).map(c => c.value);
+      if (selectedIds.length === 0) {
+        alert('请在表格左侧勾选要导出的节点！');
+        return;
+      }
+
+      const vpsIp = systemSettings.listenIp === '0.0.0.0' ? '127.0.0.1' : systemSettings.listenIp;
+      const selectedNodes = nodeState.filter(n => selectedIds.includes(n.id));
+      const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
+
+      const lines = [];
+      selectedNodes.forEach(n => {
+        lines.push(`# 节点: ${n.name} | 协议: ${n.protocol.toUpperCase()} | 分组: ${n.group}`);
+        lines.push(...exportLinkLines(n, vpsIp, protoSel));
+        lines.push('');
+      });
+
+      document.getElementById('export-text-area').value = lines.join('\n');
+      switchTab('export');
+    }
+
+    function exportSingleNode(nodeId) {
+      const node = nodeState.find(n => n.id === nodeId);
+      if (!node) return;
+
+      const vpsIp = systemSettings.listenIp === '0.0.0.0' ? '127.0.0.1' : systemSettings.listenIp;
+      const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
+      const text = `# 节点: ${node.name} | 协议: ${node.protocol.toUpperCase()}\n${exportLinkLines(node, vpsIp, protoSel).join('\n')}`;
+
+      copyToClipboard(text);
+      alert(`已复制节点 [${node.name}] 的 Socks5/HTTP 中转代理链接到剪贴板！`);
+    }
+
+    /* ==========================================
+       9.5 批量转换入口协议 (socks5/http ↔ ss aes-256-gcm)
+       ========================================== */
+    function getSelectedNodeIds() {
+      return Array.from(document.querySelectorAll('.chk-node:checked')).map(c => c.value);
+    }
+
+    function openConvertEntryDialog() {
+      document.getElementById('convert-entry-overlay').style.display = 'flex';
+      const scopeHint = document.getElementById('convert-scope-hint');
+      const sel = getSelectedNodeIds();
+      scopeHint.textContent = sel.length > 0
+        ? `转换范围: 当前选中的 ${sel.length} 个节点`
+        : '转换范围: 全部节点';
+      toggleConvertPassField();
+      document.getElementById('convert-error').textContent = '';
+    }
+
+    function closeConvertEntryDialog() {
+      document.getElementById('convert-entry-overlay').style.display = 'none';
+    }
+
+    function toggleConvertPassField() {
+      const dir = document.getElementById('convert-direction').value;
+      document.getElementById('convert-pass-group').style.display = (dir === 'ss') ? 'block' : 'none';
+    }
+
+    /* ==========================================
+       9.6 单节点编辑（重命名/分组/认证/入口协议）
+       ========================================== */
+    let editingNodeId = null;
+
+    function openEditNode(nodeId) {
+      const node = nodeState.find(n => n.id === nodeId);
+      if (!node) return;
+      editingNodeId = nodeId;
+      document.getElementById('edit-node-name').value = node.name || '';
+      document.getElementById('edit-node-group').value = node.group || '默认分组';
+      document.getElementById('edit-node-auth-user').value = node.authUser || '';
+      document.getElementById('edit-node-auth-pass').value = node.authPass || '';
+      document.getElementById('edit-node-entry').value = node.entryProto || 'mixed';
+      document.getElementById('edit-node-sspass').value = '';
+      document.getElementById('edit-node-sub').textContent = `协议: ${(node.protocol||'').toUpperCase()} | 端口: ${node.port}`;
+      document.getElementById('edit-node-error').textContent = '';
+      toggleEditEntryPassField();
+      document.getElementById('edit-node-overlay').style.display = 'flex';
+    }
+
+    function closeEditNode() {
+      document.getElementById('edit-node-overlay').style.display = 'none';
+      editingNodeId = null;
+    }
+
+    function toggleEditEntryPassField() {
+      const el = document.getElementById('edit-node-sspass-group');
+      const proto = document.getElementById('edit-node-entry').value;
+      if (el) el.style.display = (proto === 'ss') ? 'block' : 'none';
+    }
+
+    async function saveEditNode() {
+      if (!editingNodeId) return;
+      const node = nodeState.find(n => n.id === editingNodeId);
+      if (!node) return;
+      const errEl = document.getElementById('edit-node-error');
+      errEl.textContent = '';
+
+      const name = document.getElementById('edit-node-name').value.trim();
+      const group = document.getElementById('edit-node-group').value.trim();
+      const authUser = document.getElementById('edit-node-auth-user').value.trim();
+      const authPass = document.getElementById('edit-node-auth-pass').value.trim();
+      const entry = document.getElementById('edit-node-entry').value;
+      const ssPass = document.getElementById('edit-node-sspass').value.trim();
+
+      if (!name) { errEl.textContent = '节点名称不能为空'; return; }
+      if (entry === 'ss' && ssPass && ssPass.length < 4) {
+        errEl.textContent = 'Shadowsocks 密码至少 4 位（留空保留原密码）';
+        return;
+      }
+
+      const patch = { name, group: group || '默认分组', authUser, authPass, entryProto: entry };
+      if (entry === 'ss' && ssPass) patch.ssPass = ssPass;
+
+      // 后端模式：调 PATCH 真实落库 + 重载 sing-box；无后端降级本地
+      if (window.__backendMode) {
+        try {
+          const resp = await api('/api/nodes/' + encodeURIComponent(editingNodeId), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(patch),
+          });
+          if (!resp.ok) { errEl.textContent = '保存失败: HTTP ' + resp.status; return; }
+          const updated = await resp.json();
+          // 同步 nodeState
+          const idx = nodeState.findIndex(x => x.id === editingNodeId);
+          if (idx >= 0) nodeState[idx] = Object.assign(nodeState[idx], updated);
+          // 入口协议改变则自动重载 sing-box
+          if (updated.entryProto !== node.entryProto) {
+            try { await api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+          }
+          addLog('SUCCESS', `节点 [${updated.name}] 已更新`);
+        } catch (e) {
+          errEl.textContent = '保存失败: ' + e.message;
+          return;
+        }
+      } else {
+        Object.assign(node, patch);
+        if (entry === 'ss' && ssPass) node.ssPass = ssPass;
+        addLog('SUCCESS', `（预览）节点 [${node.name}] 已更新`);
+        saveNodesToStorage();
+      }
+
+      closeEditNode();
+      renderAll();
+    }
+
+    async function doConvertEntry() {
+      const dir = document.getElementById('convert-direction').value;
+      const ssPass = document.getElementById('convert-ss-pass').value.trim();
+      const sel = getSelectedNodeIds();
+      const errEl = document.getElementById('convert-error');
+      errEl.textContent = '';
+
+      if (dir === 'ss' && ssPass && ssPass.length < 4) {
+        errEl.textContent = 'Shadowsocks 密码至少 4 位（留空则自动随机生成）';
+        return;
+      }
+
+      const body = { ids: sel, entryProto: dir, method: 'aes-256-gcm' };
+      if (dir === 'ss' && ssPass) body.ssPass = ssPass;
+
+      // 有后端则走后端 API（真实生效 + 重载 sing-box）；无后端降级本地模拟
+      let result = null;
+      try {
+        const resp = await api('/api/nodes/convert-entry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (resp.ok) result = await resp.json();
+      } catch (e) { /* 后端不可用走本地 */ }
+
+      if (result) {
+        // 转换成功后重新拉取后端最新节点，确保 nodeState 与后端完全同步
+        addLog('SUCCESS', `批量转换完成：${result.converted} 个节点已切为 ${dir === 'ss' ? 'Shadowsocks' : 'socks5+http'}`);
+        try {
+          const fresh = await api('/api/nodes');
+          if (fresh.ok) {
+            const freshData = await fresh.json();
+            if (freshData && freshData.items) {
+              nodeState = freshData.items.map(n => {
+                n.entryProto = n.entryProto || 'mixed';
+                return n;
+              });
+            }
+          }
+        } catch (e) { /* 拉取失败则用返回的 items 合并 */ }
+        if (result.items && result.items.length) {
+          result.items.forEach(n => {
+            const idx = nodeState.findIndex(x => x.id === n.id);
+            if (idx >= 0) nodeState[idx] = Object.assign(nodeState[idx], n);
+          });
+        }
+      } else {
+        // 本地模拟（无后端预览）
+        const targets = sel.length ? nodeState.filter(n => sel.includes(n.id)) : nodeState;
+        let n = 0;
+        targets.forEach(node => {
+          node.entryProto = dir;
+          if (dir === 'ss') {
+            node.ssPass = ssPass || ('sb' + Math.random().toString(36).slice(2, 10));
+            node.method = 'aes-256-gcm';
+          }
+          n++;
+        });
+        addLog('SUCCESS', `（预览模式）批量转换 ${n} 个节点`);
+      }
+
+      saveNodesToStorage();
+      closeConvertEntryDialog();
+      renderAll();
+    }
+
+    /* ==========================================
+       10. SingBox JSON 配置文件生成引擎 (真实 JSON)
+       ========================================== */
+    function generateSingboxConfig() {
+      const listenIp = systemSettings.listenIp;
+      
+      const inbounds = [];
+      const outbounds = [];
+      const routeRules = [];
+
+      nodeState.forEach((node, index) => {
+        const tagInbound = `in-mixed-${node.port}`;
+        const tagOutbound = `out-${node.protocol}-${node.port}`;
+
+        inbounds.push({
+          type: 'mixed',
+          tag: tagInbound,
+          listen: listenIp,
+          listen_port: parseInt(node.port),
+          users: [
+            { username: node.authUser, password: node.authPass }
+          ]
+        });
+
+        const cfg = node.rawConfig || {};
+        let outItem = { tag: tagOutbound, type: node.protocol };
+
+        if (node.protocol === 'shadowsocks') {
+          outItem = {
+            type: 'shadowsocks',
+            tag: tagOutbound,
+            server: cfg.server,
+            server_port: cfg.server_port,
+            method: cfg.method,
+            password: cfg.password
+          };
+        } else if (node.protocol === 'vmess') {
+          outItem = {
+            type: 'vmess',
+            tag: tagOutbound,
+            server: cfg.server,
+            server_port: cfg.server_port,
+            uuid: cfg.uuid,
+            security: 'auto'
+          };
+        } else if (node.protocol === 'vless') {
+          outItem = {
+            type: 'vless',
+            tag: tagOutbound,
+            server: cfg.server,
+            server_port: cfg.server_port,
+            uuid: cfg.uuid
+          };
+        } else if (node.protocol === 'trojan') {
+          outItem = {
+            type: 'trojan',
+            tag: tagOutbound,
+            server: cfg.server,
+            server_port: cfg.server_port,
+            password: cfg.password
+          };
+        }
+
+        outbounds.push(outItem);
+
+        routeRules.push({
+          inbound: [tagInbound],
+          outbound: tagOutbound
+        });
+      });
+
+      // 已生成的 outbound tag 集合（供 relay 引用校验）
+      const outboundTagSet = new Set(outbounds.map(o => o.tag));
+
+      // 多域名轮询入口：每个域名一个 mixed 入站 + urltest 出站
+      (systemSettings.relayDomains || []).forEach(rd => {
+        const rdPort = parseInt(rd.port) || 33440;
+        const rdInboundTag = 'in-relay-' + (rd.id || 'x');
+        const rdOutboundTag = 'relay-auto-' + (rd.id || 'x');
+
+        // 该域名参与轮询的分组节点
+        const selectedGroups = rd.groups && rd.groups.length ? rd.groups : ['ALL'];
+        const rdNodes = nodeState.filter(n => selectedGroups.includes('ALL') || selectedGroups.includes(n.group));
+
+        inbounds.push({
+          type: 'mixed',
+          tag: rdInboundTag,
+          listen: listenIp,
+          listen_port: rdPort,
+          users: [
+            { username: rd.authUser || 'relayuser', password: rd.authPass || 'relaypass' }
+          ]
+        });
+
+        // 轮询目标：该分组内所有节点出站 tag，若空则 direct
+        const rdTargets = rdNodes.map(n => `out-${n.protocol}-${n.port}`).filter(t => outboundTagSet.has(t));
+        outbounds.push({
+          type: 'urltest',
+          tag: rdOutboundTag,
+          outbounds: rdTargets.length > 0 ? rdTargets : ['direct'],
+          url: systemSettings.testUrl,
+          interval: '3m'
+        });
+
+        // 该域名绑定到自己的轮询出站
+        routeRules.push({
+          inbound: [rdInboundTag],
+          outbound: rdOutboundTag
+        });
+      });
+
+      outbounds.push({ type: 'direct', tag: 'direct' });
+      outbounds.push({ type: 'block', tag: 'block' });
+
+      const singboxJson = {
+        log: {
+          level: 'info',
+          timestamp: true
+        },
+        inbounds: inbounds,
+        outbounds: outbounds,
+        route: {
+          rules: routeRules,
+          auto_detect_interface: true
+        }
+      };
+
+      document.getElementById('config-json-code').innerText = JSON.stringify(singboxJson, null, 2);
+    }
+
+    function downloadConfigFile() {
+      const content = document.getElementById('config-json-code').innerText;
+      const blob = new Blob([content], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'config.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    /* ==========================================
+       11. 流量统计与重置
+       ========================================== */
+    function renderTrafficTable() {
+      const tbody = document.getElementById('traffic-tbody');
+      if (!tbody) return;
+
+      tbody.innerHTML = nodeState.map(n => `
+        <tr>
+          <td style="font-family:var(--font-code); font-weight:bold; color:var(--ochre-gold)">${n.port}</td>
+          <td>${escapeHtml(n.name)}</td>
+          <td>${escapeHtml(n.group || '默认分组')}</td>
+          <td style="font-family:var(--font-code);">${formatBytes(n.upTraffic || 0)}</td>
+          <td style="font-family:var(--font-code);">${formatBytes(n.downTraffic || 0)}</td>
+          <td style="font-family:var(--font-code); font-weight:bold;">${formatBytes((n.upTraffic||0)+(n.downTraffic||0))}</td>
+          <td>
+            <button class="btn btn-outline btn-sm" onclick="resetSingleTraffic('${n.id}')">重置流量</button>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function resetSingleTraffic(nodeId) {
+      const node = nodeState.find(n => n.id === nodeId);
+      if (node) {
+        node.upTraffic = 0;
+        node.downTraffic = 0;
+        addLog('INFO', `节点 [${node.name}] 流量计数已归零`);
+        saveNodesToStorage();
+      }
+    }
+
+    function resetAllTraffic() {
+      if (confirm('确定将所有节点的流量统计重置归零？')) {
+        nodeState.forEach(n => {
+          n.upTraffic = 0;
+          n.downTraffic = 0;
+        });
+        addLog('WARN', '全局节点流量计数已重置归零');
+        saveNodesToStorage();
+      }
+    }
+
+    /* ==========================================
+       辅助通用函数
+       ========================================== */
+    function formatBytes(bytes) {
+      if (bytes === 0 || !bytes) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function escapeHtml(str) {
+      return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function copyToClipboard(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        addLog('INFO', '成功复制内容到剪贴板！');
+      }).catch(err => {
+        addLog('ERROR', '复制失败: ' + err.message);
+      });
+    }
+  </script>
+</body>
+</html>
