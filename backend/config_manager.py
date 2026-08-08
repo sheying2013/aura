@@ -540,7 +540,8 @@ async def status() -> Dict[str, Any]:
             clash_ok = False
     return {
         "running": running,
-        "pid": _proc.pid if running else None,
+        # host 网络下 sing-box 可能逃逸出容器 PID 空间（_proc 为 None 但 clash 探测运行中）
+        "pid": _proc.pid if (running and _proc is not None) else None,
         "uptime": uptime,
         "version": version,
         "clashApiOk": clash_ok,
