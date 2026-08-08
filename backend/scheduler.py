@@ -209,34 +209,64 @@ async def _rotate_random_relay() -> None:
     """随机挑一个可用节点作为 relay 出口，经 clash API 运行时切换（零热重载）。
 
     PUT /proxies/{tag} 只影响新连接、不断已有连接——与固定节点互不干扰。
-    返回选中的 outbound tag（无可用节点返回 None）。
+    轮询时**实时探活候选节点**（clash delay，不走 60s 探活快照）：不通就跳过
+    换下一个候选（最多试 10 个），全部不通则维持当前出口不切换——轮询模式
+    自动避开已断线节点。返回选中的 outbound tag（无可用节点返回 None）。
     """
     import config_manager as cm
+    import httpx
 
     nodes = [n for n in db.list_nodes() if n.get("status") != "disabled"]
     if not nodes:
         return None
-    # 可用池：优先在线节点，无在线节点才用全部非停用
+    # 可用池：优先在线节点（探活快照），无在线节点才用全部非停用
     online = [n for n in nodes if n.get("status") == "online"]
     pool = online or nodes
-    node = random.choice(pool)
-    tag = outbound_tag_for(node)
+    test_url = (db.get_setting("system", {}) or {}).get("testUrl", "https://www.gstatic.com/generate_204")
+    hdrs = {"Authorization": f"Bearer {cm.get_clash_secret()}"}
+
+    async def _is_alive(node: Dict[str, Any]) -> bool:
+        """实时探测节点连通性（clash API delay，2s 超时）。"""
+        tag = outbound_tag_for(node)
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(
+                    f"{cm.clash_base()}/proxies/{tag}/delay",
+                    params={"url": test_url, "timeout": "2000"},
+                    headers=hdrs,
+                )
+            return r.status_code == 200 and r.json().get("delay") is not None
+        except Exception:
+            return False
+
+    # 实时校验：随机打乱候选，逐个 delay 探测，跳过不通的节点
+    candidates = list(pool)
+    random.shuffle(candidates)
+    chosen = None
+    for node in candidates[:10]:
+        if await _is_alive(node):
+            chosen = node
+            break
+    if chosen is None:
+        print("[relay-rotate] 本轮候选节点全部不通，维持当前出口")
+        return None
+    tag = outbound_tag_for(chosen)
     # 运行时切换：selector 支持 PUT /proxies（urltest 不支持，故生成层已改用 selector）
     for rd in db.list_relay_domains():
         rd_tag = f"relay-auto-{rd['id']}"
         try:
-            async with __import__("httpx").AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=3.0) as client:
                 await client.put(
                     f"{cm.clash_base()}/proxies/{rd_tag}",
                     json={"name": tag},
-                    headers={"Authorization": f"Bearer {cm.get_clash_secret()}"},
+                    headers=hdrs,
                 )
         except Exception as e:
             print(f"[relay-rotate] PUT 切换 {rd_tag} 失败: {e}")
     settings = db.get_setting("system", {}) or {}
     settings["randomRotateCurrent"] = tag
     db.set_setting("system", settings)
-    print(f"[relay-rotate] 随机出口 → {node.get('name')} ({tag})")
+    print(f"[relay-rotate] 随机出口 → {chosen.get('name')} ({tag})")
     return tag
 
 
