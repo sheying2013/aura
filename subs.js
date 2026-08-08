@@ -7,7 +7,7 @@
 const SubscriptionManager = (() => {
   // 订阅存储 key
   const SUB_KEY = 'sb_subscriptions';
-  const REFRESH_INTERVAL = 6 * 60 * 60 * 1000; // 6 小时
+  const REFRESH_INTERVAL = 3 * 60 * 60 * 1000; // 3 小时
 
   let subscriptions = [];  // {id, url, name, group, lastFetch, lastRefresh, nodeCount, enabled}
   let refreshTimer = null;

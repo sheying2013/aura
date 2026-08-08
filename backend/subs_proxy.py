@@ -430,6 +430,13 @@ async def refresh_sub(sub: Dict[str, Any]) -> Dict[str, Any]:
             "last_error": None,
             "snapshot": json.dumps(nodes, ensure_ascii=False),
         })
+        # 有新增节点 → 重建 sing-box 配置使新节点立即生效（无新增则跳过热重载）
+        if imported["created"] > 0:
+            try:
+                import config_manager
+                await config_manager.apply_config()
+            except Exception:
+                pass
         return {"id": sub["id"], "ok": True, "count": len(nodes), "stale": False,
                 "imported": imported["created"], "error": None}
 

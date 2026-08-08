@@ -9,7 +9,7 @@ import stats
 import subs_proxy
 
 PING_INTERVAL = 60  # 秒
-SUB_REFRESH_INTERVAL = 6 * 60 * 60  # 秒
+SUB_REFRESH_INTERVAL = 3 * 60 * 60  # 秒（3 小时）
 GUARD_INTERVAL = 10  # 秒
 MAX_RESTARTS_PER_MIN = 3
 
