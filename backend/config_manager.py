@@ -163,14 +163,14 @@ def build_config() -> Dict[str, Any]:
             ss_pass = node.get("ssPass") or node.get("authPass") or "relaypass"
             inbounds.append({
                 "type": "shadowsocks", "tag": tag_in, "listen": listen_ip,
-                "listen_port": node["port"], "reuse_addr": True,
+                "listen_port": node["port"],
                 "method": "aes-256-gcm",
                 "password": ss_pass,
             })
         else:
             inbounds.append({
                 "type": "mixed", "tag": tag_in, "listen": listen_ip,
-                "listen_port": node["port"], "reuse_addr": True,
+                "listen_port": node["port"],
                 "users": [{"username": node.get("authUser") or "user", "password": node.get("authPass") or "pass"}],
             })
         cfg = node.get("rawConfig") or {}
@@ -293,7 +293,7 @@ def build_config() -> Dict[str, Any]:
                     and ("ALL" in selected_groups or n.get("group") in selected_groups)]
         inbounds.append({
             "type": "mixed", "tag": rd_in_tag, "listen": listen_ip,
-            "listen_port": rd_port, "reuse_addr": True,
+            "listen_port": rd_port,
             "users": [{"username": rd.get("authUser") or "relayuser", "password": rd.get("authPass") or "relaypass"}],
         })
         rd_targets = [outbound_tag(n["protocol"], n["port"]) for n in rd_nodes]
