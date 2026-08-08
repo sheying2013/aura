@@ -553,6 +553,8 @@ async def refresh_sub(sub: Dict[str, Any]) -> Dict[str, Any]:
             sub = db.update_sub(sub["id"], {"last_error": "解析 0 个节点"})
             return {"id": sub["id"], "ok": False, "count": 0, "stale": False, "imported": 0, "error": "解析 0 个节点"}
         imported = import_nodes(sub["id"], sub.get("group", "订阅节点"), sub.get("name", ""), nodes, stale=False)
+        # 订阅恢复正常：清除之前失败兜底标的 stale 警示（否则节点永久橙色"刷新失败"）
+        db.unmark_nodes_stale_by_sub(sub["id"])
         db.update_sub(sub["id"], {
             "last_refresh": int(__import__("time").time() * 1000),
             "node_count": len(nodes),

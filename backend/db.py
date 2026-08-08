@@ -365,6 +365,19 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
         deleted_fps = {r["fingerprint"] for r in c.execute("SELECT fingerprint FROM deleted_fingerprints")}
         # 已用端口只查一次（含 relay_domains），循环内只增批内集合
         db_used = {r[0] for r in c.execute("SELECT port FROM nodes")} | {r[0] for r in c.execute("SELECT port FROM relay_domains")}
+        # 保留端口段（settings.system.reservedPorts）也计入占用——与 get_next_available_port 主路径一致，
+        # 否则批内自动分配会占用用户预留的端口
+        _rp_row = c.execute("SELECT value FROM settings WHERE key='system'").fetchone()
+        if _rp_row:
+            try:
+                _s = json.loads(_rp_row[0] or "{}")
+                for p in (_s.get("reservedPorts", []) or []):
+                    try:
+                        db_used.add(int(p))
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:
+                pass
         batch_ports = set()
         for nd in nodes:
             # 每个节点必须带 id（前端 batch payload / 订阅导入都不传，由后端生成）
@@ -575,6 +588,15 @@ def mark_nodes_stale_by_sub(sub_id: str) -> int:
     with _lock:
         c = connect()
         cur = c.execute("UPDATE nodes SET stale=1, updated_at=? WHERE sub_id=?", (_conn_now(), sub_id))
+        c.commit()
+        return cur.rowcount
+
+
+def unmark_nodes_stale_by_sub(sub_id: str) -> int:
+    """订阅刷新成功后清 stale：订阅恢复正常时，历史失败标记的橙色警示应消除。"""
+    with _lock:
+        c = connect()
+        cur = c.execute("UPDATE nodes SET stale=0, updated_at=? WHERE sub_id=? AND stale=1", (_conn_now(), sub_id))
         c.commit()
         return cur.rowcount
 
