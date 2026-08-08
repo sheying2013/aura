@@ -3219,6 +3219,9 @@
     function importSubscriptionNodes(sub, parsedNodes, opts) {
       const stale = opts && opts.stale;
       const randStr = (len) => { const c='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'; let r=''; for(let i=0;i<len;i++) r+=c[Math.floor(Math.random()*c.length)]; return r; };
+      // 订阅自定义认证：编辑订阅时设置后，导入/重拉时统一用自定义账号密码
+      const authUser = (sub && sub.authUser) || '';
+      const authPass = (sub && sub.authPass) || '';
       // 后端模式：走 /api/nodes/batch 真实落库（含去重计数），不写内存/localStorage
       if (window.__backendMode) {
         const payload = parsedNodes.map(pn => ({
@@ -3227,8 +3230,8 @@
           group: sub.group || '订阅节点',
           port: null, // 端口由后端按段自动分配
           segment: /(住宅|ISP|原生|家宽|residential|高速)/i.test(pn.name || '') ? 51 : 52,
-          authUser: randStr(8),
-          authPass: randStr(12),
+          authUser: authUser || randStr(8),
+          authPass: authPass || randStr(12),
           entryProto: 'mixed',
           ssPass: null,
           subId: sub.id,
@@ -3276,8 +3279,8 @@
           group: sub.group || '订阅节点',
           port: targetPort,
           segment: isHighQuality ? 51 : 52,
-          authUser: randStr(8),
-          authPass: randStr(12),
+          authUser: authUser || randStr(8),
+          authPass: authPass || randStr(12),
           status: 'online',
           ping: Math.floor(Math.random() * 120) + 20,
           exitIp: server || '1.1.1.1',
@@ -3314,6 +3317,7 @@
           <span style="font-size:12px; color:var(--ink-gray);">上次: ${last} · 下次: ${next} 分钟后</span>
           <div style="margin-left:auto; display:flex; gap:6px;">
             <button class="btn btn-ghost btn-sm" onclick="refreshSubAndImport(window.SubscriptionManager.getSubs().find(x=>x.id==='${s.id}'))">立即刷新</button>
+            <button class="btn btn-ghost btn-sm" onclick="editSubscription('${s.id}')">编辑</button>
             <button class="btn btn-ghost btn-sm" onclick="removeSubscription('${s.id}')">删除</button>
           </div>
         </div>`;
@@ -3342,6 +3346,71 @@
       saveNodesToStorage();
       renderSubList();
       addLog('INFO', '已删除订阅及其节点');
+    }
+
+    // 编辑订阅：改名/分组/自定义 socks 认证（覆盖导入时的随机认证）
+    function editSubscription(id) {
+      const sub = window.SubscriptionManager.getSubs().find(x => x.id === id);
+      if (!sub) return;
+      const name = prompt('订阅名称：', sub.name || '');
+      if (name === null) return;
+      const group = prompt('归属分组（留空保持）：', sub.group || '订阅节点');
+      if (group === null) return;
+      const authUser = prompt('自定义 socks5/http 用户名（留空保持随机）：', sub.authUser || '');
+      if (authUser === null) return;
+      const authPass = prompt('自定义 socks5/http 密码（留空保持随机）：', sub.authPass || '');
+      if (authPass === null) return;
+      window.SubscriptionManager.updateSub(id, {
+        name: name.trim() || sub.name,
+        group: group.trim() || sub.group,
+        authUser: authUser.trim(),
+        authPass: authPass.trim(),
+      });
+      const updated = window.SubscriptionManager.getSubs().find(x => x.id === id);
+      addLog('INFO', `订阅 [${updated.name}] 已更新（分组: ${updated.group}${updated.authUser ? `，自定义认证: ${updated.authUser}:***` : '，保持随机认证'}`);
+
+      // 认证/分组变更 → 应用到该订阅已导入的节点（重新导入覆盖认证）
+      const nodeIds = nodeState.filter(n => n.subId === id).map(n => n.id);
+      const reimport = () => {
+        if (window.__backendMode && nodeIds.length) {
+          // 后端模式：批量 PATCH 更新这些节点的 authUser/authPass/group
+          const patchPromises = nodeIds.map(nid =>
+            api('/api/nodes/' + encodeURIComponent(nid), {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                ...(updated.authUser ? { authUser: updated.authUser, authPass: updated.authPass || '' } : {}),
+                group: updated.group,
+              }),
+            })
+          );
+          Promise.allSettled(patchPromises).then(() => {
+            addLog('INFO', `已更新 ${nodeIds.length} 个节点认证/分组（订阅 [${updated.name}]）`);
+            api('/api/nodes').then(r => r.json()).then(data => {
+              if (data && data.items) {
+                nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
+                renderAll();
+              }
+              try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+            }).catch(err => addLog('ERROR', '刷新节点列表失败: ' + err.message));
+          });
+        } else {
+          // 本地模式：直接改内存
+          nodeState.forEach(n => {
+            if (n.subId === id) {
+              if (updated.authUser) { n.authUser = updated.authUser; n.authPass = updated.authPass || ''; }
+              n.group = updated.group;
+            }
+          });
+          saveNodesToStorage();
+          renderAll();
+        }
+      };
+      if (confirm(`订阅 [${updated.name}] 更新成功。是否重新拉取并应用？`)) {
+        refreshSubAndImport(updated);
+      } else {
+        reimport();
+      }
     }
 
     // 6 小时自动刷新调度

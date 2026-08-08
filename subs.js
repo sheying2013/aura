@@ -248,17 +248,30 @@ const SubscriptionManager = (() => {
     localStorage.setItem(SUB_KEY, JSON.stringify(subscriptions));
   }
 
-  function addSub({ url, name, group, enabled = true }) {
+  function addSub({ url, name, group, authUser = '', authPass = '', enabled = true }) {
     const existing = subscriptions.find(s => s.url === url);
     if (existing) return { ok: false, msg: '订阅已存在' };
     const sub = {
       id: 'sub-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
       url, name: name || url.slice(0, 40), group: group || '订阅节点',
+      authUser: authUser || '', authPass: authPass || '',
       enabled, lastRefresh: null, nodeCount: 0, lastError: null
     };
     subscriptions.push(sub);
     save();
     return { ok: true, sub };
+  }
+
+  // 更新订阅（名称/分组/自定义认证），返回更新后的订阅
+  function updateSub(id, patch) {
+    const s = subscriptions.find(x => x.id === id);
+    if (!s) return null;
+    if (patch.name !== undefined) s.name = patch.name;
+    if (patch.group !== undefined) s.group = patch.group;
+    if (patch.authUser !== undefined) s.authUser = patch.authUser;
+    if (patch.authPass !== undefined) s.authPass = patch.authPass;
+    save();
+    return s;
   }
 
   function removeSub(id) {
@@ -344,7 +357,7 @@ const SubscriptionManager = (() => {
 
   /* ---------- 对外 API ---------- */
   return {
-    load, save, addSub, removeSub, toggleSub,
+    load, save, addSub, updateSub, removeSub, toggleSub,
     refreshSub, refreshAll, startAutoRefresh, stopAutoRefresh,
     parseContent, parseLink, getSubs,
     REFRESH_INTERVAL
