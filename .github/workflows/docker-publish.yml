@@ -48,11 +48,12 @@ jobs:
           cache-to: type=gha,mode=max
 
       # GHCR 默认私有，VPS 匿名 pull 需要公开（幂等，重复设置无害）
+      # 用 repo-scoped API：GITHUB_TOKEN 是 repo 身份，user-scoped 会 404（包归仓库所有者）
       - name: Set package visibility public
         run: |
           curl -s -o /dev/null -w "visibility patch HTTP %{http_code}\n" \
             -X PATCH \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/user/packages/container/aura" \
+            "https://api.github.com/repos/${{ github.repository }}/packages/container/aura" \
             -d '{"visibility":"public"}'
