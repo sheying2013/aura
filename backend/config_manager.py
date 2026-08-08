@@ -65,10 +65,12 @@ def _normalize_transport(tr: Any) -> Optional[Dict[str, Any]]:
 
     老订阅节点 DB 里可能存字符串（如 "ws"），直接透传会让 check 失败
     （json: cannot unmarshal string into ... transport）。字符串 → {type: str}。
+    tcp 是 sing-box 默认传输层，不生成 transport 字段（枚举无 tcp）。
     """
     if isinstance(tr, dict):
-        return tr if tr.get("type") else None
-    if isinstance(tr, str) and tr:
+        t = tr.get("type")
+        return tr if t and t != "tcp" else None
+    if isinstance(tr, str) and tr and tr != "tcp":
         return {"type": tr}
     return None
 
