@@ -1,5 +1,6 @@
-"""后台任务编排：60s 批量探活、6h 订阅刷新、10s sing-box 崩溃守护。"""
+"""后台任务编排：60s 批量探活、3h 订阅刷新、10s sing-box 崩溃守护、relay 随机轮询。"""
 import asyncio
+import random
 import time
 from typing import Any, Dict, List, Optional
 
@@ -110,6 +111,59 @@ async def _sub_refresh_loop() -> None:
             pass
 
 
+# ---------- relay 域名随机轮询（注册机/爬虫场景） ----------
+
+RANDOM_ROTATE_DEFAULT_INTERVAL = 30  # 秒（默认随机轮询间隔）
+
+def outbound_tag_for(node: Dict[str, Any]) -> str:
+    """节点 → outbound tag（与 config_manager.outbound_tag 一致，避免循环依赖）。"""
+    return f"out-{node.get('protocol')}-{node.get('port')}"
+
+async def _rotate_random_relay() -> None:
+    """随机挑一个可用节点作为 relay 出口并触发配置重建。
+
+    build_config 会读 settings.randomRotateCurrent 让 relay urltest 只走该节点。
+    返回选中的 outbound tag（无可用节点返回 None）。
+    """
+    import config_manager as cm
+
+    nodes = [n for n in db.list_nodes() if n.get("status") != "disabled"]
+    if not nodes:
+        return None
+    # 可用池：优先在线节点，无在线节点才用全部非停用
+    online = [n for n in nodes if n.get("status") == "online"]
+    pool = online or nodes
+    node = random.choice(pool)
+    tag = outbound_tag_for(node)
+    settings = db.get_setting("system", {}) or {}
+    settings["randomRotateCurrent"] = tag
+    db.set_setting("system", settings)
+    await cm.apply_config()
+    print(f"[relay-rotate] 随机出口 → {node.get('name')} ({tag})")
+    return tag
+
+
+async def _relay_random_loop() -> None:
+    """随机轮询循环：开启时按设定间隔随机挑一个可用节点作为 relay 域名出口。
+
+    面板层实现（sing-box urltest 只做延迟选优，无随机出口）：
+    开启时把随机选中的节点 tag 存 DB settings（randomRotateCurrent），
+    再触发配置重建——build_config 会读取该字段让 relay urltest 只走这个节点。
+    关闭随机轮询后：走默认 urltest 延迟选优（interval 3m 或 stickyTimeout）。
+    """
+    while True:
+        settings = db.get_setting("system", {}) or {}
+        interval = int(settings.get("randomRotateInterval") or RANDOM_ROTATE_DEFAULT_INTERVAL)
+        await asyncio.sleep(max(interval, 5))
+        try:
+            settings = db.get_setting("system", {}) or {}
+            if not settings.get("randomRotateEnabled"):
+                continue
+            await _rotate_random_relay()
+        except Exception as e:
+            print(f"[relay-rotate] 失败: {e}")
+
+
 # ---------- 崩溃守护 ----------
 
 async def _guard_loop() -> None:
@@ -148,4 +202,5 @@ async def _guard_loop() -> None:
 def start_scheduler(loop: asyncio.AbstractEventLoop) -> None:
     loop.create_task(_probe_loop())
     loop.create_task(_sub_refresh_loop())
+    loop.create_task(_relay_random_loop())
     loop.create_task(_guard_loop())

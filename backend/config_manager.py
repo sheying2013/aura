@@ -229,6 +229,13 @@ def build_config() -> Dict[str, Any]:
         # （sing-box urltest 本身无 sticky 字段，1.7.7 起校验会拒绝未知字段，故用 interval 近似）
         if settings.get("stickyEnabled"):
             rd_urltest["interval"] = settings.get("stickyTimeout") or "5m"
+        # 随机轮询（注册机/爬虫场景）：开启后 relay 出口强制为当前随机选中节点，
+        # urltest 只保留该节点（interval 拉长防它自行切走），由面板定时器随机换节点
+        if settings.get("randomRotateEnabled") and settings.get("randomRotateCurrent"):
+            cur = settings["randomRotateCurrent"]
+            if cur in rd_targets:
+                rd_urltest["outbounds"] = [cur]
+                rd_urltest["interval"] = "24h"
         outbounds.append(rd_urltest)
         route_rules.append({"inbound": [rd_in_tag], "outbound": rd_out_tag})
 

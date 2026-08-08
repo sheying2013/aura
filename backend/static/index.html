@@ -2083,6 +2083,22 @@
           </div>
         </div>
 
+        <div style="border-top: 1px solid var(--paper-border); padding-top: 16px; margin-top: 8px; margin-bottom: 20px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px;">
+            <div>
+              <label class="form-label" style="margin-bottom:2px;">随机轮询出口（注册机/爬虫）</label>
+              <div style="font-size: 12px; color: var(--ink-gray);">开启后按设定间隔从可用节点随机挑一个作为域名入口出口（IP 随机变化）；关闭后按代理池默认时间间隔延迟选优轮询。</div>
+            </div>
+            <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; white-space:nowrap;">
+              <input type="checkbox" id="setting-random-rotate-enabled" onchange="saveSystemSettings()"> 启用
+            </label>
+          </div>
+          <div>
+            <label class="form-label" style="font-size:12px;">随机轮询间隔（秒）</label>
+            <input type="number" id="setting-random-rotate-interval" class="form-control" value="30" min="5" placeholder="30" onchange="saveSystemSettings()" style="max-width: 200px;">
+          </div>
+        </div>
+
         <div style="border-top: 1px solid var(--paper-border); padding-top: 20px; margin-top: 20px; display: flex; justify-content: space-between;">
           <button class="btn btn-outline" onclick="loadDemoNodes()">⚡ 重新载入 Demo 默认示例节点</button>
           <button class="btn btn-danger" onclick="clearAllData()">🗑️ 重置面板所有持久化数据</button>
@@ -2291,6 +2307,9 @@
       // 代理池轮询粘滞超时：开启后 urltest 会粘住当前出口 sticky_timeout 时长，避免频繁切换
       stickyEnabled: false,
       stickyTimeout: '5m',
+      // 随机轮询出口（注册机/爬虫）：开启后按间隔随机挑可用节点作为域名入口出口
+      randomRotateEnabled: false,
+      randomRotateInterval: 30,
       // 多域名轮询入口数组：{id, domain, port, authUser, authPass, groups:[]}
       relayDomains: [
         { id: 'relay-1', domain: 'relay.singbox.net', port: 33440, authUser: 'relayuser', authPass: 'relaypass', groups: ['ALL'] }
@@ -2846,6 +2865,8 @@
       systemSettings.testUrl = document.getElementById('setting-test-url').value.trim();
       systemSettings.stickyEnabled = document.getElementById('setting-sticky-enabled').checked;
       systemSettings.stickyTimeout = document.getElementById('setting-sticky-timeout').value.trim() || '5m';
+      systemSettings.randomRotateEnabled = document.getElementById('setting-random-rotate-enabled').checked;
+      systemSettings.randomRotateInterval = parseInt(document.getElementById('setting-random-rotate-interval').value) || 30;
 
       localStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify(systemSettings));
       // 有后端则同步设置到 DB（粘滞超时需后端 config_manager 生效）
@@ -2878,6 +2899,8 @@
       document.getElementById('setting-test-url').value = systemSettings.testUrl;
       document.getElementById('setting-sticky-enabled').checked = !!systemSettings.stickyEnabled;
       document.getElementById('setting-sticky-timeout').value = systemSettings.stickyTimeout || '5m';
+      document.getElementById('setting-random-rotate-enabled').checked = !!systemSettings.randomRotateEnabled;
+      document.getElementById('setting-random-rotate-interval').value = systemSettings.randomRotateInterval || 30;
       renderRelayDomainList();
     }
 
@@ -2899,7 +2922,7 @@
                 needUpdate = true;
               }
             }
-            for (const k of ['reservedPorts', 'listenIp', 'testUrl', 'stickyEnabled', 'stickyTimeout']) {
+            for (const k of ['reservedPorts', 'listenIp', 'testUrl', 'stickyEnabled', 'stickyTimeout', 'randomRotateEnabled', 'randomRotateInterval']) {
               if (merged[k] === undefined || merged[k] === null) {
                 if (systemSettings[k] !== undefined) { merged[k] = systemSettings[k]; needUpdate = true; }
               }
