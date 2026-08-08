@@ -3135,6 +3135,9 @@
             nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
             renderAll();
           }
+          // 关键：导入后重建 sing-box 配置并热重载——否则节点只进 DB，
+          // inbound/outbound 不存在，探活/流量归属全部失效
+          try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
         }).catch(err => {
           addLog('ERROR', '批量导入后端失败: ' + err.message);
         });
@@ -3218,6 +3221,8 @@
             nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
             renderAll();
           }
+          // 关键：订阅导入后同样重建 sing-box 配置（节点 inbound/outbound 才能生效）
+          try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
         }).catch(err => {
           addLog('ERROR', `订阅 [${sub.name}] 导入后端失败: ${err.message}`);
         });
