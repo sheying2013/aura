@@ -1800,6 +1800,7 @@
             <select id="filter-group" class="form-select" style="width: 140px;" onchange="renderNodesTable()">
               <option value="ALL">全部分组</option>
             </select>
+            <button class="btn btn-outline btn-sm" onclick="renameGroup()" title="重命名当前选中分组">重命名</button>
 
             <input type="text" id="search-keyword" class="form-control" placeholder="搜索节点名称/IP/端口..." style="width: 200px;" oninput="renderNodesTable()">
           </div>
@@ -1808,6 +1809,7 @@
             <button class="btn btn-gold btn-sm" onclick="openConvertEntryDialog()">↔ 转换入口协议</button>
             <button class="btn btn-outline btn-sm" onclick="reassignAllPorts()">重新编排端口</button>
             <button class="btn btn-secondary btn-sm" onclick="exportSelectedNodes()">导出选中节点</button>
+            <button class="btn btn-secondary btn-sm" onclick="disableSelectedNodes()">全选停用</button>
             <button class="btn btn-danger btn-sm" onclick="deleteSelectedNodes()">批量删除</button>
           </div>
         </div>
@@ -3699,14 +3701,60 @@
 
       const filterSel = document.getElementById('filter-group');
       const curFilter = filterSel.value;
-      filterSel.innerHTML = '<option value="ALL">全部分组</option>' + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
-      filterSel.value = groups.includes(curFilter) ? curFilter : 'ALL';
+      filterSel.innerHTML = '<option value="ALL">全部分组</option>'
+        + (nodeState.some(n => n.status === 'disabled') ? '<option value="__DISABLED__">停用节点</option>' : '')
+        + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
+      filterSel.value = (curFilter === '__DISABLED__' || groups.includes(curFilter)) ? curFilter : 'ALL';
 
       const exportSel = document.getElementById('export-group-select');
       exportSel.innerHTML = '<option value="ALL">全部分组节点</option>' + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
 
       // 多域名轮询：刷新各域名卡的分组勾选
       renderRelayDomainList();
+    }
+
+    // 分组重命名：批量改节点分组 + relay 域名引用（后端处理 + 重建配置）
+    function renameGroup() {
+      const sel = document.getElementById('filter-group');
+      const oldName = sel.value;
+      if (!oldName || oldName === 'ALL' || oldName === '__DISABLED__') {
+        alert('请先在下拉框选中要重命名的分组');
+        return;
+      }
+      const newName = prompt(`将分组「${oldName}」重命名为：`, oldName);
+      if (!newName || newName.trim() === '' || newName === oldName) return;
+      if (newName.includes('/') || newName.includes('"')) {
+        alert('分组名不能包含斜杠或引号');
+        return;
+      }
+      const doRename = (payload) => {
+        const url = window.__backendMode ? '/api/groups/rename' : null;
+        if (!url) {
+          // 本地模式：直接改内存
+          nodeState.forEach(n => { if (n.group === oldName) n.group = newName.trim(); });
+          saveNodesToStorage();
+          addLog('SUCCESS', `分组 [${oldName}] 已重命名为 [${newName.trim()}]（本地）`);
+          renderAll();
+          return;
+        }
+        api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+          .then(resp => {
+            if (!resp.ok) return resp.json().then(d => { throw new Error(d.detail || ('HTTP ' + resp.status)); });
+            return resp.json();
+          })
+          .then(data => {
+            addLog('SUCCESS', `分组 [${oldName}] 已重命名为 [${newName.trim()}]（更新 ${data.updated} 个节点）`);
+            return api('/api/nodes').then(r => r.json());
+          })
+          .then(data => {
+            if (data && data.items) {
+              nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
+              renderAll();
+            }
+          })
+          .catch(err => addLog('ERROR', `分组重命名失败: ${err.message || err}`));
+      };
+      doRename({ oldName, newName: newName.trim() });
     }
 
     function renderQuickStats() {
@@ -3768,7 +3816,9 @@
       const searchKw = document.getElementById('search-keyword').value.toLowerCase().trim();
 
       const filtered = nodeState.filter(node => {
-        const matchGroup = (selectedGroup === 'ALL' || node.group === selectedGroup);
+        // 「停用节点」特殊分组：跨分组显示全部 disabled 节点
+        const matchGroup = (selectedGroup === 'ALL'
+          || (selectedGroup === '__DISABLED__' ? node.status === 'disabled' : node.group === selectedGroup));
         const matchKw = !searchKw || node.name.toLowerCase().includes(searchKw) || String(node.port).includes(searchKw) || (node.exitIp && node.exitIp.includes(searchKw));
         return matchGroup && matchKw;
       });
@@ -3968,6 +4018,35 @@
           addLog('WARN', `批量删除了 ${selectedIds.length} 个节点`);
           saveNodesToStorage();
         }
+      }
+    }
+
+    // 批量停用选中节点（状态置 disabled，不参与探活/轮询；后端 PATCH + 重建配置）
+    function disableSelectedNodes() {
+      const selectedIds = Array.from(document.querySelectorAll('.chk-node:checked')).map(c => c.value);
+      if (selectedIds.length === 0) {
+        alert('请先勾选需要停用的节点！');
+        return;
+      }
+      if (!confirm(`确认停用选中的 ${selectedIds.length} 个节点？停用后不再参与探活和代理池轮询，可随时手动启用。`)) return;
+      const doDisable = () => {
+        nodeState.forEach(n => { if (selectedIds.includes(n.id) && n.status !== 'disabled') n.status = 'disabled'; });
+        addLog('WARN', `批量停用了 ${selectedIds.length} 个节点`);
+        try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+        renderAll();
+      };
+      if (window.__backendMode) {
+        const reqs = selectedIds.map(id =>
+          api('/api/nodes/' + encodeURIComponent(id), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'disabled' }),
+          })
+        );
+        Promise.allSettled(reqs).then(doDisable);
+      } else {
+        saveNodesToStorage();
+        doDisable();
       }
     }
 
@@ -4371,6 +4450,9 @@
             server_port: cfg.server_port,
             uuid: cfg.uuid
           };
+          // vless 订阅节点几乎全走 TLS 端口；按 sni/insecure 生成 tls（与后端一致）
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          if (cfg.transport || cfg.streamSettings) outItem.transport = cfg.transport || cfg.streamSettings;
         } else if (node.protocol === 'trojan') {
           outItem = {
             type: 'trojan',
@@ -4379,6 +4461,19 @@
             server_port: cfg.server_port,
             password: cfg.password
           };
+          // trojan 协议强制 TLS（与后端一致）
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          if (cfg.transport || cfg.streamSettings) outItem.transport = cfg.transport || cfg.streamSettings;
+        } else if (node.protocol === 'hysteria2') {
+          outItem = {
+            type: 'hysteria2',
+            tag: tagOutbound,
+            server: cfg.server,
+            server_port: cfg.server_port,
+            password: cfg.password
+          };
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || '' , ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          if (cfg.obfs) outItem.obfs = { type: cfg.obfs, password: cfg.obfsPassword || cfg['obfs-password'] || '' };
         }
 
         outbounds.push(outItem);

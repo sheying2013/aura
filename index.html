@@ -1809,6 +1809,7 @@
             <button class="btn btn-gold btn-sm" onclick="openConvertEntryDialog()">↔ 转换入口协议</button>
             <button class="btn btn-outline btn-sm" onclick="reassignAllPorts()">重新编排端口</button>
             <button class="btn btn-secondary btn-sm" onclick="exportSelectedNodes()">导出选中节点</button>
+            <button class="btn btn-secondary btn-sm" onclick="disableSelectedNodes()">全选停用</button>
             <button class="btn btn-danger btn-sm" onclick="deleteSelectedNodes()">批量删除</button>
           </div>
         </div>
@@ -3700,8 +3701,10 @@
 
       const filterSel = document.getElementById('filter-group');
       const curFilter = filterSel.value;
-      filterSel.innerHTML = '<option value="ALL">全部分组</option>' + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
-      filterSel.value = groups.includes(curFilter) ? curFilter : 'ALL';
+      filterSel.innerHTML = '<option value="ALL">全部分组</option>'
+        + (nodeState.some(n => n.status === 'disabled') ? '<option value="__DISABLED__">停用节点</option>' : '')
+        + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
+      filterSel.value = (curFilter === '__DISABLED__' || groups.includes(curFilter)) ? curFilter : 'ALL';
 
       const exportSel = document.getElementById('export-group-select');
       exportSel.innerHTML = '<option value="ALL">全部分组节点</option>' + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
@@ -3714,7 +3717,7 @@
     function renameGroup() {
       const sel = document.getElementById('filter-group');
       const oldName = sel.value;
-      if (!oldName || oldName === 'ALL') {
+      if (!oldName || oldName === 'ALL' || oldName === '__DISABLED__') {
         alert('请先在下拉框选中要重命名的分组');
         return;
       }
@@ -3813,7 +3816,9 @@
       const searchKw = document.getElementById('search-keyword').value.toLowerCase().trim();
 
       const filtered = nodeState.filter(node => {
-        const matchGroup = (selectedGroup === 'ALL' || node.group === selectedGroup);
+        // 「停用节点」特殊分组：跨分组显示全部 disabled 节点
+        const matchGroup = (selectedGroup === 'ALL'
+          || (selectedGroup === '__DISABLED__' ? node.status === 'disabled' : node.group === selectedGroup));
         const matchKw = !searchKw || node.name.toLowerCase().includes(searchKw) || String(node.port).includes(searchKw) || (node.exitIp && node.exitIp.includes(searchKw));
         return matchGroup && matchKw;
       });
@@ -4013,6 +4018,35 @@
           addLog('WARN', `批量删除了 ${selectedIds.length} 个节点`);
           saveNodesToStorage();
         }
+      }
+    }
+
+    // 批量停用选中节点（状态置 disabled，不参与探活/轮询；后端 PATCH + 重建配置）
+    function disableSelectedNodes() {
+      const selectedIds = Array.from(document.querySelectorAll('.chk-node:checked')).map(c => c.value);
+      if (selectedIds.length === 0) {
+        alert('请先勾选需要停用的节点！');
+        return;
+      }
+      if (!confirm(`确认停用选中的 ${selectedIds.length} 个节点？停用后不再参与探活和代理池轮询，可随时手动启用。`)) return;
+      const doDisable = () => {
+        nodeState.forEach(n => { if (selectedIds.includes(n.id) && n.status !== 'disabled') n.status = 'disabled'; });
+        addLog('WARN', `批量停用了 ${selectedIds.length} 个节点`);
+        try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+        renderAll();
+      };
+      if (window.__backendMode) {
+        const reqs = selectedIds.map(id =>
+          api('/api/nodes/' + encodeURIComponent(id), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'disabled' }),
+          })
+        );
+        Promise.allSettled(reqs).then(doDisable);
+      } else {
+        saveNodesToStorage();
+        doDisable();
       }
     }
 
@@ -4416,6 +4450,9 @@
             server_port: cfg.server_port,
             uuid: cfg.uuid
           };
+          // vless 订阅节点几乎全走 TLS 端口；按 sni/insecure 生成 tls（与后端一致）
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          if (cfg.transport || cfg.streamSettings) outItem.transport = cfg.transport || cfg.streamSettings;
         } else if (node.protocol === 'trojan') {
           outItem = {
             type: 'trojan',
@@ -4424,6 +4461,19 @@
             server_port: cfg.server_port,
             password: cfg.password
           };
+          // trojan 协议强制 TLS（与后端一致）
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          if (cfg.transport || cfg.streamSettings) outItem.transport = cfg.transport || cfg.streamSettings;
+        } else if (node.protocol === 'hysteria2') {
+          outItem = {
+            type: 'hysteria2',
+            tag: tagOutbound,
+            server: cfg.server,
+            server_port: cfg.server_port,
+            password: cfg.password
+          };
+          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || '' , ...(cfg.insecure || cfg['skip-cert-verify'] ? { insecure: true } : {}) };
+          if (cfg.obfs) outItem.obfs = { type: cfg.obfs, password: cfg.obfsPassword || cfg['obfs-password'] || '' };
         }
 
         outbounds.push(outItem);

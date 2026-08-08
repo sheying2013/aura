@@ -175,14 +175,28 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
                     rc["tls"]["server_name"] = params["sni"]
                 if params.get("fp"):
                     rc["tls"]["utls"] = {"enabled": True, "fingerprint": params["fp"]}
+                # vless/trojan 常见 allowInsecure / insecure 参数
+                for k in ("allowInsecure", "insecure"):
+                    if params.get(k) in ("1", "true", "yes"):
+                        rc["tls"]["insecure"] = True
                 if params.get("flow"):
                     rc["flow"] = params["flow"]
                 if params.get("type", "tcp") != "tcp":
                     rc["transport"] = {"type": params["type"]}
+                    if params.get("path"):
+                        rc["transport"]["path"] = params["path"]
+                    if params.get("host"):
+                        rc["transport"]["headers"] = {"Host": params["host"]}
+                    if params.get("serviceName"):
+                        rc["transport"]["service_name"] = params["serviceName"]
                 if params.get("security") == "reality":
                     rc["tls"]["reality"] = {"enabled": True,
                                             "public_key": params.get("pbk", ""),
                                             "short_id": params.get("sid", "")}
+                    # sing-box reality client 强制要求 uTLS（无 fp 默认 chrome）
+                    if "utls" not in rc["tls"]:
+                        rc["tls"]["utls"] = {"enabled": True,
+                                             "fingerprint": params.get("fp") or "chrome"}
                 return {
                     "name": name or f"{proto}-{hp[0]}", "protocol": sb_type, "rawConfig": rc,
                 }
@@ -192,12 +206,19 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
             m = re.match(r"^([^@]*)@?([^:]+):(\d+)(.*)$", body)
             if not m:
                 return None
-            params = dict(re.findall(r"([^&=]+)=([^&]+)", m.group(4)))
+            qs = m.group(4).lstrip("?")
+            params = dict(re.findall(r"([^&=]+)=([^&]+)", qs))
+            rc: Dict[str, Any] = {"server": m.group(2), "server_port": int(m.group(3)),
+                                  "password": m.group(1) or params.get("auth", ""),
+                                  "sni": params.get("sni", "")}
+            if params.get("insecure") in ("1", "true", "yes"):
+                rc["insecure"] = True
+            if params.get("obfs"):
+                rc["obfs"] = params["obfs"]
+                rc["obfsPassword"] = params.get("obfs-password", "")
             return {
                 "name": name or f"hy2-{m.group(2)}", "protocol": "hysteria2",
-                "rawConfig": {"server": m.group(2), "server_port": int(m.group(3)),
-                              "password": m.group(1) or params.get("auth", ""),
-                              "sni": params.get("sni", "")},
+                "rawConfig": rc,
             }
         # tuic://
         if line.startswith("tuic://"):
@@ -206,7 +227,7 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
             if not m:
                 return None
             parts = m.group(1).split(":")
-            params = dict(re.findall(r"([^&=]+)=([^&]+)", m.group(4)))
+            params = dict(re.findall(r"([^&=]+)=([^&]+)", m.group(4).lstrip("?")))
             return {
                 "name": name or f"tuic-{m.group(2)}", "protocol": "tuic",
                 "rawConfig": {"server": m.group(2), "server_port": int(m.group(3)),
@@ -277,20 +298,49 @@ def _parse_clash_yaml(content: str) -> List[Dict[str, Any]]:
 
     for block in blocks:
         obj: Dict[str, Any] = {}
-        for l in block:
+
+        # 两遍扫描：先定位所有 *-opts 子块的行区间（缩进大于 opts 键的行）
+        opts_ranges: List[tuple] = []
+        for i, l in enumerate(block):
+            opm0 = re.match(r"^(\s*)[\w-]+-opts:\s*$", l)
+            if opm0:
+                base0 = len(opm0.group(1))
+                j = i + 1
+                while j < len(block):
+                    lm = re.match(r"^(\s+)", block[j])
+                    if not lm or len(lm.group(1)) <= base0:
+                        break
+                    j += 1
+                opts_ranges.append((i, j))
+        # 主循环：跳过 *-opts 子块区间内的行（避免 path/Host/tls 污染顶层）
+        for i, l in enumerate(block):
+            if any(s <= i < e for s, e in opts_ranges):
+                continue
             kv = re.match(r"^\s*([\w-]+):\s*(.*)$", l)
-            if kv and kv.group(1) not in ("ws-opts", "grpc-opts", "reality-opts", "plugin-opts", "ss-opts", "xhttp-opts", "tls-opts", "http-opts"):
+            if kv:
                 obj[kv.group(1)] = kv.group(2).strip().strip("'\"")
         for i, l in enumerate(block):
-            opm = re.match(r"^\s*([\w-]+)-opts:\s*$", l)
+            opm = re.match(r"^\s*-?\s*([\w-]+)-opts:\s*$", l)
             if opm:
+                base_indent = len(l) - len(l.lstrip())
                 sub: Dict[str, Any] = {}
                 for j in range(i + 1, len(block)):
-                    if not re.match(r"^\s+\S", block[j]):
-                        break
-                    kv = re.match(r"^\s+([\w-]+):\s*(.*)$", block[j])
-                    if kv:
-                        sub[kv.group(1)] = kv.group(2).strip().strip("'\"")
+                    kv = re.match(r"^(\s+)([\w-]+):\s*(.*)$", block[j])
+                    if not kv or len(kv.group(1)) <= base_indent:
+                        break  # 缩进不足 = 属于 opts 之外的兄弟字段
+                    indent = len(kv.group(1))
+                    key, val = kv.group(2), kv.group(3).strip().strip("'\"")
+                    if key == "headers" and not val:
+                        # headers 嵌套子块（如 Host: xxx）→ dict
+                        hdrs: Dict[str, Any] = {}
+                        for k2 in range(j + 1, len(block)):
+                            kv2 = re.match(r"^(\s+)([\w-]+):\s*(.*)$", block[k2])
+                            if not kv2 or len(kv2.group(1)) <= indent:
+                                break
+                            hdrs[kv2.group(2)] = kv2.group(3).strip().strip("'\"")
+                        sub["headers"] = hdrs
+                    else:
+                        sub[key] = val
                 obj[opm.group(1) + "-opts"] = sub
         if not obj.get("name") or not obj.get("type"):
             continue
@@ -299,20 +349,73 @@ def _parse_clash_yaml(content: str) -> List[Dict[str, Any]]:
         proto = proto_map.get(obj.get("type", ""))
         if not proto:
             continue
-        # 归一化：clash tls 字段可能是字符串 'true'/'false' → 转 dict
+
+        def _bool(v: Any) -> bool:
+            if isinstance(v, bool):
+                return v
+            return str(v).strip().lower() in ("true", "1", "yes", "on")
+
+        # 端口/数值统一转 int（clash YAML 解析后是字符串）
+        for pk in ("port", "server_port"):
+            if pk in obj:
+                try:
+                    obj[pk] = int(obj[pk])
+                except (TypeError, ValueError):
+                    pass
+
+        # TLS 归一化：tls 字段（bool/'true'）+ sni/server_name + skip-cert-verify → sing-box tls dict
         tls_raw = obj.get("tls")
-        if isinstance(tls_raw, str):
-            obj["tls"] = {"enabled": tls_raw.lower() == "true"}
-        # 归一化：clash network + ws-opts/grpc-opts → sing-box transport
-        if obj.get("network") and obj.get("network") != "tcp":
-            transport = {"type": obj["network"]}
-            opts_key = obj["network"] + "-opts"
+        tls_enabled = _bool(tls_raw) if tls_raw is not None else None
+        sni = obj.get("sni") or obj.get("server_name") or ""
+        skip_verify = _bool(obj.get("skip-cert-verify")) if obj.get("skip-cert-verify") is not None else False
+        if tls_enabled is not None or sni or skip_verify:
+            tls_dict: Dict[str, Any] = {"enabled": bool(tls_enabled) if tls_enabled is not None else True}
+            if sni:
+                tls_dict["server_name"] = sni
+            if skip_verify:
+                tls_dict["insecure"] = True
+            if obj.get("fingerprint") or obj.get("client-fingerprint"):
+                tls_dict["utls"] = {"enabled": True,
+                                    "fingerprint": obj.get("fingerprint") or obj.get("client-fingerprint")}
+            if obj.get("reality-opts"):
+                ropts = obj["reality-opts"]
+                tls_dict["reality"] = {"enabled": True,
+                                       "public_key": ropts.get("public-key") or ropts.get("public_key", ""),
+                                       "short_id": ropts.get("short-id") or ropts.get("short_id", "")}
+                # sing-box reality client 强制要求 uTLS（无 fp 默认 chrome 指纹）
+                if "utls" not in tls_dict:
+                    tls_dict["utls"] = {"enabled": True,
+                                        "fingerprint": obj.get("fingerprint") or obj.get("client-fingerprint") or "chrome"}
+            obj["tls"] = tls_dict
+
+        # 归一化：clash network + ws-opts/grpc-opts/grpc → sing-box transport
+        network = (obj.get("network") or "tcp").lower()
+        if network != "tcp":
+            transport: Dict[str, Any] = {"type": network}
+            opts_key = network + "-opts"
             opts = obj.get(opts_key)
             if isinstance(opts, dict):
                 for k, v in opts.items():
+                    if k in ("headers",):
+                        continue  # headers 单独处理（嵌套 dict）
+                    if k in ("tls", "skip-cert-verify", "servername", "server_name", "Host"):
+                        continue  # clash 专有字段不进 transport
                     transport[k] = v
+                hdrs = opts.get("headers")
+                if isinstance(hdrs, dict) and hdrs:
+                    transport["headers"] = hdrs
+                if network == "ws" and isinstance(opts.get("path"), str):
+                    transport["path"] = opts["path"] or "/"
+            # grpc 兼容：serviceName 可能直接在 grpc-opts 或顶层
+            if network == "grpc" and not transport.get("service_name"):
+                transport["service_name"] = obj.get("serviceName") or obj.get("service_name", "")
             obj["transport"] = transport
-        # clash ss 用 cipher 键 → method 兼容已在 config_manager 处理
+        # hy2 obfs 参数 → rawConfig 保留（config_manager 生成 outbound 时映射）
+        if proto == "hysteria2":
+            if obj.get("obfs"):
+                obj["obfs"] = obj["obfs"]
+            if obj.get("obfs-password"):
+                obj["obfsPassword"] = obj["obfs-password"]
         nodes.append({"name": obj["name"], "protocol": proto, "rawConfig": obj})
     return nodes
 

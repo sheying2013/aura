@@ -217,7 +217,21 @@ const SubscriptionManager = (() => {
   }
 
   /* ---------- 订阅拉取 ---------- */
+  // 后端模式：走 /api/subs/fetch（服务端 httpx 拉取，无浏览器 CORS 限制）
+  // 本地模式：直接 fetch（机场订阅大多不带 CORS 头，仅本地可用）
   async function fetchSubscription(url) {
+    if (window.__backendMode) {
+      const token = localStorage.getItem('sb_auth_token') || '';
+      const resp = await fetch('/api/subs/fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: JSON.stringify({ url })
+      });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const data = await resp.json();
+      if (!data.ok) throw new Error(data.error || '拉取失败');
+      return data.content || '';
+    }
     const resp = await fetch(url, { mode: 'cors' });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     return await resp.text();

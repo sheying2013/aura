@@ -148,6 +148,15 @@ def build_config() -> Dict[str, Any]:
                 out_item["security"] = cfg.get("security", "auto")
             if tls:
                 out_item["tls"] = tls
+            elif sb_type == "vless":
+                # vless 订阅节点（clash/vless://）几乎全走 TLS 端口；无 tls 配置时
+                # 尝试按 sni/skip-cert-verify 推断，避免裸连超时
+                out_item["tls"] = {
+                    "enabled": True,
+                    "server_name": cfg.get("sni") or cfg.get("server_name") or cfg.get("server", ""),
+                    **({"insecure": True} if cfg.get("skip-cert-verify") in (True, "true", "1")
+                       else {}),
+                }
             if cfg.get("flow"):
                 out_item["flow"] = cfg["flow"]
             if cfg.get("transport") or cfg.get("streamSettings"):
@@ -160,6 +169,16 @@ def build_config() -> Dict[str, Any]:
             })
             if tls:
                 out_item["tls"] = tls
+            else:
+                # trojan 协议强制 TLS；订阅节点未带 tls 配置时按 sni 推断
+                out_item["tls"] = {
+                    "enabled": True,
+                    "server_name": cfg.get("sni") or cfg.get("server_name") or cfg.get("server", ""),
+                    **({"insecure": True} if cfg.get("skip-cert-verify") in (True, "true", "1")
+                       else {}),
+                }
+            if cfg.get("transport") or cfg.get("streamSettings"):
+                out_item["transport"] = cfg.get("transport") or cfg.get("streamSettings")
         elif sb_type in ("socks", "http"):
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
@@ -176,8 +195,17 @@ def build_config() -> Dict[str, Any]:
                 "server_port": int(cfg.get("server_port") or cfg.get("port") or 0),
                 "password": cfg.get("password") or cfg.get("auth") or "",
             })
-            if cfg.get("sni"):
-                out_item["tls"] = {"enabled": True, "server_name": cfg["sni"]}
+            tls_dict: Dict[str, Any] = {"enabled": True}
+            if cfg.get("sni") or cfg.get("server_name"):
+                tls_dict["server_name"] = cfg.get("sni") or cfg.get("server_name")
+            if cfg.get("insecure") in (True, "true", "1") or cfg.get("skip-cert-verify") in (True, "true", "1"):
+                tls_dict["insecure"] = True
+            out_item["tls"] = tls_dict
+            # hy2 obfs（clash 订阅常见 salamander）→ sing-box 对象形式
+            obfs = cfg.get("obfs")
+            if obfs:
+                out_item["obfs"] = {"type": obfs,
+                                    "password": cfg.get("obfsPassword") or cfg.get("obfs-password") or ""}
         elif sb_type == "tuic":
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
