@@ -40,8 +40,10 @@ echo "=== 重启容器 ==="
 docker rm -f "$CONTAINER" 2>/dev/null || true
 
 mkdir -p "$DATA_DIR"
+# host 网络：sing-box 的所有入站端口（面板 19001 + 节点端口 + 域名轮询入口如 33440）
+# 直接监听宿主机，无需为每个端口手动映射；任意新增 relay 域名端口即时生效
 docker run -d --name "$CONTAINER" \
-  -p "$PORT:$PORT" \
+  --network host \
   -v "$DATA_DIR:/app/backend/data" \
   --restart unless-stopped \
   "$IMAGE"

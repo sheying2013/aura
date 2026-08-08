@@ -447,11 +447,16 @@ def get_settings():
 
 
 @app.put("/api/settings", dependencies=[Depends(require_auth)])
-def put_settings(body: dict):
+async def put_settings(body: dict):
     db.set_setting("system", body)
     # 同步 relay_domains 表（供后端查询用）
     if isinstance(body.get("relayDomains"), list):
         db.upsert_relay_domains(body["relayDomains"])
+    # 设置/域名变更后自动重生成并热重载 sing-box（新域名入口立即生效）
+    try:
+        await config_manager.apply_config()
+    except Exception:
+        pass
     return {"ok": True}
 
 

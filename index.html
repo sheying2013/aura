@@ -2745,11 +2745,11 @@
 
     async function loadNodesFromBackendOrStorage() {
       // 后端可达就用后端真实数据（空列表=没节点，绝不用 demo 填充）
-      let backendReached = false;
       try {
         const resp = await api('/api/nodes');
         if (resp.ok) {
-          backendReached = true;
+          // 后端可达即标记后端模式（空列表也是后端模式，保存必须落 DB）
+          window.__backendMode = true;
           const data = await resp.json();
           if (data && data.items) {
             nodeState = data.items.map(n => {
@@ -2757,8 +2757,6 @@
               n.entryProto = n.entryProto || 'mixed';
               return n;
             });
-            // 后端有数据则标记已走后端（保存不再覆盖 DB）
-            window.__backendMode = true;
             renderAll();
             return;
           }
