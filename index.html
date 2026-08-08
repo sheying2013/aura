@@ -2063,6 +2063,22 @@
           </div>
         </div>
 
+        <div style="border-top: 1px solid var(--paper-border); padding-top: 16px; margin-top: 8px; margin-bottom: 20px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px;">
+            <div>
+              <label class="form-label" style="margin-bottom:2px;">代理池粘滞超时（sticky）</label>
+              <div style="font-size: 12px; color: var(--ink-gray);">开启后轮询出口在设定时长内粘住当前节点不切换，避免代理频繁换出口导致连接抖动。</div>
+            </div>
+            <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; white-space:nowrap;">
+              <input type="checkbox" id="setting-sticky-enabled" onchange="saveSystemSettings()"> 启用
+            </label>
+          </div>
+          <div>
+            <label class="form-label" style="font-size:12px;">粘滞时长（如 30s / 5m / 10m）</label>
+            <input type="text" id="setting-sticky-timeout" class="form-control" value="5m" placeholder="30s / 5m / 10m" onchange="saveSystemSettings()" style="max-width: 200px;">
+          </div>
+        </div>
+
         <div style="border-top: 1px solid var(--paper-border); padding-top: 20px; margin-top: 20px; display: flex; justify-content: space-between;">
           <button class="btn btn-outline" onclick="loadDemoNodes()">⚡ 重新载入 Demo 默认示例节点</button>
           <button class="btn btn-danger" onclick="clearAllData()">🗑️ 重置面板所有持久化数据</button>
@@ -2166,6 +2182,8 @@
           showLogin(false);
           document.getElementById('pwd-overlay').style.display = 'none';
           addLog('SUCCESS', '登录成功');
+          // 登录成功后连接真实流量 SSE（此前未登录时的连接已被 401 拒绝）
+          startTrafficSSE();
         }
       } catch (e) { errEl.textContent = '网络错误：' + e.message; }
     }
@@ -2204,6 +2222,8 @@
         if (data.token) {
           authToken = data.token;
           localStorage.setItem(AUTH_TOKEN_KEY, authToken);
+          // token 已变更，旧 SSE 连接失效，用新 token 重连
+          startTrafficSSE();
         }
         if (fromFirstLogin) {
           document.getElementById('pwd-overlay').style.display = 'none';
@@ -2246,6 +2266,9 @@
       relayPort: 33440,
       relayAuth: 'relayuser:relaypass',
       relaySelectedGroups: ['ALL'],
+      // 代理池轮询粘滞超时：开启后 urltest 会粘住当前出口 sticky_timeout 时长，避免频繁切换
+      stickyEnabled: false,
+      stickyTimeout: '5m',
       // 多域名轮询入口数组：{id, domain, port, authUser, authPass, groups:[]}
       relayDomains: [
         { id: 'relay-1', domain: 'relay.singbox.net', port: 33440, authUser: 'relayuser', authPass: 'relaypass', groups: ['ALL'] }
@@ -2292,20 +2315,29 @@
     });
 
     /* ---------- SSE 真实流量消费（fetch + ReadableStream，支持 Bearer token） ---------- */
+    let sseActive = false;      // 当前是否有活跃 SSE 连接
+    let sseReconnectTimer = null; // 断开重连定时器
     function startTrafficSSE() {
+      if (sseActive) return;    // 已有活跃连接不重复建立
       try {
         const url = '/api/stats/stream';
         const headers = {};
         if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
         fetch(url, { headers }).then(resp => {
           if (!resp.ok) return; // 静默放弃，回退模拟
+          sseActive = true;
           sseConnected = true;
           const reader = resp.body.getReader();
           const decoder = new TextDecoder();
           let buf = '';
           function pump() {
             reader.read().then(({ done, value }) => {
-              if (done) { sseConnected = false; return; }
+              if (done) {
+                sseConnected = false;
+                sseActive = false;
+                scheduleSseReconnect();
+                return;
+              }
               buf += decoder.decode(value, { stream: true });
               const parts = buf.split('\n\n');
               buf = parts.pop();
@@ -2330,17 +2362,39 @@
                             if (ns.ping != null) node.ping = ns.ping;
                           }
                         });
+                        // 节流刷新统计条/表格/矩阵，避免 1s 全量重绘过重
+                        if (!window.__sseRenderTimer) {
+                          window.__sseRenderTimer = setTimeout(() => {
+                            window.__sseRenderTimer = null;
+                            renderQuickStats();
+                            renderNodesTable();
+                            renderNodeMatrix();
+                            updateChartAndStats();
+                          }, 2000);
+                        }
                       }
                     }
                   } catch (e) { /* 解析失败跳过 */ }
                 }
               }
               pump();
-            }).catch(() => { sseConnected = false; });
+            }).catch(() => {
+              sseConnected = false;
+              sseActive = false;
+              scheduleSseReconnect();
+            });
           }
           pump();
         }).catch(() => { /* fetch 失败静默 */ });
       } catch (e) { /* 整体异常静默 */ }
+    }
+    function scheduleSseReconnect() {
+      // 已登录才重连（未登录无 token，重连只会 401）；3s 后重试
+      if (!authToken || sseReconnectTimer) return;
+      sseReconnectTimer = setTimeout(() => {
+        sseReconnectTimer = null;
+        startTrafficSSE();
+      }, 3000);
     }
 
     function initInitialTrafficHistory() {
@@ -2365,13 +2419,16 @@
 
       function animate() {
         step += 0.04;
-        
-        // 1. 模拟速率的微小起伏波动 (使得数据跳动极其平滑自然)
-        const targetUp = 1.20 + Math.sin(step * 1.2) * 0.45 + (Math.random() * 0.1 - 0.05);
-        const targetDown = 18.50 + Math.cos(step * 0.8) * 4.20 + (Math.random() * 0.4 - 0.2);
 
-        realtimeUpSpeed = Math.max(0.05, realtimeUpSpeed * 0.95 + targetUp * 0.05);
-        realtimeDownSpeed = Math.max(0.1, realtimeDownSpeed * 0.95 + targetDown * 0.05);
+        // 1. 速率数值：SSE 已连（真实数据）→ 直接用真实值渲染，绝不用模拟值覆盖；
+        //    未连 SSE → 才用模拟起伏（仅本地预览/无后端场景）
+        if (!sseConnected) {
+          const targetUp = 1.20 + Math.sin(step * 1.2) * 0.45 + (Math.random() * 0.1 - 0.05);
+          const targetDown = 18.50 + Math.cos(step * 0.8) * 4.20 + (Math.random() * 0.4 - 0.2);
+
+          realtimeUpSpeed = Math.max(0.05, realtimeUpSpeed * 0.95 + targetUp * 0.05);
+          realtimeDownSpeed = Math.max(0.1, realtimeDownSpeed * 0.95 + targetDown * 0.05);
+        }
 
         const upEl = document.getElementById('realtime-up-speed');
         const downEl = document.getElementById('realtime-down-speed');
@@ -2687,9 +2744,12 @@
     }
 
     async function loadNodesFromBackendOrStorage() {
+      // 后端可达就用后端真实数据（空列表=没节点，绝不用 demo 填充）
+      let backendReached = false;
       try {
         const resp = await api('/api/nodes');
         if (resp.ok) {
+          backendReached = true;
           const data = await resp.json();
           if (data && data.items) {
             nodeState = data.items.map(n => {
@@ -2704,24 +2764,26 @@
           }
         }
       } catch (e) { /* 无后端走 localStorage */ }
-      // 无后端：回退本地 demo
+      // 后端不可达：回退 localStorage（绝不用 demo 自动填充）
       loadNodesFromStorage();
-      if (nodeState.length === 0) {
-        loadDemoNodes(false);
-      } else {
-        renderAll();
-      }
+      renderAll();
     }
 
     function saveSystemSettings() {
       const reservedStr = document.getElementById('setting-reserved-ports').value;
       const reservedArr = reservedStr.split(/[\n,]/).map(x => parseInt(x.trim())).filter(x => !isNaN(x));
-      
+
       systemSettings.reservedPorts = reservedArr;
       systemSettings.listenIp = document.getElementById('setting-listen-ip').value.trim() || '0.0.0.0';
       systemSettings.testUrl = document.getElementById('setting-test-url').value.trim();
-      
+      systemSettings.stickyEnabled = document.getElementById('setting-sticky-enabled').checked;
+      systemSettings.stickyTimeout = document.getElementById('setting-sticky-timeout').value.trim() || '5m';
+
       localStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify(systemSettings));
+      // 有后端则同步设置到 DB（粘滞超时需后端 config_manager 生效）
+      if (window.__backendMode) {
+        try { api('/api/settings', { method: 'PUT', body: JSON.stringify(systemSettings) }); } catch(e){}
+      }
       addLog('INFO', '系统配置参数已保存');
       renderAll();
     }
@@ -2746,6 +2808,8 @@
       document.getElementById('setting-reserved-ports').value = systemSettings.reservedPorts.join('\n');
       document.getElementById('setting-listen-ip').value = systemSettings.listenIp;
       document.getElementById('setting-test-url').value = systemSettings.testUrl;
+      document.getElementById('setting-sticky-enabled').checked = !!systemSettings.stickyEnabled;
+      document.getElementById('setting-sticky-timeout').value = systemSettings.stickyTimeout || '5m';
       renderRelayDomainList();
     }
 
@@ -4072,13 +4136,18 @@
 
         // 轮询目标：该分组内所有节点出站 tag，若空则 direct
         const rdTargets = rdNodes.map(n => `out-${n.protocol}-${n.port}`).filter(t => outboundTagSet.has(t));
-        outbounds.push({
+        const rdOutbound = {
           type: 'urltest',
           tag: rdOutboundTag,
           outbounds: rdTargets.length > 0 ? rdTargets : ['direct'],
           url: systemSettings.testUrl,
           interval: '3m'
-        });
+        };
+        // 代理池粘滞超时：开启后把探测间隔拉长到 sticky_timeout，期间出口粘住当前节点
+        if (systemSettings.stickyEnabled) {
+          rdOutbound.interval = systemSettings.stickyTimeout || '5m';
+        }
+        outbounds.push(rdOutbound);
 
         // 该域名绑定到自己的轮询出站
         routeRules.push({
