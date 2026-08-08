@@ -27,14 +27,6 @@
       --ink-gray: #9e9585;            /* 次要文字 */
       --ink-muted: #666055;           /* 暗色弱化 */
       --danger-red: #c0392b;
-      
-      --badge-51-bg: rgba(56, 142, 142, 0.2);
-      --badge-51-color: #5edfff;
-      --badge-51-border: rgba(94, 223, 255, 0.35);
-      
-      --badge-52-bg: rgba(150, 140, 120, 0.2);
-      --badge-52-color: #d1c8b8;
-      --badge-52-border: rgba(209, 200, 184, 0.3);
 
       --badge-pool-bg: rgba(212, 163, 55, 0.18);
       --badge-pool-color: #e6b45a;
@@ -748,7 +740,7 @@
       margin-bottom: 4px;
     }
 
-    .group-bar-segment {
+    .group-bar-part {
       height: 100%;
       transition: width 0.4s ease;
       position: relative;
@@ -1282,26 +1274,6 @@
       box-shadow: 0 0 6px rgba(192, 57, 43, 0.5);
     }
 
-    /* 51 / 52 段徽标 */
-    .badge-segment {
-      display: inline-flex;
-      align-items: center;
-      padding: 1px 6px;
-      border-radius: 4px;
-      font-size: 10px;
-      font-weight: bold;
-      font-family: var(--font-code);
-    }
-    .badge-51 {
-      background: var(--badge-51-bg);
-      color: var(--badge-51-color);
-      border: 1px solid var(--badge-51-border);
-    }
-    .badge-52 {
-      background: var(--badge-52-bg);
-      color: var(--badge-52-color);
-      border: 1px solid var(--badge-52-border);
-    }
     .badge-pool {
       background: var(--badge-pool-bg);
       color: var(--badge-pool-color);
@@ -1803,11 +1775,9 @@
       <div class="stat-divider">|</div>
       <div class="stat-pill">出站节点: <span class="val" id="qs-total-nodes">0</span></div>
       <div class="stat-divider">|</div>
-      <div class="stat-pill">高质量: <span class="val" style="color:var(--badge-51-color)" id="qs-51-count">0</span></div>
-      <div class="stat-divider">|</div>
-      <div class="stat-pill">普通: <span class="val" style="color:var(--badge-52-color)" id="qs-52-count">0</span></div>
-      <div class="stat-divider">|</div>
       <div class="stat-pill">代理池: <span class="val" style="color:var(--badge-pool-color)" id="qs-pool-count">0</span></div>
+      <div class="stat-divider">|</div>
+      <div class="stat-pill">普通: <span class="val" id="qs-normal-count">0</span></div>
       <div class="stat-divider">|</div>
       <div class="stat-pill">在线节点: <span class="val online" id="qs-online-count">0</span></div>
       <div class="stat-divider">|</div>
@@ -1860,7 +1830,6 @@
                 <th style="width: 30px;"><input type="checkbox" id="chk-all" onchange="toggleSelectAll(this)"></th>
                 <th style="width: 34px;">状态</th>
                 <th style="width: 72px;">端口</th>
-                <th style="width: 60px;">段</th>
                 <th style="width: 90px;">分组</th>
                 <th style="width: 70px;">协议</th>
                 <th style="width: 70px;">入口</th>
@@ -2726,7 +2695,7 @@
       let totalBytes = 0;
 
       nodeState.forEach(n => {
-        const grp = n.group || (n.segment === 51 ? '高质量' : '普通');
+        const grp = n.group || '默认分组';
         const bytes = (n.upTraffic || 0) + (n.downTraffic || 0);
         groupTrafficMap[grp] = (groupTrafficMap[grp] || 0) + bytes;
         groupNodeCountMap[grp] = (groupNodeCountMap[grp] || 0) + 1;
@@ -2745,7 +2714,7 @@
         const pct = totalBytes > 0 ? ((bytes / totalBytes) * 100) : (100 / groupKeys.length);
         const color = colors[idx % colors.length];
 
-        barHtml += `<div class="group-bar-segment" style="width: ${pct.toFixed(1)}%; background: ${color};" title="${escapeHtml(grp)}: ${pct.toFixed(1)}%"></div>`;
+        barHtml += `<div class="group-bar-part" style="width: ${pct.toFixed(1)}%; background: ${color};" title="${escapeHtml(grp)}: ${pct.toFixed(1)}%"></div>`;
         
         legendHtml += `
           <div class="group-legend-item">
@@ -2871,7 +2840,6 @@
         protocol: n.protocol || 'shadowsocks',
         group: n.group || '默认分组',
         port: n.port || null,
-        segment: n.segment || null,
         authUser: n.authUser || null,
         authPass: n.authPass || null,
         entryProto: n.entryProto || 'mixed',
@@ -2984,10 +2952,9 @@
           name: '香港 BGP 原生家宽 [高质量VIP]',
           protocol: 'shadowsocks',
           group: '香港专线',
-          port: 51001,
-          segment: 51,
-          authUser: 'user51001',
-          authPass: 'pass51001',
+          port: 53001,
+          authUser: 'user53001',
+          authPass: 'pass53001',
           status: 'online',
           ping: 32,
           exitIp: '103.21.244.18',
@@ -3000,10 +2967,9 @@
           name: '日本 东京 住宅 ISP [高速双 ISP]',
           protocol: 'vmess',
           group: '日本节点',
-          port: 51002,
-          segment: 51,
-          authUser: 'user51002',
-          authPass: 'pass51002',
+          port: 53002,
+          authUser: 'user53002',
+          authPass: 'pass53002',
           status: 'online',
           ping: 68,
           exitIp: '133.242.180.5',
@@ -3016,10 +2982,9 @@
           name: '美国 洛杉矶 普通 Cloud 01',
           protocol: 'vless',
           group: '默认分组',
-          port: 52001,
-          segment: 52,
-          authUser: 'user52001',
-          authPass: 'pass52001',
+          port: 53003,
+          authUser: 'user53003',
+          authPass: 'pass53003',
           status: 'online',
           ping: 165,
           exitIp: '104.28.19.88',
@@ -3032,10 +2997,9 @@
           name: '新加坡 Trojan 直连 02',
           protocol: 'trojan',
           group: '默认分组',
-          port: 52002,
-          segment: 52,
-          authUser: 'user52002',
-          authPass: 'pass52002',
+          port: 53004,
+          authUser: 'user53004',
+          authPass: 'pass53004',
           status: 'offline',
           ping: 0,
           exitIp: 'N/A',
@@ -3049,7 +3013,7 @@
       if (window.__backendMode) {
         const payload = nodeState.map(d => ({
           name: d.name, protocol: d.protocol, group: d.group, port: d.port,
-          segment: d.segment, authUser: d.authUser, authPass: d.authPass,
+          authUser: d.authUser, authPass: d.authPass,
           entryProto: d.entryProto || 'mixed', rawConfig: d.rawConfig || {},
         }));
         api('/api/nodes/batch', {
@@ -3139,9 +3103,6 @@
         try {
           const parsedNode = parseProxyUri(line);
           if (parsedNode) {
-            // 自动判断 51/52 质量段（仅凭「家宽」字样不算，见 isHighQualityNode）
-            const isHighQuality = isHighQualityNode(parsedNode.name);
-            parsedNode.segment = isHighQuality ? 51 : 52;
             parsedNode.group = targetGroup;
 
             // 端口分配规则（批内自增，避免多个节点拿到同一端口）
@@ -3150,8 +3111,7 @@
               targetPort = getNextAvailablePort(startPort, batchUsedPorts);
               startPort = targetPort + 1; // 供下一个节点使用
             } else {
-              const defaultBase = isHighQuality ? 51001 : 52001;
-              targetPort = getNextAvailablePort(defaultBase, batchUsedPorts);
+              targetPort = getNextAvailablePort(52001, batchUsedPorts);
             }
             batchUsedPorts.add(targetPort);
 
@@ -3266,8 +3226,7 @@
           name: pn.name || '未命名',
           protocol: pn.protocol,
           group: sub.group || '订阅节点',
-          port: null, // 端口由后端按段自动分配
-          segment: isHighQualityNode(pn.name || '') ? 51 : 52,
+          port: null, // 端口由后端自动分配
           authUser: authUser || randStr(8),
           authPass: authPass || randStr(12),
           entryProto: 'mixed',
@@ -3308,15 +3267,13 @@
           dup++;
           return;
         }
-        const isHighQuality = isHighQualityNode(pn.name || '');
-        const targetPort = getNextAvailablePort(isHighQuality ? 51001 : 52001);
+        const targetPort = getNextAvailablePort(52001);
         nodeState.push({
           id: 'node-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
           name: pn.name || '未命名',
           protocol: pn.protocol,
           group: sub.group || '订阅节点',
           port: targetPort,
-          segment: isHighQuality ? 51 : 52,
           authUser: authUser || randStr(8),
           authPass: authPass || randStr(12),
           status: 'online',
@@ -3744,10 +3701,6 @@
 
     // 判断是否高质量节点（51 段）。仅凭节点名「家宽」字样不算——那是机场营销命名，
     // 不代表真实住宅/ISP IP；只有明确标识（住宅/ISP/原生/residential/高速）才归 51 段。
-    function isHighQualityNode(name) {
-      return /(住宅|ISP|原生|residential|高速)/i.test(name || '');
-    }
-
     function checkPortConflict(portValue, currentId) {
       const portNum = parseInt(portValue);
       if (isNaN(portNum)) return true;
@@ -3797,20 +3750,13 @@
     }
 
     function reassignAllPorts() {
-      if (!confirm('确定按 51 (高质量 51001+) 和 52 (普通 52001+) 重新一键分配所有端口？')) return;
+      if (!confirm('确定重新一键分配所有端口？将从 52001 起自动分配不冲突端口。')) return;
 
-      let port51 = 51001;
-      let port52 = 52001;
+      let portCursor = 52001;
 
       nodeState.forEach(node => {
-        let target;
-        if (node.segment === 51) {
-          target = getNextAvailablePort(port51);
-          port51 = target + 1;
-        } else {
-          target = getNextAvailablePort(port52);
-          port52 = target + 1;
-        }
+        const target = getNextAvailablePort(portCursor);
+        portCursor = target + 1;
         node.port = target;
         node.authUser = 'u' + target;
         node.authPass = 'p' + target;
@@ -3933,9 +3879,8 @@
 
     function renderQuickStats() {
       const total = nodeState.length;
-      const c51 = nodeState.filter(n => n.segment === 51).length;
-      const c52 = nodeState.filter(n => n.segment === 52).length;
       const cPool = nodeState.filter(n => (n.group || '') === '代理池').length;
+      const cNormal = nodeState.filter(n => (n.group || '') !== '代理池').length;
       const online = nodeState.filter(n => n.status === 'online').length;
 
       const pings = nodeState.filter(n => n.ping > 0).map(n => n.ping);
@@ -3945,9 +3890,8 @@
 
       document.getElementById('qs-inbound-ports').innerText = total;
       document.getElementById('qs-total-nodes').innerText = total;
-      document.getElementById('qs-51-count').innerText = c51;
-      document.getElementById('qs-52-count').innerText = c52;
       document.getElementById('qs-pool-count').innerText = cPool;
+      document.getElementById('qs-normal-count').innerText = cNormal;
       document.getElementById('qs-online-count').innerText = online;
       document.getElementById('qs-avg-ping').innerText = avgPing > 0 ? avgPing + ' ms' : '-- ms';
       document.getElementById('qs-total-traffic').innerText = formatBytes(totalBytes);
@@ -3999,7 +3943,7 @@
       });
 
       if (filtered.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="13" style="text-align:center; padding:30px; color:var(--ink-gray);">暂无符合条件的节点，请从“批量导入”中添加。</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="12" style="text-align:center; padding:30px; color:var(--ink-gray);">暂无符合条件的节点，请从“批量导入”中添加。</td></tr>`;
         return;
       }
 
@@ -4015,9 +3959,6 @@
             </td>
             <td>
               <input type="number" class="${portClass}" value="${n.port}" onchange="updateNodePort('${n.id}', this.value)" title="${isConflict ? '警告：端口冲突！' : '编辑端口'}">
-            </td>
-            <td>
-              <span class="badge-segment ${n.segment === 51 ? 'badge-51' : 'badge-52'}">${n.segment}</span>
             </td>
             <td>${escapeHtml(n.group || '默认分组')}</td>
             <td><span class="proto-tag">${n.protocol.toUpperCase()}</span></td>

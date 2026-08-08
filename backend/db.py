@@ -202,14 +202,11 @@ def _used_ports(c) -> set:
 
 
 def _next_available_port_locked(c, preferred_port: Optional[int], segment: Optional[int] = None) -> int:
-    """不加锁的端口分配内核（调用方需已持有 _lock）。"""
+    """不加锁的端口分配内核（调用方需已持有 _lock）。默认从 52001 起分配。"""
     used = _used_ports(c)
     if preferred_port and preferred_port not in used:
         return preferred_port
-    if segment == 51 or (preferred_port and str(preferred_port).startswith("51")):
-        base = 51001
-    else:
-        base = 52001
+    base = 52001
     p = base
     while p in used:
         p += 1
@@ -217,20 +214,10 @@ def _next_available_port_locked(c, preferred_port: Optional[int], segment: Optio
 
 
 def get_next_available_port(preferred_port: Optional[int], segment: Optional[int] = None) -> int:
-    """51 段高质量 / 52 段普通。preferred_port 决定段；冲突自动向上跳过。"""
+    """端口分配：preferred_port 生效则用之，否则从 52001 起；冲突自动向上跳过。"""
     with _lock:
         c = connect()
         return _next_available_port_locked(c, preferred_port, segment)
-
-
-def infer_segment(name: str, protocol: str, port: Optional[int] = None) -> int:
-    """质量自动判定：名称含关键词→51 段，否则 52。"""
-    if port and str(port).startswith("51"):
-        return 51
-    if port and str(port).startswith("52"):
-        return 52
-    kw = ("住宅", "ISP", "原生", "家宽", "residential", "高速")
-    return 51 if any(k in (name or "") for k in kw) else 52
 
 
 def random_auth(port: int) -> tuple:
@@ -365,9 +352,8 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
             port = nd.get("port")
             db_used = {r[0] for r in c.execute("SELECT port FROM nodes")} | {r[0] for r in c.execute("SELECT port FROM relay_domains")}
             if not port:
-                # 自动分配：从段基址起找既不在 DB 也不在批内已用端口的空闲端口
-                segment = nd.get("segment")
-                base = 51001 if (segment == 51 or nd.get("port") and str(nd.get("port")).startswith("51")) else 52001
+                # 自动分配：从 52001 起找既不在 DB 也不在批内已用端口的空闲端口
+                base = 52001
                 port = base
                 while port in db_used or port in batch_ports:
                     port += 1
@@ -466,8 +452,7 @@ def update_node_port(node_id: str, port: Optional[int]) -> Optional[Dict]:
             used.discard(cur["port"])
         target = port
         if not target or target in used:
-            seg = cur.get("segment") or infer_segment(cur["name"], cur["protocol"])
-            target = _next_available_port_locked(c, port if port else None, seg)
+            target = _next_available_port_locked(c, port if port else None)
         c.execute("UPDATE nodes SET port=?, updated_at=? WHERE id=?", (target, _conn_now(), node_id))
         c.commit()
     return get_node(node_id)

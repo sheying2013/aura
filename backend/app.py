@@ -128,10 +128,9 @@ def list_nodes(q: Optional[str] = None, group: Optional[str] = None, subId: Opti
 
 @app.post("/api/nodes", response_model=models.Node, status_code=201, dependencies=[Depends(require_auth)])
 def create_node(body: models.NodeCreate):
-    segment = body.segment or db.infer_segment(body.name, body.protocol, body.port)
     port = body.port
     if not port:
-        port = db.get_next_available_port(None, segment)
+        port = db.get_next_available_port(None)
     # 冲突检查：nodes + relay_domains + reservedPorts 全查
     used_ports = set(n["port"] for n in db.list_nodes())
     used_ports |= set(rd["port"] for rd in db.list_relay_domains())
@@ -144,7 +143,7 @@ def create_node(body: models.NodeCreate):
         "protocol": body.protocol,
         "group": body.group or "默认分组",
         "port": port,
-        "segment": segment,
+        "segment": 52,
         "authUser": body.authUser,
         "authPass": body.authPass,
         "status": body.status or "offline",
@@ -166,15 +165,14 @@ def create_node(body: models.NodeCreate):
 def create_node_batch(body: models.NodeBatchRequest):
     prepared = []
     for n in body.nodes:
-        segment = n.segment or db.infer_segment(n.name, n.protocol, n.port)
         prepared.append({
             "id": db.new_node_id(),
             "name": n.name,
             "protocol": n.protocol,
             "group": n.group or "默认分组",
-            # port 交给 db.create_node_batch 批内自动分配（段内自增，避免批内冲突）
+            # port 交给 db.create_node_batch 批内自动分配（52001 起自增，避免批内冲突）
             "port": n.port,
-            "segment": segment,
+            "segment": 52,
             "authUser": n.authUser,
             "authPass": n.authPass,
             "status": n.status or "offline",

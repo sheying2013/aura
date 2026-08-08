@@ -484,13 +484,12 @@ def parse_content(content: str) -> List[Dict[str, Any]]:
 
 def import_nodes(sub_id: str, group: str, nodes: List[Dict[str, Any]], stale: bool = False) -> Dict[str, Any]:
     """把解析出的节点导入 DB（对齐前端：按 server:port 去重、分组继承、随机 auth、subId 关联）。"""
-    from db import infer_segment, get_next_available_port, random_auth, create_node_batch
+    from db import get_next_available_port, random_auth, create_node_batch
 
     prepared: List[Dict[str, Any]] = []
     for pn in nodes:
         rc = pn.get("rawConfig") or {}
-        seg = infer_segment(pn.get("name", ""), pn.get("protocol", ""))
-        port = get_next_available_port(None, seg)
+        port = get_next_available_port(None)
         user, passwd = random_auth(port)
         prepared.append({
             "id": db.new_node_id(),
@@ -498,7 +497,7 @@ def import_nodes(sub_id: str, group: str, nodes: List[Dict[str, Any]], stale: bo
             "protocol": pn.get("protocol", "shadowsocks"),
             "group": group,
             "port": port,
-            "segment": seg,
+            "segment": 52,
             "authUser": user,
             "authPass": passwd,
             "status": "offline",
