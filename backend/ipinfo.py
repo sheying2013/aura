@@ -171,3 +171,69 @@ def lookup(ip: str) -> Dict[str, Any]:
 def lookup_batch(ips) -> Dict[str, Dict[str, Any]]:
     """批量查 IP 情报（逐 IP，独立降级）。"""
     return {ip: lookup(ip) for ip in ips}
+
+
+# ---------- ping0.cc 增强（风控值/原生IP，经节点代理） ----------
+
+_PING0_TTL = 7 * 24 * 3600  # ping0 数据变化慢，7 天缓存
+_ping0_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _parse_ping0(body: str) -> Dict[str, Any]:
+    """从 ping0.cc HTML 提取：风控值 / IP 类型 / 原生IP / 适用场景。"""
+    import re
+    out: Dict[str, Any] = {}
+    m = re.search(r'riskcurrent.*?value">(\d+)%</span><span class="lab">\s*([^<]+)', body, re.S)
+    if m:
+        out["exitRisk"] = int(m.group(1))
+        out["exitRiskLabel"] = m.group(2).strip()
+    m2 = re.search(r'line-iptype.*?content">(.*?)</div>', body, re.S)
+    if m2:
+        t = re.sub(r'<[^>]+>', '|', m2.group(1))
+        t = re.sub(r'\|+', '|', t).strip('|').strip()
+        if t:
+            out["exitIpType"] = t[:40]
+    m3 = re.search(r'line-nativeip.*?content">(.*?)</div>', body, re.S)
+    if m3:
+        t3 = re.sub(r'<[^>]+>', '', m3.group(1)).strip()
+        if t3:
+            out["exitNativeIp"] = t3[:20]
+    return out
+
+
+def _fetch_ping0_via_proxy(ip: str, proxy_url: str, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
+    """经 HTTP 代理访问 ping0.cc。socks5 代理需 pysocks；这里用 http 代理（mixed inbound 同时提供 http）。"""
+    try:
+        import urllib.request
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        req = urllib.request.Request(f"https://ping0.cc/ip/{ip}",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        body = opener.open(req, timeout=timeout).read().decode("utf-8", errors="replace")
+        # 被 Cloudflare 风控挡时返回验证页（<5KB 且含 turnstile）
+        if len(body) < 5000 or "turnstile" in body.lower():
+            return None
+        return _parse_ping0(body)
+    except Exception:
+        return None
+
+
+def lookup_ping0(ip: str, nodes) -> Dict[str, Any]:
+    """经节点代理查 ping0.cc 风控情报，多节点重试。失败返回空 dict。"""
+    if not ip or not nodes:
+        return {}
+    ent = _ping0_cache.get(ip)
+    if ent and time.time() - ent["ts"] < _PING0_TTL:
+        return ent["data"]
+    for n in nodes:
+        port = n.get("port")
+        user = n.get("authUser") or "user"
+        passwd = n.get("authPass") or "pass"
+        proxy = f"http://{user}:{passwd}@127.0.0.1:{port}"
+        data = _fetch_ping0_via_proxy(ip, proxy)
+        if data:
+            _ping0_cache[ip] = {"ts": time.time(), "data": data}
+            if len(_ping0_cache) > 2000:
+                _ping0_cache.clear()
+            return data
+    return {}

@@ -123,6 +123,7 @@ def init_db() -> None:
             ("exit_city", "TEXT"),
             ("exit_type", "TEXT"),
             ("exit_score", "INTEGER"),
+            ("exit_risk", "INTEGER"),
         ):
             if col not in cols:
                 c.execute(f"ALTER TABLE nodes ADD COLUMN {col} {ddl}")
@@ -158,6 +159,7 @@ def _row_to_node(row: sqlite3.Row) -> Dict[str, Any]:
         "exitCity": row["exit_city"] if "exit_city" in row.keys() else None,
         "exitType": row["exit_type"] if "exit_type" in row.keys() else None,
         "exitScore": row["exit_score"] if "exit_score" in row.keys() else None,
+        "exitRisk": row["exit_risk"] if "exit_risk" in row.keys() else None,
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -410,7 +412,7 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
             """UPDATE nodes SET name=?,protocol=?,"group"=?,port=?,segment=?,auth_user=?,
                auth_pass=?,status=?,ping=?,exit_ip=?,up_traffic=?,down_traffic=?,raw_config=?,
                sub_id=?,stale=?,selected=?,entry_proto=?,ss_pass=?,consecutive_fails=?,
-               exit_country=?,exit_flag=?,exit_city=?,exit_type=?,exit_score=?,updated_at=?
+               exit_country=?,exit_flag=?,exit_city=?,exit_type=?,exit_score=?,exit_risk=?,updated_at=?
                WHERE id=?""",
             (
                 merged["name"], merged["protocol"], merged["group"], merged["port"],
@@ -423,7 +425,7 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
                 merged.get("entryProto", "mixed"), merged.get("ssPass"),
                 merged.get("consecutiveFails", 0),
                 merged.get("exitCountry"), merged.get("exitFlag"), merged.get("exitCity"),
-                merged.get("exitType"), merged.get("exitScore"),
+                merged.get("exitType"), merged.get("exitScore"), merged.get("exitRisk"),
                 _conn_now(), node_id,
             ),
         )

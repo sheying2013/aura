@@ -20,13 +20,13 @@ _ip_enrich_pending: set = set()  # 防同一节点并发重复查
 
 
 def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
-    """探活成功后惰性补查出口 IP 归属地/评分，已有关键情报则跳过。"""
+    """探活成功后惰性补查出口 IP 情报（归属地/评分 + ping0 风控值），已有关键情报则跳过。"""
     ip = node.get("exitIp")
     nid = node["id"]
     if not ip or ip in ("N/A", "1.1.1.1"):
         return
-    if node.get("exitCountry") and node.get("exitType"):
-        return  # 已有情报
+    if node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
+        return  # 情报已齐全
     if nid in _ip_enrich_pending:
         return
     _ip_enrich_pending.add(nid)
@@ -39,6 +39,17 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
             patch = {k: info[k] for k in
                      ("exitCountry", "exitFlag", "exitCity", "exitType", "exitScore")
                      if k in info}
+            # 缺 ping0 风控值时经在线节点代理补查（失败降级保留基础情报）
+            if patch and (node.get("exitRisk") is None or patch.get("exitCountry")):
+                try:
+                    async with _ip_enrich_sem:
+                        online = [n for n in db.list_nodes()
+                                  if n.get("status") == "online" and n.get("port") != node.get("port")]
+                        p0 = await asyncio.to_thread(ipinfo.lookup_ping0, ip, online[:10])
+                    if p0:
+                        patch["exitRisk"] = p0.get("exitRisk")
+                except Exception:
+                    pass
             if patch:
                 db.update_node(nid, patch)
         except Exception:

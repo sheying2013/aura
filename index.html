@@ -1324,6 +1324,16 @@
     .exit-score.high { background: rgba(76, 217, 149, 0.15); color: var(--jade-green-glow); }
     .exit-score.mid { background: rgba(212, 163, 55, 0.12); color: var(--ochre-gold); }
     .exit-score.low { background: rgba(230, 126, 34, 0.12); color: #e67e22; }
+    .exit-risk {
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-family: var(--font-code);
+      font-weight: 600;
+    }
+    .exit-risk.low { background: rgba(76, 217, 149, 0.15); color: var(--jade-green-glow); }
+    .exit-risk.mid { background: rgba(212, 163, 55, 0.12); color: var(--ochre-gold); }
+    .exit-risk.high { background: rgba(230, 126, 34, 0.12); color: #e67e22; }
 
     /* ==========================================
        7. 域名解析轮询入口卡片
@@ -2996,7 +3006,7 @@
           ping: 32,
           exitIp: '103.21.244.18',
           exitFlag: '🇭🇰', exitCountry: '中国香港', exitCity: 'Hong Kong',
-          exitType: 'residential', exitScore: 92,
+          exitType: 'residential', exitScore: 92, exitRisk: 18,
           upTraffic: 1024 * 1024 * 42,
           downTraffic: 1024 * 1024 * 380,
           rawConfig: { type: 'ss', server: 'hk.node.com', server_port: 8388, method: 'aes-128-gcm', password: 'secretpassword' }
@@ -3013,7 +3023,7 @@
           ping: 68,
           exitIp: '133.242.180.5',
           exitFlag: '🇯🇵', exitCountry: '日本', exitCity: 'Tokyo',
-          exitType: 'hosting', exitScore: 42,
+          exitType: 'hosting', exitScore: 42, exitRisk: 65,
           upTraffic: 1024 * 1024 * 12,
           downTraffic: 1024 * 1024 * 150,
           rawConfig: { type: 'vmess', server: 'jp.node.com', server_port: 443, uuid: 'a1b2c3d4-e5f6-7890-1234-56789abcdef0' }
@@ -4037,6 +4047,10 @@
       if (score == null || score === '') return '';
       return score >= 80 ? 'high' : (score >= 50 ? 'mid' : 'low');
     }
+    function exitRiskClass(risk) {
+      if (risk == null || risk === '') return '';
+      return risk <= 50 ? 'low' : (risk <= 70 ? 'mid' : 'high');
+    }
     function renderExitIp(n) {
       const esc = v => escapeHtml(v);
       const flag = esc(n.exitFlag || '');
@@ -4046,12 +4060,16 @@
       const hasScore = score > 0;
       const scoreBadge = hasScore ? `<span class="exit-score ${exitScoreClass(score)}">${esc(score)}</span>` : '';
       const typeBadge = typeLabel ? `<span class="exit-badge ${esc(n.exitType || 'unknown')}">${esc(typeLabel)}</span>` : '';
+      // ping0 风控值（越低越纯净，≤50 安全，>70 可拉黑）
+      const risk = n.exitRisk;
+      const hasRisk = risk != null && risk !== '';
+      const riskBadge = hasRisk ? `<span class="exit-risk ${exitRiskClass(risk)}" title="风控值: ${esc(risk)}/100（越低越安全）">风控${esc(risk)}</span>` : '';
       const city = esc(n.exitCity || '');
       const country = esc(n.exitCountry || '');
-      const tooltip = [esc(n.exitIp), country ? `归属地: ${country}${city ? ' ' + city : ''}` : '', typeLabel ? `类型: ${typeLabel}` : '', hasScore ? `纯净度: ${esc(score)}/100` : ''].filter(Boolean).join('\n');
+      const tooltip = [esc(n.exitIp), country ? `归属地: ${country}${city ? ' ' + city : ''}` : '', typeLabel ? `类型: ${typeLabel}` : '', hasScore ? `纯净度: ${esc(score)}/100` : '', hasRisk ? `风控值: ${esc(risk)}/100（越低越安全）` : ''].filter(Boolean).join('\n');
       const ip = esc(n.exitIp) || 'N/A';
       const ipTxt = ip === 'N/A' ? 'N/A' : `<span class="ipaddr" title="${tooltip}">${ip}</span>`;
-      const badges = [flag ? `<span class="flag">${flag}</span>` : '', ipTxt, typeBadge, scoreBadge].filter(Boolean).join('');
+      const badges = [flag ? `<span class="flag">${flag}</span>` : '', ipTxt, typeBadge, scoreBadge, riskBadge].filter(Boolean).join('');
       return badges ? `<span class="exit-ip-cell">${badges}</span>` : 'N/A';
     }
 
