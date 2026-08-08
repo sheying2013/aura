@@ -1816,7 +1816,8 @@
             <button class="btn btn-gold btn-sm" onclick="openConvertEntryDialog()">↔ 转换入口协议</button>
             <button class="btn btn-outline btn-sm" onclick="reassignAllPorts()">重新编排端口</button>
             <button class="btn btn-secondary btn-sm" onclick="exportSelectedNodes()">导出选中节点</button>
-            <button class="btn btn-secondary btn-sm" onclick="enableSelectedNodes()">全选启用</button>
+            <button class="btn btn-secondary btn-sm" onclick="enableSelectedNodes()">启用选中</button>
+            <button class="btn btn-secondary btn-sm" onclick="enableAllDisabledNodes()">全部启用</button>
             <button class="btn btn-secondary btn-sm" onclick="disableSelectedNodes()">全选停用</button>
             <button class="btn btn-danger btn-sm" onclick="deleteSelectedNodes()">批量删除</button>
           </div>
@@ -4163,6 +4164,35 @@
       } else {
         saveNodesToStorage();
         doEnable();
+      }
+    }
+
+    // 启用所有停用节点（一键全部启用）
+    function enableAllDisabledNodes() {
+      const disabledNodes = nodeState.filter(n => n.status === 'disabled');
+      if (disabledNodes.length === 0) {
+        alert('当前没有停用节点');
+        return;
+      }
+      if (!confirm(`确认全部启用 ${disabledNodes.length} 个停用节点？启用后恢复参与探活和代理池轮询。`)) return;
+      const doEnableAll = () => {
+        nodeState.forEach(n => { if (n.status === 'disabled') n.status = 'enabled'; });
+        addLog('INFO', `全部启用了 ${disabledNodes.length} 个停用节点`);
+        try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+        renderAll();
+      };
+      if (window.__backendMode) {
+        const reqs = disabledNodes.map(n =>
+          api('/api/nodes/' + encodeURIComponent(n.id), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'enabled' }),
+          })
+        );
+        Promise.allSettled(reqs).then(doEnableAll);
+      } else {
+        saveNodesToStorage();
+        doEnableAll();
       }
     }
 
