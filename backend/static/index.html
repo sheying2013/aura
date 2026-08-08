@@ -3100,6 +3100,43 @@
     function importSubscriptionNodes(sub, parsedNodes, opts) {
       const stale = opts && opts.stale;
       const randStr = (len) => { const c='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'; let r=''; for(let i=0;i<len;i++) r+=c[Math.floor(Math.random()*c.length)]; return r; };
+      // 后端模式：走 /api/nodes/batch 真实落库（含去重计数），不写内存/localStorage
+      if (window.__backendMode) {
+        const payload = parsedNodes.map(pn => ({
+          name: pn.name || '未命名',
+          protocol: pn.protocol,
+          group: sub.group || '订阅节点',
+          port: null, // 端口由后端按段自动分配
+          segment: /(住宅|ISP|原生|家宽|residential|高速)/i.test(pn.name || '') ? 51 : 52,
+          authUser: randStr(8),
+          authPass: randStr(12),
+          entryProto: 'mixed',
+          ssPass: null,
+          subId: sub.id,
+          stale: !!stale,
+          rawConfig: pn.rawConfig || {},
+        }));
+        api('/api/nodes/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nodes: payload }),
+        }).then(resp => {
+          if (!resp.ok) throw new Error('batch 失败 ' + resp.status);
+          return resp.json();
+        }).then(data => {
+          addLog(stale ? 'WARN' : 'INFO', `订阅 [${sub.name}] 导入后端：成功 ${data.created}，去重跳过 ${data.skipped}`);
+          return api('/api/nodes').then(r => r.json());
+        }).then(data => {
+          if (data && data.items) {
+            nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
+            renderAll();
+          }
+        }).catch(err => {
+          addLog('ERROR', `订阅 [${sub.name}] 导入后端失败: ${err.message}`);
+        });
+        return;
+      }
+      // 本地模式（后端不可达）：原逻辑，节点进内存 + localStorage
       let added = 0, dup = 0;
       parsedNodes.forEach(pn => {
         const server = pn.rawConfig && (pn.rawConfig.server || pn.rawConfig.address);
