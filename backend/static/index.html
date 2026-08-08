@@ -3854,8 +3854,14 @@
       const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
       const text = `# 节点: ${node.name} | 协议: ${node.protocol.toUpperCase()}\n${exportLinkLines(node, vpsIp, protoSel).join('\n')}`;
 
+      // 同时写入导出框（保证复制失败时也能拿到）+ 尝试复制
+      const area = document.getElementById('export-text-area');
+      if (area) {
+        area.value = text;
+        switchTab('export');
+      }
       copyToClipboard(text);
-      alert(`已复制节点 [${node.name}] 的 Socks5/HTTP 中转代理链接到剪贴板！`);
+      alert(`已生成节点 [${node.name}] 的中转链接（复制到剪贴板或见导出框）`);
     }
 
     /* ==========================================
@@ -4245,11 +4251,39 @@
     }
 
     function copyToClipboard(text) {
-      navigator.clipboard.writeText(text).then(() => {
-        addLog('INFO', '成功复制内容到剪贴板！');
-      }).catch(err => {
-        addLog('ERROR', '复制失败: ' + err.message);
-      });
+      // 优先 Clipboard API（仅 https/localhost 可用）
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          addLog('INFO', '成功复制内容到剪贴板！');
+        }).catch(err => {
+          addLog('ERROR', 'Clipboard API 复制失败: ' + err.message + '，尝试降级方案');
+          legacyCopy(text);
+        });
+        return;
+      }
+      // http 非安全上下文降级：textarea + execCommand('copy')
+      legacyCopy(text);
+    }
+
+    function legacyCopy(text) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) {
+          addLog('INFO', '成功复制内容到剪贴板（降级方案）！');
+        } else {
+          addLog('ERROR', '复制失败，请手动复制导出框内容');
+        }
+      } catch (e) {
+        addLog('ERROR', '复制失败: ' + e.message);
+      }
     }
   </script>
 </body>
