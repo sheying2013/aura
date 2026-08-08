@@ -1,27 +1,39 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Aura · SingBox 中转节点管理面板 一键安装脚本
-#  Linux (systemd 守护) / macOS (前台启动)
+#  Linux (systemd 守护 + 开机自启) / macOS (前台启动)
 #
 #  用法：
 #    1) 已克隆仓库（推荐）：
 #         git clone https://github.com/sheying2013/aura.git aura && cd aura && bash install.sh
-#    2) 全自动（仓库公开后）：
+#    2) 远程执行：
 #         curl -fsSL https://raw.githubusercontent.com/sheying2013/aura/main/install.sh | bash
 #         （脚本会从 AURA_REPO_URL 克隆代码）
 #
-#  可调环境变量：
-#    AURA_REPO_URL   仓库地址（默认 GitHub sheying2013/aura）
+#  安装过程交互式引导设置：面板端口 / 网页登录路径 / 登录账号 / 登录密码
+#  安装完成后：
+#    - 注册 systemd 服务（Linux root）并开机自启
+#    - 安装 `aura` 命令，终端输入 aura 调出交互式配置界面
+#
+#  可调环境变量（跳过交互，全部默认）：
+#    AURA_REPO_URL   仓库地址（默认 https://github.com/sheying2013/aura.git）
 #    AURA_DIR        安装目录（默认 $HOME/aura）
 #    AURA_PORT       面板端口（默认 19001）
-#    SINGBOX_VERSION sing-box 内核版本（默认 1.7.7）
+#    AURA_PATH       网页登录路径（默认 /admin）
+#    AURA_USERNAME   登录账号（默认 admin）
+#    AURA_PASSWORD   登录密码（默认随机生成）
+#    AURA_SKIP_INPUT 1=完全非交互，全部用默认/环境变量
 # ============================================================
 set -euo pipefail
 
 # ---------- 配置 ----------
 REPO_URL="${AURA_REPO_URL:-https://github.com/sheying2013/aura.git}"
 INSTALL_DIR="${AURA_DIR:-$HOME/aura}"
-PORT="${AURA_PORT:-19001}"
+PORT="${AURA_PORT:-}"
+PATH_PREFIX="${AURA_PATH:-}"
+USERNAME="${AURA_USERNAME:-}"
+PASSWORD="${AURA_PASSWORD:-}"
+SKIP_INPUT="${AURA_SKIP_INPUT:-0}"
 SINGBOX_VERSION="${SINGBOX_VERSION:-1.7.7}"
 
 # ---------- 输出工具 ----------
@@ -30,6 +42,21 @@ info()  { color "36" "[*] $1\n"; }
 ok()    { color "32" "[✔] $1\n"; }
 warn()  { color "33" "[!] $1\n"; }
 fail()  { color "31" "[✘] $1\n"; exit 1; }
+
+prompt_input() {
+  local p="$1" default="$2"
+  local val=""
+  printf "%s" "$p"
+  if [ -n "$default" ]; then
+    printf " [%s]" "$default"
+  fi
+  printf ": "
+  read -r val
+  if [ -z "$val" ]; then
+    val="$default"
+  fi
+  printf "%s" "$val"
+}
 
 # ---------- 系统检测 ----------
 detect_os() {
@@ -50,10 +77,9 @@ detect_arch() {
 
 OS=$(detect_os)
 ARCH=$(detect_arch)
-info "系统: $OS / 架构: $ARCH / 端口: $PORT"
+info "系统: $OS / 架构: $ARCH"
 
 # ---------- 就位源码 ----------
-# 判断是否在仓库目录内运行（存在 backend/app.py）
 if [ -f "backend/app.py" ]; then
   SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
   info "检测到源码目录: $SRC_DIR"
@@ -72,7 +98,7 @@ fi
 install_singbox() {
   if command -v sing-box >/dev/null 2>&1; then
     ver=$(sing-box version 2>/dev/null | head -n1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" || echo "?")
-    info "检测到 sing-box $ver，跳过安装（可用 SINGBOX_BIN 指定路径）"
+    info "检测到 sing-box $ver，跳过安装"
     export SINGBOX_BIN="$(command -v sing-box)"
     return
   fi
@@ -84,11 +110,11 @@ install_singbox() {
     export SINGBOX_BIN="$SB_BIN"
     return
   fi
-  info "下载 sing-box v$SINGBOX_VERSION ($OS-$ARCH)..."
-  TARBALL="sing-box-${SINGBOX_VERSION}-${OS}-${ARCH}.tar.gz"
-  curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${TARBALL}" -o /tmp/singbox.tar.gz
+  info "下载 sing-box v${SINGBOX_VERSION:-1.7.7} ($OS-$ARCH)..."
+  TARBALL="sing-box-${SINGBOX_VERSION:-1.7.7}-${OS}-${ARCH}.tar.gz"
+  curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION:-1.7.7}/${TARBALL}" -o /tmp/singbox.tar.gz
   tar -xzf /tmp/singbox.tar.gz -C /tmp
-  cp "/tmp/sing-box-${SINGBOX_VERSION}-${OS}-${ARCH}/sing-box" "$SB_BIN"
+  cp "/tmp/sing-box-${SINGBOX_VERSION:-1.7.7}-${OS}-${ARCH}/sing-box" "$SB_BIN"
   chmod +x "$SB_BIN"
   rm -rf /tmp/singbox.tar.gz /tmp/sing-box-*
   export SINGBOX_BIN="$SB_BIN"
@@ -119,7 +145,80 @@ setup_python() {
 
 setup_python
 
-# ---------- 同步前端到 static ----------
+# ---------- 交互引导配置 ----------
+configure_panel() {
+  echo
+  info "面板配置引导（直接回车使用默认值，随时 Ctrl+C 取消）"
+  echo
+
+  if [ -z "$PORT" ] && [ "$SKIP_INPUT" != "1" ]; then
+    PORT=$(prompt_input "面板端口" "19001")
+  fi
+  PORT="${PORT:-19001}"
+  case "$PORT" in
+    ''|*[!0-9]*) fail "端口不合法: $PORT" ;;
+    *) ;;
+  esac
+
+  if [ -z "$PATH_PREFIX" ] && [ "$SKIP_INPUT" != "1" ]; then
+    PATH_PREFIX=$(prompt_input "网页登录路径" "/admin")
+  fi
+  PATH_PREFIX="${PATH_PREFIX:-/admin}"
+  case "$PATH_PREFIX" in
+    /*) ;;
+    *) fail "路径必须以 / 开头: $PATH_PREFIX" ;;
+  esac
+
+  if [ -z "$USERNAME" ] && [ "$SKIP_INPUT" != "1" ]; then
+    USERNAME=$(prompt_input "登录账号" "admin")
+  fi
+  USERNAME="${USERNAME:-admin}"
+  case "$USERNAME" in
+    *[[:space:]]*|*/*) fail "账号不能含空格或斜杠: $USERNAME" ;;
+    *) ;;
+  esac
+
+  if [ -z "$PASSWORD" ]; then
+    if [ "$SKIP_INPUT" != "1" ]; then
+      PASSWORD=$(prompt_input "登录密码（至少6位，留空自动生成）" "")
+    fi
+    if [ -z "$PASSWORD" ]; then
+      PASSWORD="$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | head -c 12)"
+      warn "已生成随机密码: $PASSWORD （请记下！登录后可在面板或 aura 命令修改）"
+    fi
+  fi
+
+  # 写入 panel.conf + 数据库密码（用 base64 传参避免特殊字符破坏 shell）
+  local pass_b64
+  pass_b64="$(printf '%s' "$PASSWORD" | base64 | tr -d '\n')"
+  info "写入面板配置..."
+  ( cd "$SRC_DIR/backend" && \
+    PORT="$PORT" PANEL_PATH="$PATH_PREFIX" PANEL_USER="$USERNAME" PASS_B64="$pass_b64" \
+    "$PY" -c "
+import os, base64, time
+import panel_config, db
+from auth import hash_password
+panel_config.set_many({
+    'port': int(os.environ['PORT']),
+    'panel_path': os.environ['PANEL_PATH'],
+    'username': os.environ['PANEL_USER'],
+})
+passwd = base64.b64decode(os.environ['PASS_B64']).decode()
+db.init_db()
+db.set_setting('auth', {
+    'password_hash': hash_password(passwd),
+    'password_change_required': False,
+    'changed_at': int(time.time() * 1000),
+})
+print('config written')
+" >/dev/null )
+  ok "配置已保存"
+}
+
+# 无 db.init_db 的 python 直接写 panel.conf（轻量场景由 aura_cli 兜底）
+configure_panel
+
+# ---------- 同步前端 ----------
 sync_frontend() {
   mkdir -p "$SRC_DIR/backend/static"
   [ -f "$SRC_DIR/index.html" ] && cp -f "$SRC_DIR/index.html" "$SRC_DIR/backend/static/index.html"
@@ -129,12 +228,28 @@ sync_frontend() {
 
 sync_frontend
 
+# ---------- 安装 aura 命令 ----------
+link_aura_cmd() {
+  local BINDIR
+  if [ "$(id -u)" -eq 0 ]; then
+    BINDIR="/usr/local/bin"
+  else
+    BINDIR="$HOME/.local/bin"
+    mkdir -p "$BINDIR"
+  fi
+  chmod +x "$SRC_DIR/backend/aura_cli.py"
+  ln -sf "$SRC_DIR/backend/aura_cli.py" "$BINDIR/aura"
+  ok "aura 命令已安装: $BINDIR/aura（终端输入 aura 进入配置界面）"
+}
+
+link_aura_cmd
+
 # ---------- 启动 ----------
 start_linux() {
   if [ "$(id -u)" -ne 0 ]; then
     warn "非 root 用户，跳过 systemd 服务安装，改为前台启动"
     cd "$SRC_DIR/backend"
-    exec uvicorn app:app --host 0.0.0.0 --port "$PORT"
+    exec bash start.sh
   fi
   cat > /etc/systemd/system/aura.service <<EOF
 [Unit]
@@ -145,7 +260,7 @@ After=network.target
 Type=simple
 WorkingDirectory=$SRC_DIR/backend
 Environment=SINGBOX_BIN=${SINGBOX_BIN:-sing-box}
-ExecStart=$(command -v uvicorn || echo "$SRC_DIR/backend/.venv/bin/uvicorn") app:app --host 0.0.0.0 --port $PORT
+ExecStart=$SRC_DIR/backend/start.sh
 Restart=always
 RestartSec=5
 
@@ -155,15 +270,14 @@ EOF
   systemctl daemon-reload
   systemctl enable aura.service >/dev/null 2>&1
   systemctl start aura.service
-  ok "systemd 服务已启动（aura.service）"
+  ok "systemd 服务已启动并设置开机自启（aura.service）"
 }
 
 start_mac() {
-  warn "macOS 暂不注册后台服务，请保持本窗口运行："
-  warn "  cd $SRC_DIR/backend && SINGBOX_BIN=${SINGBOX_BIN:-sing-box} uvicorn app:app --host 0.0.0.0 --port $PORT"
+  warn "macOS 不注册后台服务，请保持本窗口运行，或自行配置 launchd："
+  warn "  $SRC_DIR/backend/start.sh"
   cd "$SRC_DIR/backend"
-  export SINGBOX_BIN="${SINGBOX_BIN:-sing-box}"
-  exec uvicorn app:app --host 0.0.0.0 --port "$PORT"
+  exec bash start.sh
 }
 
 echo
@@ -171,8 +285,9 @@ ok "安装完成！"
 echo
 echo "  ┌────────────────────────────────────────────┐"
 echo "  │  Aura · SingBox 中转节点管理面板            │"
-echo "  │  访问地址:  http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo <服务器IP>):$PORT/admin"
-echo "  │  默认账号:  admin（首次登录请修改密码）     │"
+echo "  │  访问地址: http://<服务器IP>:$PORT$PATH_PREFIX"
+echo "  │  登录账号: $USERNAME"
+echo "  │  配置工具: 终端输入 aura                     │"
 echo "  └────────────────────────────────────────────┘"
 echo
 

@@ -13,6 +13,7 @@ import secrets
 import time
 
 import db
+import panel_config
 
 TOKEN_TTL = 7 * 24 * 60 * 60  # 7 天
 FAIL_LOCKOUT_SECONDS = 5  # 失败后延迟
@@ -21,6 +22,11 @@ FAIL_LOCKOUT_SECONDS = 5  # 失败后延迟
 _tokens: dict = {}
 # 失败计数: ip -> [timestamps]
 _failures: dict = {}
+
+
+def get_username() -> str:
+    """当前面板登录用户名（默认 admin，可由 aura CLI / panel.conf 修改）。"""
+    return panel_config.get("username") or "admin"
 
 
 def hash_password(password: str, salt: str = "") -> str:
@@ -80,8 +86,8 @@ async def login(username: str, password: str, client_ip: str = "") -> dict:
         return {"ok": False, "error": "尝试过于频繁，请稍后再试"}
 
     auth = _get_auth()
-    # 用户名固定为 admin（单用户面板）
-    if username != "admin":
+    # 用户名可从面板配置修改（默认 admin，单用户面板）
+    if username != get_username():
         _record_failure(key)
         await asyncio.sleep(FAIL_LOCKOUT_SECONDS)
         return {"ok": False, "error": "用户名或密码错误"}

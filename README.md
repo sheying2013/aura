@@ -32,7 +32,16 @@ Aura 是一个基于 **sing-box 内核** 的节点中转管理面板。它把外
 
 安装后访问：`http://<服务器IP>:19001/admin`
 
-默认账号 `admin`，**首次登录强制修改密码**。
+### 默认值
+
+| 项目 | 默认值 | 修改方式 |
+|---|---|---|
+| 面板端口 | `19001` | 一键脚本安装时交互设置，或终端输入 `aura` 配置 |
+| 网页登录路径 | `/admin` | 一键脚本安装时交互设置，或终端输入 `aura` 配置 |
+| 登录账号 | `admin` | 一键脚本安装时交互设置，或终端输入 `aura` 配置 |
+| 登录密码 | `admin` | **首次登录强制修改**，或终端输入 `aura` 配置 |
+
+> **一键脚本安装时全部交互式引导设置**（端口/路径/账号/密码），并配置开机自启。安装后终端输入 `aura` 可随时调出交互式配置界面（改端口/路径/账号/密码/更新面板/服务控制）。
 
 ---
 
@@ -77,7 +86,7 @@ docker run -d --name aura-panel \
 
 ## 🖥️ 一键脚本安装
 
-适合没有 Docker 的 Linux 服务器（自动装 sing-box 内核 + Python 依赖 + systemd 守护）。
+适合没有 Docker 的 Linux 服务器（自动装 sing-box 内核 + Python 依赖 + **交互式设置面板端口/路径/账号/密码** + systemd 开机自启 + 安装 `aura` 配置命令）。
 
 ### 方式 A：克隆后执行
 
@@ -87,25 +96,43 @@ cd aura
 bash install.sh
 ```
 
-### 方式 B：远程执行（仓库公开后）
+### 方式 B：远程执行
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sheying2013/aura/main/install.sh | bash
 ```
 
-### 可调环境变量
+### 安装过程
+
+脚本交互式引导（直接回车用默认值）：
+
+```
+面板端口 [19001]:
+网页登录路径 [/admin]:
+登录账号 [admin]:
+登录密码（至少6位，留空自动生成）:
+```
+
+### 安装后
+
+- **开机自启**：Linux root 下自动注册 `aura.service` systemd 服务（开机自启 + 崩溃重启）
+- **aura 命令**：终端输入 `aura` 调出交互式配置界面，随时改端口/路径/账号/密码、更新面板、重启服务
+- 访问 `http://<服务器IP>:<端口>/<路径>` 登录
+
+### 可调环境变量（完全非交互安装）
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `AURA_DIR` | `$HOME/aura` | 安装目录 |
 | `AURA_PORT` | `19001` | 面板端口 |
-| `SINGBOX_VERSION` | `1.7.7` | sing-box 内核版本 |
+| `AURA_PATH` | `/admin` | 网页登录路径 |
+| `AURA_USERNAME` | `admin` | 登录账号 |
+| `AURA_PASSWORD` | 随机生成 | 登录密码 |
+| `AURA_DIR` | `$HOME/aura` | 安装目录 |
+| `AURA_SKIP_INPUT` | `0` | `1`=跳过交互，全部用默认/环境变量 |
 
 ```bash
-AURA_PORT=8080 bash install.sh
+AURA_PORT=8080 AURA_USERNAME=mine AURA_PASSWORD='x9Kd@w' AURA_SKIP_INPUT=1 bash install.sh
 ```
-
-Linux 下以 root 运行会自动注册 `aura.service` systemd 服务（开机自启 + 崩溃重启）；非 root 或 macOS 退化为前台运行。
 
 ---
 
@@ -152,7 +179,22 @@ cp ../subs.js    static/subs.js
 ### 5. 启动
 
 ```bash
+# 推荐：start.sh 自动读取面板端口（data/panel.conf）并同步前端
+cd backend && bash start.sh
+```
+
+或手动指定端口：
+
+```bash
 uvicorn app:app --host 0.0.0.0 --port 19001
+```
+
+### 5.1 配置默认账号密码
+
+首次启动后默认账号 `admin` / 密码 `admin`，**登录后强制修改密码**。也可以在启动前直接设置：
+
+```bash
+cd backend && python3 -c "import panel_config, db; from auth import hash_password; panel_config.set_many({'port': 19001, 'panel_path': '/admin', 'username': 'admin'}); db.init_db(); db.set_setting('auth', {'password_hash': hash_password('你的密码'), 'password_change_required': False, 'changed_at': 0}); print('ok')"
 ```
 
 ### 6. systemd 守护（可选）
@@ -202,8 +244,8 @@ sudo systemctl enable --now aura.service
 **Q: 高质量 / 普通 / 代理池 怎么分？**
 节点名称包含住宅/ISP/原生/家宽/residential 等关键词自动归入高质量（`51` 端口段），否则归入普通（`52` 端口段）。「代理池」是独立第三组——分组名为「代理池」的节点，与端口段无关。
 
-**Q: 默认密码是什么？**
-`admin`。首次登录强制修改密码，改密后 token 自动刷新。
+**Q: 默认账号密码 / 端口 / 路径是什么？**
+默认账号 `admin`、密码 `admin`、端口 `19001`、路径 `/admin`。首次登录强制修改密码。一键脚本安装时会交互式引导设置，装完后终端输入 `aura` 可随时改。
 
 **Q: 数据存在哪？**
 `backend/data/panel.db`（SQLite）。Docker 部署则映射在宿主 `./data` 目录。

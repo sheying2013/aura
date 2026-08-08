@@ -11,6 +11,7 @@ const SubscriptionManager = (() => {
 
   let subscriptions = [];  // {id, url, name, group, lastFetch, lastRefresh, nodeCount, enabled}
   let refreshTimer = null;
+  let minuteTimer = null;
 
   /* ---------- 基础工具 ---------- */
   function safeB64Decode(str) {
@@ -311,15 +312,18 @@ const SubscriptionManager = (() => {
     // 立即检查一次（页面加载时若超6小时则刷新）
     setTimeout(check, 3000);
     refreshTimer = setInterval(check, REFRESH_INTERVAL);
-    // 同时每 5 分钟轻量检查（防时间漂移）
-    // 实际上面 setInterval 已够，此处作为兜底每 1 分钟检查
-    setInterval(check, 60 * 1000);
+    // 同时每 1 分钟轻量检查（防时间漂移/兜底）
+    minuteTimer = setInterval(check, 60 * 1000);
     return check;
   }
 
   function stopAutoRefresh() {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = null;
+    if (minuteTimer) {
+      clearInterval(minuteTimer);
+      minuteTimer = null;
+    }
   }
 
   function getSubs() { return subscriptions; }

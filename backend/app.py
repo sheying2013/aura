@@ -17,6 +17,7 @@ import auth
 import config_manager
 import db
 import models
+import panel_config
 import scheduler
 import stats
 import subs_proxy
@@ -24,8 +25,8 @@ import subs_proxy
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DATA_DIR = os.path.join(BASE_DIR, "data")
-# 面板路径前缀（默认 /admin）
-PANEL_PATH = "/admin"
+# 面板路径前缀（默认 /admin，可用 aura CLI / panel.conf 修改）
+PANEL_PATH = panel_config.get("panel_path") or "/admin"
 
 
 def _client_ip(request: Request) -> str:
@@ -72,6 +73,7 @@ def auth_status():
     auth_disabled = os.environ.get("AUTH_DISABLED") == "1"
     return {
         "authenticated": True,
+        "username": auth.get_username(),
         "passwordChangeRequired": False if auth_disabled else auth.is_password_change_required(),
     }
 
