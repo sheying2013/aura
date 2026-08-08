@@ -5,9 +5,9 @@
 #
 #  用法：
 #    1) 已克隆仓库（推荐）：
-#         git clone <你的仓库地址> aura && cd aura && bash install.sh
+#         git clone https://github.com/sheying2013/aura.git aura && cd aura && bash install.sh
 #    2) 全自动（仓库公开后）：
-#         curl -fsSL https://raw.githubusercontent.com/<USER>/aura/main/install.sh | bash
+#         curl -fsSL https://raw.githubusercontent.com/sheying2013/aura/main/install.sh | bash
 #         （脚本会从 AURA_REPO_URL 克隆代码）
 #
 #  可调环境变量：

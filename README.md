@@ -43,7 +43,7 @@ Aura 是一个基于 **sing-box 内核** 的节点中转管理面板。它把外
 ### 1. 获取代码
 
 ```bash
-git clone <你的仓库地址> aura
+git clone https://github.com/sheying2013/aura.git aura
 cd aura
 ```
 
@@ -82,7 +82,7 @@ docker run -d --name aura-panel \
 ### 方式 A：克隆后执行
 
 ```bash
-git clone <你的仓库地址> aura
+git clone https://github.com/sheying2013/aura.git aura
 cd aura
 bash install.sh
 ```
@@ -90,7 +90,7 @@ bash install.sh
 ### 方式 B：远程执行（仓库公开后）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<USER>/aura/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sheying2013/aura/main/install.sh | bash
 ```
 
 ### 可调环境变量
@@ -120,7 +120,7 @@ Linux 下以 root 运行会自动注册 `aura.service` systemd 服务（开机�
 ### 1. 获取代码
 
 ```bash
-git clone <你的仓库地址> aura
+git clone https://github.com/sheying2013/aura.git aura
 cd aura
 ```
 
