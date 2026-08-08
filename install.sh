@@ -198,22 +198,33 @@ configure_panel() {
     *) ;;
   esac
 
-  if [ -z "$PASSWORD" ]; then
-    if [ "$SKIP_INPUT" != "1" ]; then
-      PASSWORD=$(prompt_input "登录密码（至少6位，留空自动生成）" "")
+  # 密码：用户显式提供（交互输入或 AURA_PASSWORD）才算"想改密码"；
+  # 自动生成的随机密码只在首次安装时用，重跑/更新时不得覆盖已有密码
+  PASSWORD_EXPLICIT="0"
+  if [ -n "$AURA_PASSWORD" ]; then
+    PASSWORD="$AURA_PASSWORD"
+    PASSWORD_EXPLICIT="1"
+  fi
+  if [ -z "$PASSWORD" ] && [ "$SKIP_INPUT" != "1" ]; then
+    PASSWORD=$(prompt_input "登录密码（至少6位，留空保持当前密码）" "")
+    if [ -n "$PASSWORD" ]; then
+      PASSWORD_EXPLICIT="1"
     fi
-    if [ -z "$PASSWORD" ]; then
-      PASSWORD="$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | head -c 12)"
-      warn "已生成随机密码: $PASSWORD （请记下！登录后可在面板或 aura 命令修改）"
-    fi
+  fi
+  if [ -z "$PASSWORD" ] && [ "$PASSWORD_EXPLICIT" = "0" ]; then
+    # 无显式密码：生成一个候选（若 db 已有密码，python 端会保留旧的，此候选被忽略）
+    PASSWORD="$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | head -c 12)"
   fi
 
   # 写入 panel.conf + 数据库密码（用 base64 传参避免特殊字符破坏 shell）
-  local pass_b64
+  # 密码持久化：db 已有 password_hash 时保留（不覆盖），除非用户显式输入新密码
+  local pass_b64 force_pw PW_RESULT
   pass_b64="$(printf '%s' "$PASSWORD" | base64 | tr -d '\n')"
+  force_pw="$PASSWORD_EXPLICIT"
   info "写入面板配置..."
-  ( cd "$SRC_DIR/backend" && \
-    PORT="$PORT" PANEL_PATH="$PATH_PREFIX" PANEL_USER="$USERNAME" PASS_B64="$pass_b64" \
+  PW_RESULT="$( cd "$SRC_DIR/backend" && \
+    PORT="$PORT" PANEL_PATH="$PATH_PREFIX" PANEL_USER="$USERNAME" \
+    PASS_B64="$pass_b64" FORCE_PW="$force_pw" \
     "$PY" -c "
 import os, base64, time
 import panel_config, db
@@ -223,16 +234,27 @@ panel_config.set_many({
     'panel_path': os.environ['PANEL_PATH'],
     'username': os.environ['PANEL_USER'],
 })
-passwd = base64.b64decode(os.environ['PASS_B64']).decode()
 db.init_db()
-db.set_setting('auth', {
-    'password_hash': hash_password(passwd),
-    'password_change_required': False,
-    'changed_at': int(time.time() * 1000),
-})
-print('config written')
-" >/dev/null )
-  ok "配置已保存"
+auth = db.get_setting('auth', {}) or {}
+existing = auth.get('password_hash')
+force = os.environ.get('FORCE_PW') == '1'
+if existing and not force:
+    # 密码持久化：已有密码则保留（更新/重装不重置密码）
+    print('PW_KEPT')
+else:
+    passwd = base64.b64decode(os.environ['PASS_B64']).decode()
+    db.set_setting('auth', {
+        'password_hash': hash_password(passwd),
+        'password_change_required': False,
+        'changed_at': int(time.time() * 1000),
+    })
+    print('PW_SET')
+" 2>/dev/null | grep -oE 'PW_(KEPT|SET)' | head -1 )"
+  case "$PW_RESULT" in
+    PW_KEPT) ok "配置已保存（已保留现有登录密码）" ;;
+    PW_SET)  ok "配置已保存（登录密码已设置，请牢记！）" ;;
+    *)       ok "配置已保存" ;;
+  esac
 }
 
 # 无 db.init_db 的 python 直接写 panel.conf（轻量场景由 aura_cli 兜底）

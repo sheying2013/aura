@@ -9,13 +9,27 @@ set -euo pipefail
 # 镜像地址（GitHub Actions docker-publish workflow 推送）
 IMAGE="ghcr.io/sheying2013/aura:latest"
 PORT="${AURA_PORT:-19001}"
-DATA_DIR="${AURA_DATA_DIR:-$(pwd)/data}"
+# 数据目录固定路径（不随执行目录变化，避免更新时挂错卷丢数据/丢密码）
+DATA_DIR="${AURA_DATA_DIR:-/opt/aura/data}"
 CONTAINER="aura-panel"
 
 echo "=== Aura 面板更新 ==="
 echo "  镜像: $IMAGE"
 echo "  端口: $PORT"
 echo "  数据: $DATA_DIR"
+
+# 旧数据迁移：历史版本曾在 $(pwd)/data 或 /root/aura/data 落库，
+# 若新固定路径无 db 而旧位置有，先迁移（保住节点库与密码）
+if [ ! -f "$DATA_DIR/panel.db" ]; then
+  for old in "$(pwd)/data" "/root/aura/data" "$(dirname "$0")/data"; do
+    if [ -f "$old/panel.db" ]; then
+      echo "  检测到旧数据目录: $old，迁移到 $DATA_DIR"
+      mkdir -p "$DATA_DIR"
+      cp -a "$old/." "$DATA_DIR/"
+      break
+    fi
+  done
+fi
 
 # 1. 拉取最新镜像（云端已构建好，本地不编译）
 echo "=== 拉取镜像 ==="
