@@ -1,0 +1,60 @@
+name: docker-build
+
+on:
+  push:
+    paths:
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.dockerignore'
+      - 'backend/**'
+      - 'index.html'
+      - 'subs.js'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t aura-panel .
+
+      - name: Run container
+        run: |
+          docker run -d --name aura-test -p 19001:19001 aura-panel
+          # 等待 uvicorn 就绪（最多 30s）
+          for i in $(seq 1 30); do
+            if docker logs aura-test 2>&1 | grep -qE "Uvicorn running|Application startup complete"; then
+              echo "server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          docker ps --filter name=aura-test
+
+      - name: Health check WebUI
+        run: |
+          # 面板路径 /admin 应返回 200 HTML
+          code=$(curl -s -o /tmp/webui.html -w "%{http_code}" --max-time 5 http://127.0.0.1:19001/admin/ || echo 000)
+          echo "WebUI /admin/ -> HTTP $code"
+          [ "$code" = "200" ] || { echo "FAIL: WebUI not reachable"; docker logs aura-test; exit 1; }
+          grep -q "Aura" /tmp/webui.html && echo "page contains Aura brand" || { echo "FAIL: page does not contain Aura"; exit 1; }
+
+      - name: Health check login API
+        run: |
+          resp=$(curl -s --max-time 5 -X POST http://127.0.0.1:19001/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin"}')
+          echo "login response: $resp"
+          echo "$resp" | grep -q '"ok":true' || { echo "FAIL: login did not succeed"; docker logs aura-test; exit 1; }
+          echo "$resp" | grep -q '"passwordChangeRequired":true' || echo "warn: passwordChangeRequired not true (maybe already changed)"
+
+      - name: Scan logs for tracebacks
+        if: always()
+        run: |
+          if docker logs aura-test 2>&1 | grep -iE "traceback|exception in asyncio" ; then
+            echo "FAIL: traceback found in container logs"
+            exit 1
+          fi
+          echo "no tracebacks in container logs"
