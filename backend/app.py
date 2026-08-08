@@ -263,6 +263,24 @@ def delete_node_batch(body: models.DeleteBatchRequest):
     return {"deleted": db.delete_node_batch(body.ids)}
 
 
+@app.post("/api/groups/rename", dependencies=[Depends(require_auth)])
+async def rename_group(body: dict):
+    """分组重命名：批量更新节点分组 + relay 域名引用，重命名后重建配置。"""
+    old_name = (body.get("oldName") or "").strip()
+    new_name = (body.get("newName") or "").strip()
+    if not old_name or not new_name:
+        raise HTTPException(status_code=400, detail="oldName/newName 不能为空")
+    result = db.rename_group(old_name, new_name)
+    if result["updated"] == 0 and result["relayUpdated"] == 0:
+        raise HTTPException(status_code=404, detail=f"分组 [{old_name}] 不存在")
+    # 分组名变更影响 relay 池 → 重建配置
+    try:
+        await config_manager.apply_config()
+    except Exception:
+        pass
+    return {"ok": True, **result}
+
+
 @app.post("/api/nodes/{node_id}/traffic/reset", response_model=models.Node, dependencies=[Depends(require_auth)])
 def reset_node_traffic(node_id: str):
     node = db.reset_node_traffic(node_id)

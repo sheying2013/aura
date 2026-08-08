@@ -120,9 +120,9 @@ def outbound_tag_for(node: Dict[str, Any]) -> str:
     return f"out-{node.get('protocol')}-{node.get('port')}"
 
 async def _rotate_random_relay() -> None:
-    """随机挑一个可用节点作为 relay 出口并触发配置重建。
+    """随机挑一个可用节点作为 relay 出口，经 clash API 运行时切换（零热重载）。
 
-    build_config 会读 settings.randomRotateCurrent 让 relay urltest 只走该节点。
+    PUT /proxies/{tag} 只影响新连接、不断已有连接——与固定节点互不干扰。
     返回选中的 outbound tag（无可用节点返回 None）。
     """
     import config_manager as cm
@@ -135,21 +135,31 @@ async def _rotate_random_relay() -> None:
     pool = online or nodes
     node = random.choice(pool)
     tag = outbound_tag_for(node)
+    # 运行时切换：selector 支持 PUT /proxies（urltest 不支持，故生成层已改用 selector）
+    for rd in db.list_relay_domains():
+        rd_tag = f"relay-auto-{rd['id']}"
+        try:
+            async with __import__("httpx").AsyncClient(timeout=3.0) as client:
+                await client.put(
+                    f"{cm.clash_base()}/proxies/{rd_tag}",
+                    json={"name": tag},
+                    headers={"Authorization": f"Bearer {cm.get_clash_secret()}"},
+                )
+        except Exception as e:
+            print(f"[relay-rotate] PUT 切换 {rd_tag} 失败: {e}")
     settings = db.get_setting("system", {}) or {}
     settings["randomRotateCurrent"] = tag
     db.set_setting("system", settings)
-    await cm.apply_config()
     print(f"[relay-rotate] 随机出口 → {node.get('name')} ({tag})")
     return tag
 
 
 async def _relay_random_loop() -> None:
-    """随机轮询循环：开启时按设定间隔随机挑一个可用节点作为 relay 域名出口。
+    """随机轮询循环：开启时按设定间隔随机挑一个可用节点并运行时切换出口。
 
-    面板层实现（sing-box urltest 只做延迟选优，无随机出口）：
-    开启时把随机选中的节点 tag 存 DB settings（randomRotateCurrent），
-    再触发配置重建——build_config 会读取该字段让 relay urltest 只走这个节点。
-    关闭随机轮询后：走默认 urltest 延迟选优（interval 3m 或 stickyTimeout）。
+    面板层实现（sing-box 无随机 outbound）：selector + PUT /proxies 运行时切换，
+    只影响新连接、不断已有连接（不热重载）。
+    关闭随机轮询后：selector 保持当前选中（或由探活调度切到延迟最优）。
     """
     while True:
         settings = db.get_setting("system", {}) or {}

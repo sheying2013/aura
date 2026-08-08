@@ -219,24 +219,19 @@ def build_config() -> Dict[str, Any]:
         })
         rd_targets = [outbound_tag(n["protocol"], n["port"]) for n in rd_nodes]
         rd_targets = [t for t in rd_targets if t in outbound_tag_set]
-        rd_urltest = {
-            "type": "urltest", "tag": rd_out_tag,
+        # 用 selector 代替 urltest：轮询切换走 clash API PUT /proxies 运行时切换，
+        # 只影响新连接、不断已有连接（热重载会全局断连，urltest 无法随机切换）。
+        # 关闭随机轮询时：selector 由探活调度定时切到延迟最优节点（urltest 语义由面板模拟）。
+        rd_selector = {
+            "type": "selector", "tag": rd_out_tag,
             "outbounds": rd_targets if rd_targets else ["direct"],
-            "url": test_url, "interval": "3m",
         }
-        # 代理池粘滞超时：面板层实现——开启后把 urltest 探测间隔拉长到 sticky_timeout，
-        # 期间 sing-box 不重新探测切换，出口粘住当前节点；到点后才重新测延迟换优。
-        # （sing-box urltest 本身无 sticky 字段，1.7.7 起校验会拒绝未知字段，故用 interval 近似）
-        if settings.get("stickyEnabled"):
-            rd_urltest["interval"] = settings.get("stickyTimeout") or "5m"
-        # 随机轮询（注册机/爬虫场景）：开启后 relay 出口强制为当前随机选中节点，
-        # urltest 只保留该节点（interval 拉长防它自行切走），由面板定时器随机换节点
+        # 随机轮询（注册机/爬虫场景）：启动时选中随机节点，之后定时器随机 PUT 切换
         if settings.get("randomRotateEnabled") and settings.get("randomRotateCurrent"):
             cur = settings["randomRotateCurrent"]
             if cur in rd_targets:
-                rd_urltest["outbounds"] = [cur]
-                rd_urltest["interval"] = "24h"
-        outbounds.append(rd_urltest)
+                rd_selector["default"] = cur
+        outbounds.append(rd_selector)
         route_rules.append({"inbound": [rd_in_tag], "outbound": rd_out_tag})
 
     outbounds.append({"type": "direct", "tag": "direct"})

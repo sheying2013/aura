@@ -1800,6 +1800,7 @@
             <select id="filter-group" class="form-select" style="width: 140px;" onchange="renderNodesTable()">
               <option value="ALL">全部分组</option>
             </select>
+            <button class="btn btn-outline btn-sm" onclick="renameGroup()" title="重命名当前选中分组">重命名</button>
 
             <input type="text" id="search-keyword" class="form-control" placeholder="搜索节点名称/IP/端口..." style="width: 200px;" oninput="renderNodesTable()">
           </div>
@@ -3707,6 +3708,50 @@
 
       // 多域名轮询：刷新各域名卡的分组勾选
       renderRelayDomainList();
+    }
+
+    // 分组重命名：批量改节点分组 + relay 域名引用（后端处理 + 重建配置）
+    function renameGroup() {
+      const sel = document.getElementById('filter-group');
+      const oldName = sel.value;
+      if (!oldName || oldName === 'ALL') {
+        alert('请先在下拉框选中要重命名的分组');
+        return;
+      }
+      const newName = prompt(`将分组「${oldName}」重命名为：`, oldName);
+      if (!newName || newName.trim() === '' || newName === oldName) return;
+      if (newName.includes('/') || newName.includes('"')) {
+        alert('分组名不能包含斜杠或引号');
+        return;
+      }
+      const doRename = (payload) => {
+        const url = window.__backendMode ? '/api/groups/rename' : null;
+        if (!url) {
+          // 本地模式：直接改内存
+          nodeState.forEach(n => { if (n.group === oldName) n.group = newName.trim(); });
+          saveNodesToStorage();
+          addLog('SUCCESS', `分组 [${oldName}] 已重命名为 [${newName.trim()}]（本地）`);
+          renderAll();
+          return;
+        }
+        api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+          .then(resp => {
+            if (!resp.ok) return resp.json().then(d => { throw new Error(d.detail || ('HTTP ' + resp.status)); });
+            return resp.json();
+          })
+          .then(data => {
+            addLog('SUCCESS', `分组 [${oldName}] 已重命名为 [${newName.trim()}]（更新 ${data.updated} 个节点）`);
+            return api('/api/nodes').then(r => r.json());
+          })
+          .then(data => {
+            if (data && data.items) {
+              nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
+              renderAll();
+            }
+          })
+          .catch(err => addLog('ERROR', `分组重命名失败: ${err.message || err}`));
+      };
+      doRename({ oldName, newName: newName.trim() });
     }
 
     function renderQuickStats() {

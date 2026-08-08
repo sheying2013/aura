@@ -240,6 +240,32 @@ def random_auth(port: int) -> tuple:
     return user, passwd
 
 
+def rename_group(old_name: str, new_name: str) -> Dict[str, Any]:
+    """分组重命名：批量更新节点分组 + relay_domains 的 groups 引用。
+
+    返回 {updated, relayUpdated}——updated=节点数，relayUpdated=引用更新的域名数。
+    """
+    if not old_name or not new_name or old_name == new_name:
+        return {"updated": 0, "relayUpdated": 0}
+    with _lock:
+        c = connect()
+        cur = c.execute('UPDATE nodes SET "group"=?, updated_at=? WHERE "group"=?',
+                        (new_name, _conn_now(), old_name))
+        updated = cur.rowcount
+        relay_updated = 0
+        for r in c.execute("SELECT id, groups FROM relay_domains"):
+            try:
+                groups = json.loads(r["groups"] or '["ALL"]')
+            except Exception:
+                continue
+            if old_name in groups and "ALL" not in groups:
+                groups = [new_name if g == old_name else g for g in groups]
+                c.execute("UPDATE relay_domains SET groups=? WHERE id=?", (json.dumps(groups), r["id"]))
+                relay_updated += 1
+        c.commit()
+        return {"updated": updated, "relayUpdated": relay_updated}
+
+
 # ---------- 节点 CRUD ----------
 
 def list_nodes(q: Optional[str] = None, group: Optional[str] = None, sub_id: Optional[str] = None) -> List[Dict]:
