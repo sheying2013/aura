@@ -3547,30 +3547,67 @@
         const main = uri.substring(8);
         const atSp = main.split('@');
         const uuid = atSp[0];
-        const hostPortSp = atSp[1].split('?')[0].split(':');
+        const body = atSp[1];
+        const qIdx = body.indexOf('?');
+        const hostPortSp = (qIdx === -1 ? body : body.substring(0, qIdx)).split(':');
         const server = hostPortSp[0];
         const port = parseInt(hostPortSp[1]);
-
-        return {
-          name,
-          protocol: 'vless',
-          rawConfig: { type: 'vless', server, server_port: port, uuid }
-        };
+        // vless query 常含 reality/flow/transport 参数，必须完整解析，禁止 split('?')[0] 丢弃
+        const q = qIdx === -1 ? {} : Object.fromEntries(new URLSearchParams(body.substring(qIdx + 1)));
+        const cfg = { type: 'vless', server, server_port: port, uuid };
+        if (q.flow) cfg.flow = q.flow;
+        if (q.encryption) cfg.encryption = q.encryption;
+        if (q.security) cfg.security = q.security;
+        if (q.fp) cfg.fp = q.fp;
+        if (q.pbk) cfg.pbk = q.pbk;
+        if (q.sid) cfg.sid = q.sid;
+        if (q.sni) cfg.sni = q.sni;
+        if (q.host) cfg.host = q.host;
+        if (q.alpn) cfg.alpn = q.alpn;
+        if (q.serviceName) cfg.serviceName = q.serviceName;
+        if (q.allowInsecure === '1' || q.allowInsecure === 'true') cfg.insecure = true;
+        const transportType = q.type || q.net;
+        if (transportType && transportType !== 'tcp' && transportType !== 'none') {
+          const transport = { type: transportType };
+          if (q.path) transport.path = q.path;
+          if (transportType === 'grpc') transport.service_name = q.serviceName || q.path || '';
+          if (transportType === 'http' && q.host) transport.host = [q.host];
+          if ((transportType === 'ws' || transportType === 'http') && q.host) transport.headers = { Host: q.host };
+          cfg.transport = transport;
+        }
+        if (q.security === 'reality' || q.pbk) {
+          cfg.reality = { enabled: true, public_key: q.pbk || '', short_id: q.sid || '' };
+        }
+        return { name, protocol: 'vless', rawConfig: cfg };
       }
 
       if (uri.startsWith('trojan://')) {
         const main = uri.substring(9);
         const atSp = main.split('@');
         const password = atSp[0];
-        const hostPortSp = atSp[1].split('?')[0].split(':');
+        const body = atSp[1];
+        const qIdx = body.indexOf('?');
+        const hostPortSp = (qIdx === -1 ? body : body.substring(0, qIdx)).split(':');
         const server = hostPortSp[0];
         const port = parseInt(hostPortSp[1]);
-
-        return {
-          name,
-          protocol: 'trojan',
-          rawConfig: { type: 'trojan', server, server_port: port, password }
-        };
+        // trojan query 常含 sni/transport 参数，必须完整解析
+        const q = qIdx === -1 ? {} : Object.fromEntries(new URLSearchParams(body.substring(qIdx + 1)));
+        const cfg = { type: 'trojan', server, server_port: port, password };
+        if (q.sni) cfg.sni = q.sni;
+        if (q.fp) cfg.fp = q.fp;
+        if (q.alpn) cfg.alpn = q.alpn;
+        if (q.host) cfg.host = q.host;
+        if (q.allowInsecure === '1' || q.allowInsecure === 'true') cfg.insecure = true;
+        const transportType = q.type || q.net;
+        if (transportType && transportType !== 'tcp' && transportType !== 'none') {
+          const transport = { type: transportType };
+          if (q.path) transport.path = q.path;
+          if (transportType === 'grpc') transport.service_name = q.serviceName || q.path || '';
+          if (transportType === 'http' && q.host) transport.host = [q.host];
+          if ((transportType === 'ws' || transportType === 'http') && q.host) transport.headers = { Host: q.host };
+          cfg.transport = transport;
+        }
+        return { name, protocol: 'trojan', rawConfig: cfg };
       }
 
       // socks5:// 与 http://（代理节点直接导入，作为 sing-box 出站）
@@ -3641,8 +3678,16 @@
           server = hp[0]; port = parseInt(hp[1]);
         }
         const cfg = { type: 'hysteria2', server, server_port: port, password };
-        if (query.sni) cfg.sni = query.sni;
-        if (query.insecure) cfg.insecure = query.insecure === '1' || query.insecure === 'true';
+        // 清洗 markdown 自动链接残留（如 sni=[www.bing.com&mport=...](https://... 被渲染破坏）
+        let sni = query.sni || '';
+        if (sni.includes('[') && sni.includes(']')) {
+          const inner = sni.substring(sni.indexOf('[') + 1, sni.indexOf(']'));
+          sni = inner.split('&')[0];
+        }
+        if (sni) cfg.sni = sni;
+        // hy2 机场节点证书多与 SNI 不匹配，默认 insecure 跳过证书校验（实测连通关键）
+        cfg.insecure = true;
+        if (query.insecure === '0' || query.insecure === 'false') cfg.insecure = false;
         return { name, protocol: 'hysteria2', rawConfig: cfg };
       }
 
@@ -4625,9 +4670,21 @@
             server_port: cfg.server_port,
             uuid: cfg.uuid
           };
-          // vless 订阅节点几乎全走 TLS 端口；按 sni/insecure 生成 tls（与后端一致）。
-          // 推断场景（无原始 tls 配置）server_name 是猜的，默认 insecure 跳过证书校验
-          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, insecure: true };
+          if (cfg.flow) outItem.flow = cfg.flow;
+          const isReality = cfg.reality && cfg.reality.enabled;
+          // server_name 必须填（reality 空 server_name 会让 sing-box 退化成普通 TLS 走 x509 校验）；
+          // 无 sni 时用 server 兜底（IP 也让 reality 生效，后续由 pbk 校验决定成败）
+          const tlsObj = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server };
+          if (cfg.fp) tlsObj.utls = { enabled: true, fingerprint: cfg.fp };
+          if (isReality) {
+            // reality 客户端不做证书校验，insecure 无意义；按 pbk/sid 生成
+            tlsObj.reality = { enabled: true, public_key: cfg.reality.public_key || '', short_id: cfg.reality.short_id || '' };
+          } else {
+            // 推断场景（无原始 tls 配置）server_name 是猜的，默认 insecure 跳过证书校验
+            tlsObj.insecure = true;
+          }
+          if (cfg.alpn) tlsObj.alpn = String(cfg.alpn).split(',');
+          outItem.tls = tlsObj;
           if (cfg.transport || cfg.streamSettings) outItem.transport = cfg.transport || cfg.streamSettings;
         } else if (node.protocol === 'trojan') {
           outItem = {
@@ -4638,7 +4695,10 @@
             password: cfg.password
           };
           // trojan 协议强制 TLS（与后端一致）；推断场景默认 insecure
-          outItem.tls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, insecure: true };
+          const troTls = { enabled: true, server_name: cfg.sni || cfg.server_name || cfg.server, insecure: true };
+          if (cfg.fp) troTls.utls = { enabled: true, fingerprint: cfg.fp };
+          if (cfg.alpn) troTls.alpn = String(cfg.alpn).split(',');
+          outItem.tls = troTls;
           if (cfg.transport || cfg.streamSettings) outItem.transport = cfg.transport || cfg.streamSettings;
         } else if (node.protocol === 'hysteria2') {
           outItem = {
