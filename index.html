@@ -1516,6 +1516,43 @@
     </div>
   </div>
 
+  <!-- 编辑订阅弹窗（名称/链接/分组/端口/认证 批量应用到该订阅全部节点） -->
+  <div id="edit-sub-overlay" class="login-overlay" style="display:none;">
+    <div class="login-box ink-card" style="max-width: 480px;">
+      <div class="seal-logo" style="width:46px;height:46px;font-size:22px;margin:0 auto 8px;">✎</div>
+      <h2 style="font-family:var(--font-serif);color:var(--ochre-gold);text-align:center;margin-bottom:4px;">编辑订阅</h2>
+      <div id="edit-sub-sub" style="text-align:center;font-size:12px;color:var(--ink-gray);margin-bottom:20px;"></div>
+
+      <div class="form-group">
+        <label class="form-label">订阅名称</label>
+        <input type="text" id="edit-sub-name" class="form-control">
+      </div>
+      <div class="form-group">
+        <label class="form-label">订阅链接（URL）</label>
+        <input type="text" id="edit-sub-url" class="form-control">
+      </div>
+      <div class="form-group">
+        <label class="form-label">归属分组</label>
+        <input type="text" id="edit-sub-group" class="form-control">
+      </div>
+      <div class="form-group">
+        <label class="form-label">节点端口起始（留空保持原端口；填了则批量重新分配该订阅全部节点端口）</label>
+        <input type="number" id="edit-sub-port-start" class="form-control" placeholder="如 53000 / 54000">
+      </div>
+      <div class="form-group">
+        <label class="form-label">对外认证（socks5/http 用户名 · 密码，批量覆盖该订阅全部节点）</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="edit-sub-auth-user" class="form-control" placeholder="用户名" style="flex:1">
+          <input type="text" id="edit-sub-auth-pass" class="form-control" placeholder="密码" style="flex:1">
+        </div>
+      </div>
+
+      <div id="edit-sub-error" style="color:var(--cinnabar-red);font-size:12px;margin-bottom:10px;min-height:16px;"></div>
+      <button class="btn btn-primary" style="width:100%;" onclick="saveEditSubscription()">保存并批量应用</button>
+      <button class="btn btn-outline btn-sm" style="width:100%;margin-top:8px;" onclick="closeEditSubscription()">取消</button>
+    </div>
+  </div>
+
   <!-- 山水背景 SVG (石青/黛色/墨色/渐变/柔亮月光) -->
   <svg id="landscape-bg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
     <defs>
@@ -3349,72 +3386,126 @@
       addLog('INFO', '已删除订阅及其节点');
     }
 
-    // 编辑订阅：改链接/名称/分组/自定义 socks 认证（覆盖导入时的随机认证）
+    // 编辑订阅：弹窗一次改 名称/链接/分组/端口起始/认证，保存后批量应用到该订阅全部节点
+    let editingSubId = null;
+
     function editSubscription(id) {
       const sub = window.SubscriptionManager.getSubs().find(x => x.id === id);
       if (!sub) return;
-      const url = prompt('订阅链接：', sub.url || '');
-      if (url === null) return;
-      const name = prompt('订阅名称：', sub.name || '');
-      if (name === null) return;
-      const group = prompt('归属分组（留空保持）：', sub.group || '订阅节点');
-      if (group === null) return;
-      const authUser = prompt('自定义 socks5/http 用户名（留空保持随机）：', sub.authUser || '');
-      if (authUser === null) return;
-      const authPass = prompt('自定义 socks5/http 密码（留空保持随机）：', sub.authPass || '');
-      if (authPass === null) return;
-      window.SubscriptionManager.updateSub(id, {
-        url: url.trim() || sub.url,
-        name: name.trim() || sub.name,
-        group: group.trim() || sub.group,
-        authUser: authUser.trim(),
-        authPass: authPass.trim(),
-      });
-      const updated = window.SubscriptionManager.getSubs().find(x => x.id === id);
-      const urlChanged = updated.url !== sub.url;
-      addLog('INFO', `订阅 [${updated.name}] 已更新（分组: ${updated.group}${updated.authUser ? `，自定义认证: ${updated.authUser}:***` : '，保持随机认证'}${urlChanged ? '，链接已修改' : ''}`);
+      editingSubId = id;
+      const subNodes = nodeState.filter(n => n.subId === id);
+      document.getElementById('edit-sub-name').value = sub.name || '';
+      document.getElementById('edit-sub-url').value = sub.url || '';
+      document.getElementById('edit-sub-group').value = sub.group || '订阅节点';
+      document.getElementById('edit-sub-port-start').value = '';
+      document.getElementById('edit-sub-auth-user').value = sub.authUser || '';
+      document.getElementById('edit-sub-auth-pass').value = sub.authPass || '';
+      document.getElementById('edit-sub-sub').textContent = `节点 ${subNodes.length} 个 | 当前分组: ${sub.group || '订阅节点'}`;
+      document.getElementById('edit-sub-error').textContent = '';
+      document.getElementById('edit-sub-overlay').style.display = 'flex';
+    }
 
-      // 认证/分组变更 → 应用到该订阅已导入的节点（重新导入覆盖认证）
-      const nodeIds = nodeState.filter(n => n.subId === id).map(n => n.id);
-      const reimport = () => {
-        if (window.__backendMode && nodeIds.length) {
-          // 后端模式：批量 PATCH 更新这些节点的 authUser/authPass/group
-          const patchPromises = nodeIds.map(nid =>
-            api('/api/nodes/' + encodeURIComponent(nid), {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                ...(updated.authUser ? { authUser: updated.authUser, authPass: updated.authPass || '' } : {}),
-                group: updated.group,
-              }),
-            })
-          );
-          Promise.allSettled(patchPromises).then(() => {
-            addLog('INFO', `已更新 ${nodeIds.length} 个节点认证/分组（订阅 [${updated.name}]）`);
-            api('/api/nodes').then(r => r.json()).then(data => {
-              if (data && data.items) {
-                nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
-                renderAll();
-              }
-              try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
-            }).catch(err => addLog('ERROR', '刷新节点列表失败: ' + err.message));
-          });
-        } else {
-          // 本地模式：直接改内存
-          nodeState.forEach(n => {
-            if (n.subId === id) {
-              if (updated.authUser) { n.authUser = updated.authUser; n.authPass = updated.authPass || ''; }
-              n.group = updated.group;
-            }
-          });
-          saveNodesToStorage();
-          renderAll();
-        }
+    function closeEditSubscription() {
+      document.getElementById('edit-sub-overlay').style.display = 'none';
+      editingSubId = null;
+    }
+
+    async function saveEditSubscription() {
+      if (!editingSubId) return;
+      const sub = window.SubscriptionManager.getSubs().find(x => x.id === editingSubId);
+      if (!sub) return;
+      const errEl = document.getElementById('edit-sub-error');
+      errEl.textContent = '';
+
+      const name = document.getElementById('edit-sub-name').value.trim();
+      const url = document.getElementById('edit-sub-url').value.trim();
+      const group = document.getElementById('edit-sub-group').value.trim();
+      const portStart = document.getElementById('edit-sub-port-start').value.trim();
+      const authUser = document.getElementById('edit-sub-auth-user').value.trim();
+      const authPass = document.getElementById('edit-sub-auth-pass').value.trim();
+
+      if (!url) { errEl.textContent = '订阅链接不能为空'; return; }
+      if (portStart && (isNaN(parseInt(portStart)) || parseInt(portStart) < 1000)) {
+        errEl.textContent = '端口起始必须是 ≥1000 的数字，留空保持原端口';
+        return;
+      }
+
+      // 1. 更新订阅记录
+      window.SubscriptionManager.updateSub(editingSubId, {
+        url, name: name || sub.name,
+        group: group || sub.group,
+        authUser, authPass,
+      });
+      const updated = window.SubscriptionManager.getSubs().find(x => x.id === editingSubId);
+
+      // 2. 该订阅全部节点批量应用
+      const nodeIds = nodeState.filter(n => n.subId === editingSubId).map(n => n.id);
+      const startPort = portStart ? parseInt(portStart) : null;
+
+      // 本地模式也要分配端口（批量 PATCH 端口）
+      const assignPorts = () => {
+        if (!startPort) return {};
+        const portMap = {};
+        // used 排除本订阅节点自身旧端口，重排才能落在连续新段上
+        const ownIds = new Set(nodeIds);
+        const used = new Set(nodeState.filter(n => !ownIds.has(n.id)).map(n => n.port));
+        let p = startPort;
+        nodeIds.forEach(nid => {
+          while (used.has(p)) p++;
+          portMap[nid] = p;
+          used.add(p);
+          p++;
+        });
+        return portMap;
       };
-      if (confirm(`订阅 [${updated.name}] 更新成功。是否重新拉取并应用？`)) {
-        refreshSubAndImport(updated);
+
+      if (window.__backendMode && nodeIds.length) {
+        const portMap = assignPorts();
+        const patchPromises = nodeIds.map(nid =>
+          api('/api/nodes/' + encodeURIComponent(nid), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ...(authUser ? { authUser, authPass: authPass || '' } : {}),
+              group: group || sub.group,
+              ...(portMap[nid] ? { port: portMap[nid] } : {}),
+            }),
+          })
+        );
+        Promise.allSettled(patchPromises).then(async () => {
+          addLog('INFO', `已批量更新 ${nodeIds.length} 个节点（订阅 [${updated.name}]${authUser ? '，认证' : ''}${group ? '，分组' : ''}${startPort ? '，端口' : ''}）`);
+          try {
+            const resp = await api('/api/nodes');
+            const data = await resp.json();
+            if (data && data.items) {
+              nodeState = data.items.map(n => { n.entryProto = n.entryProto || 'mixed'; return n; });
+              renderAll();
+            }
+          } catch(e) { addLog('ERROR', '刷新节点列表失败: ' + e.message); }
+          try { await api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+        });
       } else {
-        reimport();
+        // 本地模式：直接改内存
+        const portMap = assignPorts();
+        nodeState.forEach(n => {
+          if (n.subId === editingSubId) {
+            if (authUser) { n.authUser = authUser; n.authPass = authPass || ''; }
+            if (group) n.group = group;
+            if (portMap[n.id]) n.port = portMap[n.id];
+          }
+        });
+        saveNodesToStorage();
+        renderAll();
+        addLog('INFO', `已批量更新订阅 [${updated.name}] 节点${authUser ? '，认证' : ''}${group ? '，分组' : ''}${startPort ? '，端口' : ''}`);
+      }
+
+      renderSubList();
+      closeEditSubscription();
+
+      // 3. 是否重新拉取（改链接后一般要拉新节点）
+      const urlChanged = updated.url !== sub.url;
+      if (confirm(`订阅 [${updated.name}] 已更新${urlChanged ? '（链接已修改）' : ''}。是否立即重新拉取该订阅？`)) {
+        refreshSubAndImport(updated);
       }
     }
 
