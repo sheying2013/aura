@@ -98,6 +98,35 @@ def clash_base() -> str:
     return f"http://{CLASH_HOST}:{CLASH_PORT}"
 
 
+def _signal_singbox(sig: signal.Signals) -> int:
+    """向本面板的 sing-box 进程发信号，返回命中数。
+
+    host 网络 + slim 镜像（无 pkill/ps）下遍历 /proc 找 sing-box 进程。
+    host 网络下 sing-box 可能逃逸到宿主 PID 空间，容器内 /proc 若看不到
+    则返回 0（调用方应回退到宿主机手段）。
+    """
+    hits = 0
+    try:
+        cmdline_marker = f"sing-box run -c {CONFIG_PATH}"
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\x00", b" ").decode(errors="ignore")
+            except (OSError, IOError):
+                continue
+            if cmdline_marker in cmd:
+                try:
+                    os.kill(int(pid), sig)
+                    hits += 1
+                except (OSError, ProcessLookupError):
+                    pass
+    except OSError:
+        pass
+    return hits
+
+
 def outbound_tag(protocol: str, port: int) -> str:
     return f"out-{protocol}-{port}"
 
@@ -498,14 +527,9 @@ async def stop() -> None:
                 _logf = None
             return
         # _proc 丢失但 clash 探测仍活着（如 uvicorn 崩溃重启后 sing-box 残留），
-        # 兜底用 pkill 按命令行特征清理，避免面板显示已停止而 sing-box 仍占用端口。
+        # 兜底遍历 /proc 按命令行特征清理，避免面板显示已停止而 sing-box 仍占用端口。
         if is_running():
-            try:
-                # 精确匹配本面板的 config 路径，避免误杀宿主其他 sing-box 实例
-                subprocess.run(["pkill", "-TERM", "-f", f"sing-box run -c {CONFIG_PATH}"],
-                               capture_output=True, timeout=5)
-            except Exception:
-                pass
+            _signal_singbox(signal.SIGTERM)
 
 
 async def reload_config() -> bool:
@@ -515,23 +539,21 @@ async def reload_config() -> bool:
     先 check()，新配置无效会保留旧实例。因此这里在发出后轮询 clash API：
     旧实例 close 再起新实例期间 /version 短暂不可达，恢复即视为重载成功。
 
-    host 网络下 sing-box 可能逃逸出容器 PID 空间（_proc 为 None 但 clash 探测
-    运行中），此时无法 send_signal，改用 pkill -HUP 按 config 路径匹配。
+    host 网络下 sing-box 可能逃逸出容器 PID 空间（_proc 指向的容器进程可能
+    已 reaped/失效），统一用 /proc 扫描真实运行的 sing-box 进程发信号。
     """
     global _proc
     if not is_running():
         return False
+    # 优先 _proc（正常路径）；逃逸场景 /proc 扫描兜底，命中才认为信号发出
     if _proc is not None:
         try:
             _proc.send_signal(signal.SIGHUP)
         except Exception:
-            return False
+            if _signal_singbox(signal.SIGHUP) == 0:
+                return False
     else:
-        # _proc 丢失但 sing-box 仍在跑：pkill -HUP 按本面板 config 路径精确匹配
-        try:
-            subprocess.run(["pkill", "-HUP", "-f", f"sing-box run -c {CONFIG_PATH}"],
-                           capture_output=True, timeout=5)
-        except Exception:
+        if _signal_singbox(signal.SIGHUP) == 0:
             return False
     # 等 clash API 恢复（旧实例关闭到新实例就绪的窗口 <1s 左右；最多 5s）
     hdrs = {"Authorization": f"Bearer {get_clash_secret()}"}
