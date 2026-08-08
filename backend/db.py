@@ -345,6 +345,7 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
     items: List[Dict] = []
     with _lock:
         c = connect()
+        # 一次性预载：现有节点 server 指纹 + 已删指纹 + 已用端口（避免每节点循环全表扫描 O(N²)）
         existing_servers = set()
         for r in c.execute("SELECT raw_config, id FROM nodes"):
             try:
@@ -357,6 +358,8 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
                 pass
         # 已删除节点指纹（sub_id|server|port）：订阅刷新不重复导入
         deleted_fps = {r["fingerprint"] for r in c.execute("SELECT fingerprint FROM deleted_fingerprints")}
+        # 已用端口只查一次（含 relay_domains），循环内只增批内集合
+        db_used = {r[0] for r in c.execute("SELECT port FROM nodes")} | {r[0] for r in c.execute("SELECT port FROM relay_domains")}
         batch_ports = set()
         for nd in nodes:
             # 每个节点必须带 id（前端 batch payload / 订阅导入都不传，由后端生成）
@@ -371,14 +374,14 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
                     duplicate += 1
                     skipped += 1
                     continue
-                existing_servers.add(key)
-                # 已删除节点指纹：订阅刷新时不重复导入（仅跳过，不占 duplicate 计数）
+                # 已删除节点指纹：订阅刷新时不重复导入（仅跳过，不占 duplicate 计数）。
+                # 注意：先检查指纹再 add existing_servers——已删节点不占位，同 host 不同订阅仍可导入
                 if nd.get("subId") and f"{nd['subId']}|{srv}|{sp}" in deleted_fps:
                     skipped += 1
                     continue
+                existing_servers.add(key)
             # 端口冲突则跳过（不入库，避免 IntegrityError 中断整批）
             port = nd.get("port")
-            db_used = {r[0] for r in c.execute("SELECT port FROM nodes")} | {r[0] for r in c.execute("SELECT port FROM relay_domains")}
             if not port:
                 # 自动分配：从 52001 起找既不在 DB 也不在批内已用端口的空闲端口
                 base = 52001
@@ -389,6 +392,7 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
                 skipped += 1
                 continue
             batch_ports.add(port)
+            db_used.add(port)
             nd["port"] = port
             try:
                 c.execute(
@@ -401,7 +405,8 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
             except sqlite3.IntegrityError:
                 skipped += 1
                 continue
-            items.append(_row_to_node(c.execute("SELECT * FROM nodes WHERE id = ?", (nd["id"],)).fetchone()))
+            # 不再逐条回查（200 节点 = 200 次全字段 SELECT），输入字段齐全直接用
+            items.append(nd)
             created += 1
         c.commit()
     return {"created": created, "skipped": skipped, "duplicate": duplicate, "items": items}

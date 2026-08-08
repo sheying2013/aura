@@ -2464,7 +2464,7 @@
                           window.__sseRenderTimer = setTimeout(() => {
                             window.__sseRenderTimer = null;
                             renderQuickStats();
-                            renderNodesTable();
+                            syncNodesTable();
                             renderNodeMatrix();
                             updateChartAndStats();
                           }, 2000);
@@ -3120,7 +3120,18 @@
     /* ==========================================
        5. 节点解析与导入逻辑 (真实解析器)
        ========================================== */
+    let __importInFlight = false;
     function handleBatchImport() {
+      // 防重入：导入中禁按钮，避免重复点击提交多个 batch/apply 排队
+      if (window.__importInFlight) { addLog('WARN', '导入进行中，请稍候…'); return; }
+      window.__importInFlight = true;
+      const btn = document.querySelector('#tab-import button.btn-primary');
+      const originalText = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = '导入中…'; }
+      const finish = () => {
+        window.__importInFlight = false;
+        if (btn) { btn.disabled = false; btn.textContent = originalText; }
+      };
       const text = document.getElementById('import-text').value.trim();
       const startPortInput = document.getElementById('import-start-port').value.trim();
       const targetGroup = document.getElementById('import-group').value.trim() || '默认分组';
@@ -3136,11 +3147,13 @@
 
       if (!text) {
         alert('请先粘贴节点订阅/单链接！');
+        finish();
         return;
       }
 
       if (entryProto === 'ss' && ssPass && ssPass.length < 4) {
         alert('Shadowsocks 密码至少 4 位（留空则自动随机生成）');
+        finish();
         return;
       }
 
@@ -3199,6 +3212,7 @@
 
       if (importedNodes.length === 0) {
         addLog('ERROR', `批量导入失败：${lines.length} 行全部无效`);
+        finish();
         return;
       }
 
@@ -3221,16 +3235,20 @@
             renderAll();
           }
           // 关键：导入后重建 sing-box 配置并热重载——否则节点只进 DB，
-          // inbound/outbound 不存在，探活/流量归属全部失效
+          // inbound/outbound 不存在，探活/流量归属全部失效。
+          // 后台执行不阻塞 UI（大批量重建 sing-box 配置可能耗时数秒）
           try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
         }).catch(err => {
           addLog('ERROR', '批量导入后端失败: ' + err.message);
+        }).finally(() => {
+          finish();
         });
       } else {
         // 本地预览模式
         importedNodes.forEach(n => nodeState.push(n));
         addLog('SUCCESS', `（预览模式）批量导入 ${importedNodes.length} 个节点，出口协议 ${entryProto === 'ss' ? 'Shadowsocks' : 'socks5+http'}。`);
         saveNodesToStorage();
+        finish();
       }
 
       document.getElementById('import-text').value = '';
@@ -4114,11 +4132,9 @@
         const portClass = isConflict ? 'port-input conflict' : 'port-input';
 
         return `
-          <tr>
+          <tr data-id="${n.id}">
             <td><input type="checkbox" class="chk-node" value="${n.id}"></td>
-            <td>
-              <span class="status-dot ${n.status === 'online' ? 'online' : (n.status === 'disabled' ? 'disabled' : 'offline')}" title="${n.status === 'disabled' ? '已停用（连续探活失败自动）' : n.status}"></span>
-            </td>
+            <td data-cell="status"><span class="status-dot ${n.status === 'online' ? 'online' : (n.status === 'disabled' ? 'disabled' : 'offline')}" title="${n.status === 'disabled' ? '已停用（连续探活失败自动）' : n.status}"></span></td>
             <td>
               <input type="number" class="${portClass}" value="${n.port}" onchange="updateNodePort('${n.id}', this.value)" title="${isConflict ? '警告：端口冲突！' : '编辑端口'}">
             </td>
@@ -4126,9 +4142,9 @@
             <td><span class="proto-tag">${n.protocol.toUpperCase()}</span></td>
             <td><span class="proto-tag" style="${n.entryProto === 'ss' ? 'background: var(--ochre-gold); color:#120e06;' : ''}">${(n.entryProto || 'mixed').toUpperCase()}</span></td>
             <td style="font-weight: 500;" title="认证: ${n.authUser || ''}:${n.authPass || ''}${n.status === 'disabled' ? ' · 连续失败 ' + (n.consecutiveFails || 0) + ' 次已停用' : ''}">${escapeHtml(n.name)}${n.status === 'disabled' ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
-            <td style="font-size:12px;">${renderExitIp(n)}</td>
-            <td style="font-family:var(--font-code);">${formatBytes((n.upTraffic||0)+(n.downTraffic||0))}</td>
-            <td style="font-family:var(--font-code); color:${n.ping < 80 ? 'var(--jade-green-glow)' : 'var(--ochre-gold)'}">${n.ping > 0 ? n.ping + 'ms' : 'timeout'}</td>
+            <td style="font-size:12px;" data-cell="ipq">${renderExitIp(n)}</td>
+            <td style="font-family:var(--font-code);" data-cell="traffic">${formatBytes((n.upTraffic||0)+(n.downTraffic||0))}</td>
+            <td style="font-family:var(--font-code); color:${n.ping < 80 ? 'var(--jade-green-glow)' : 'var(--ochre-gold)'}" data-cell="latency">${n.ping > 0 ? n.ping + 'ms' : 'timeout'}</td>
             <td style="text-align: center; white-space: nowrap;">
               ${n.status === 'disabled'
                 ? `<button class="btn btn-secondary btn-xs" onclick="enableNode('${n.id}')" title="重新启用">启用</button>
@@ -4146,6 +4162,53 @@
       if (checkedIds.size) {
         document.querySelectorAll('.chk-node').forEach(c => { if (checkedIds.has(c.value)) c.checked = true; });
       }
+    }
+
+    // SSE 实时更新：只更新表格里变化的单元格（流量/延迟/状态/IP质量），不重建整表。
+    // 解决 400+ 节点列表每 2s 全表 innerHTML 重建导致的闪烁、端口输入框/勾选丢失。
+    function syncNodesTable() {
+      const tbody = document.getElementById('nodes-tbody');
+      if (!tbody) return;
+      const selectedGroup = document.getElementById('filter-group').value;
+      const searchKw = document.getElementById('search-keyword').value.toLowerCase().trim();
+      // 过滤逻辑与 renderNodesTable 一致
+      const filtered = nodeState.filter(node => {
+        if (selectedGroup === '__DISABLED__') return node.status === 'disabled';
+        if (node.status === 'disabled') return false;
+        const matchGroup = (selectedGroup === 'ALL' || node.group === selectedGroup);
+        const matchKw = !searchKw || node.name.toLowerCase().includes(searchKw) || String(node.port).includes(searchKw) || (node.exitIp && node.exitIp.includes(searchKw));
+        return matchGroup && matchKw;
+      });
+      // 当前 DOM 里的行（按 data-id 索引，不动复选框/端口输入框这些用户交互元素）
+      const rows = Array.from(tbody.querySelectorAll('tr[data-id]'));
+      const rowById = new Map(rows.map(r => [r.getAttribute('data-id'), r]));
+      // 1) 只更新已有行的活跃单元格
+      filtered.forEach(n => {
+        const tr = rowById.get(n.id);
+        if (!tr) return;
+        const set = (k, v) => {
+          const td = tr.querySelector(`[data-cell="${k}"]`);
+          if (td && td.textContent !== v) td.innerHTML = v;
+        };
+        set('traffic', formatBytes((n.upTraffic||0)+(n.downTraffic||0)));
+        const latStr = n.ping > 0 ? n.ping + 'ms' : 'timeout';
+        const latTd = tr.querySelector('[data-cell="latency"]');
+        if (latTd) {
+          if (latTd.textContent !== latStr) latTd.textContent = latStr;
+          latTd.style.color = n.ping < 80 ? 'var(--jade-green-glow)' : 'var(--ochre-gold)';
+        }
+        // IP 质量格：SSE 不刷新这些字段（探活/exit-ip 查询才变），重建时 renderNodesTable 已覆盖，这里跳过
+        const stTd = tr.querySelector('[data-cell="status"]');
+        if (stTd) {
+          const cls = n.status === 'online' ? 'online' : (n.status === 'disabled' ? 'disabled' : 'offline');
+          const dot = stTd.querySelector('.status-dot');
+          if (dot) { dot.className = 'status-dot ' + cls; dot.title = n.status === 'disabled' ? '已停用（连续探活失败自动）' : n.status; }
+        }
+      });
+      // 2) 存在/消失的行：整体重建一次（增删操作后生效）
+      const newIds = new Set(filtered.map(n => n.id));
+      const needRebuild = filtered.length !== rows.length || rows.some(r => !newIds.has(r.getAttribute('data-id')));
+      if (needRebuild) renderNodesTable();
     }
 
     function toggleSelectAll(masterChk) {
