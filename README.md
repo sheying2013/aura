@@ -62,6 +62,8 @@ cd aura
 docker compose up -d --build
 ```
 
+> **架构**：Dockerfile 自动探测架构（amd64 / arm64），x86_64 与 ARM 服务器（Oracle ARM、Apple Silicon）均可直接构建。
+
 ### 3. 验证
 
 ```bash
@@ -87,6 +89,8 @@ docker run -d --name aura-panel \
 ## 🖥️ 一键脚本安装
 
 适合没有 Docker 的 Linux 服务器（自动装 sing-box 内核 + Python 依赖 + **交互式设置面板端口/路径/账号/密码** + systemd 开机自启 + 安装 `aura` 配置命令）。
+
+> **架构支持**：x86_64/amd64 与 arm64/aarch64（Apple Silicon、Oracle ARM、树莓派 64 位等）全支持。macOS 也支持（Intel 和 Apple Silicon），自动下载对应架构的 sing-box，并解除 macOS Gatekeeper 隔离。
 
 ### 方式 A：克隆后执行
 
@@ -115,7 +119,7 @@ curl -fsSL https://raw.githubusercontent.com/sheying2013/aura/main/install.sh | 
 
 ### 安装后
 
-- **开机自启**：Linux root 下自动注册 `aura.service` systemd 服务（开机自启 + 崩溃重启）
+- **开机自启**：Linux root 下自动注册 `aura.service` systemd 服务（开机自启 + 崩溃重启）；macOS 安装时可选择注册 launchd 后台服务（同样开机自启 + 崩溃重启）
 - **aura 命令**：终端输入 `aura` 调出交互式配置界面，随时改端口/路径/账号/密码、更新面板、重启服务
 - 访问 `http://<服务器IP>:<端口>/<路径>` 登录
 
