@@ -198,7 +198,10 @@ def build_config() -> Dict[str, Any]:
             tls_dict: Dict[str, Any] = {"enabled": True}
             if cfg.get("sni") or cfg.get("server_name"):
                 tls_dict["server_name"] = cfg.get("sni") or cfg.get("server_name")
-            if cfg.get("insecure") in (True, "true", "1") or cfg.get("skip-cert-verify") in (True, "true", "1"):
+            # hy2 机场节点证书多与 SNI 不匹配，默认 insecure 跳过证书校验（实测连通关键，与前端一致）
+            if cfg.get("insecure") in (False, "0", "false"):
+                pass  # 显式关闭才不设 insecure
+            else:
                 tls_dict["insecure"] = True
             out_item["tls"] = tls_dict
             # hy2 obfs（clash 订阅常见 salamander）→ sing-box 对象形式

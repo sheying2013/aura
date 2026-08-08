@@ -3991,6 +3991,8 @@
 
     function renderNodesTable() {
       const tbody = document.getElementById('nodes-tbody');
+      // 保留已勾选节点（SSE 2s 刷新会重建 tbody，清掉勾选 → 用户「无法多选」）
+      const checkedIds = new Set(Array.from(document.querySelectorAll('.chk-node:checked')).map(c => c.value));
       const selectedGroup = document.getElementById('filter-group').value;
       const searchKw = document.getElementById('search-keyword').value.toLowerCase().trim();
 
@@ -4039,6 +4041,11 @@
           </tr>
         `;
       }).join('');
+
+      // 恢复之前勾选（SSE 刷新清掉的多选恢复）
+      if (checkedIds.size) {
+        document.querySelectorAll('.chk-node').forEach(c => { if (checkedIds.has(c.value)) c.checked = true; });
+      }
     }
 
     function toggleSelectAll(masterChk) {
