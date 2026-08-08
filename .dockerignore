@@ -1,0 +1,28 @@
+# ========== 敏感数据 - 严禁打进镜像 ==========
+# 本地运行时数据（真实节点库 / 生成配置 / 日志 / clash secret）
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# 项目说明文档
+代码概要.md
+
+# 本地截图
+screenshots/
+
+# ========== 版本控制 ==========
+.git/
+.gitignore
+.gitattributes
+
+# ========== Python 缓存 ==========
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ========== 系统文件 ==========
+.DS_Store
+.claude/
