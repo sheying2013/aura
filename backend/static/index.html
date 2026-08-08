@@ -1259,6 +1259,10 @@
       background: var(--danger-red);
       box-shadow: 0 0 6px var(--danger-red);
     }
+    .status-dot.disabled {
+      background: #5a5348;
+      box-shadow: none;
+    }
 
     /* 端口输入框 (冲突红框) */
     .port-input {
@@ -3759,7 +3763,7 @@
           <tr>
             <td><input type="checkbox" class="chk-node" value="${n.id}"></td>
             <td>
-              <span class="status-dot ${n.status === 'online' ? 'online' : 'offline'}" title="${n.status}"></span>
+              <span class="status-dot ${n.status === 'online' ? 'online' : (n.status === 'disabled' ? 'disabled' : 'offline')}" title="${n.status === 'disabled' ? '已停用（连续探活失败自动）' : n.status}"></span>
             </td>
             <td>
               <input type="number" class="${portClass}" value="${n.port}" onchange="updateNodePort('${n.id}', this.value)" title="${isConflict ? '警告：端口冲突！' : '编辑端口'}">
@@ -3770,12 +3774,14 @@
             <td>${escapeHtml(n.group || '默认分组')}</td>
             <td><span class="proto-tag">${n.protocol.toUpperCase()}</span></td>
             <td><span class="proto-tag" style="${n.entryProto === 'ss' ? 'background: var(--ochre-gold); color:#120e06;' : ''}">${(n.entryProto || 'mixed').toUpperCase()}</span></td>
-            <td style="font-weight: 500;" title="认证: ${n.authUser || ''}:${n.authPass || ''}">${escapeHtml(n.name)}</td>
+            <td style="font-weight: 500;" title="认证: ${n.authUser || ''}:${n.authPass || ''}${n.status === 'disabled' ? ' · 连续失败 ' + (n.consecutiveFails || 0) + ' 次已停用' : ''}">${escapeHtml(n.name)}${n.status === 'disabled' ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
             <td style="font-family:var(--font-code);">${formatBytes((n.upTraffic||0)+(n.downTraffic||0))}</td>
             <td style="font-family:var(--font-code); color:${n.ping < 80 ? 'var(--jade-green-glow)' : 'var(--ochre-gold)'}">${n.ping > 0 ? n.ping + 'ms' : 'timeout'}</td>
             <td style="font-family:var(--font-code); font-size:12px;">${n.exitIp || 'N/A'}</td>
             <td style="text-align: center; white-space: nowrap;">
-              <button class="btn btn-gold btn-xs" onclick="pingSingleNode('${n.id}')" title="探活">${iconSvg('bolt')}</button>
+              ${n.status === 'disabled'
+                ? `<button class="btn btn-secondary btn-xs" onclick="enableNode('${n.id}')" title="重新启用">启用</button>`
+                : `<button class="btn btn-gold btn-xs" onclick="pingSingleNode('${n.id}')" title="探活">${iconSvg('bolt')}</button>`}
               <button class="btn btn-secondary btn-xs" onclick="openEditNode('${n.id}')" title="编辑/重命名">${iconSvg('edit')}</button>
               <button class="btn btn-outline btn-xs" onclick="exportSingleNode('${n.id}')" title="导出">${iconSvg('download')}</button>
               <button class="btn btn-danger btn-xs" onclick="deleteNode('${n.id}')" title="删除">${iconSvg('trash')}</button>
@@ -3787,6 +3793,31 @@
 
     function toggleSelectAll(masterChk) {
       document.querySelectorAll('.chk-node').forEach(c => c.checked = masterChk.checked);
+    }
+
+    // 手动重新启用已停用节点（清失败计数 + 恢复状态 + 重建配置）
+    function enableNode(nodeId) {
+      const node = nodeState.find(n => n.id === nodeId);
+      if (!node) return;
+      if (window.__backendMode) {
+        api('/api/nodes/' + encodeURIComponent(nodeId), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'offline', consecutiveFails: 0 }),
+        }).then(resp => {
+          if (!resp.ok) throw new Error('API ' + resp.status);
+          const n = nodeState.find(x => x.id === nodeId);
+          if (n) { n.status = 'offline'; n.consecutiveFails = 0; }
+          addLog('INFO', `节点 [${node.name}] 已重新启用`);
+          renderNodesTable();
+          try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+        }).catch(err => addLog('ERROR', `启用节点失败: ${err.message}`));
+        return;
+      }
+      node.status = 'offline';
+      node.consecutiveFails = 0;
+      saveNodesToStorage();
+      addLog('INFO', `节点 [${node.name}] 已重新启用`);
     }
 
     /* ==========================================

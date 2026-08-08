@@ -114,6 +114,8 @@ def init_db() -> None:
             c.execute("ALTER TABLE nodes ADD COLUMN entry_proto TEXT DEFAULT 'mixed'")
         if "ss_pass" not in cols:
             c.execute("ALTER TABLE nodes ADD COLUMN ss_pass TEXT")
+        if "consecutive_fails" not in cols:
+            c.execute("ALTER TABLE nodes ADD COLUMN consecutive_fails INTEGER DEFAULT 0")
         c.commit()
 
 
@@ -140,6 +142,7 @@ def _row_to_node(row: sqlite3.Row) -> Dict[str, Any]:
         "selected": bool(row["selected"]),
         "entryProto": row["entry_proto"] or "mixed",
         "ssPass": row["ss_pass"],
+        "consecutiveFails": row["consecutive_fails"] if "consecutive_fails" in row.keys() else 0,
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -362,7 +365,7 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
         c.execute(
             """UPDATE nodes SET name=?,protocol=?,"group"=?,port=?,segment=?,auth_user=?,
                auth_pass=?,status=?,ping=?,exit_ip=?,up_traffic=?,down_traffic=?,raw_config=?,
-               sub_id=?,stale=?,selected=?,entry_proto=?,ss_pass=?,updated_at=?
+               sub_id=?,stale=?,selected=?,entry_proto=?,ss_pass=?,consecutive_fails=?,updated_at=?
                WHERE id=?""",
             (
                 merged["name"], merged["protocol"], merged["group"], merged["port"],
@@ -373,6 +376,7 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
                 merged.get("subId"), 1 if merged.get("stale") else 0,
                 1 if merged.get("selected") else 0,
                 merged.get("entryProto", "mixed"), merged.get("ssPass"),
+                merged.get("consecutiveFails", 0),
                 _conn_now(), node_id,
             ),
         )
@@ -477,15 +481,28 @@ def reset_all_traffic() -> None:
         c.commit()
 
 
-def update_node_probe(node_id: str, ping: int, status: str, error: Optional[str] = None) -> None:
-    """探活结果落库（status/exitIp/ping 由后端覆盖，不经前端回写）。"""
+def update_node_probe(node_id: str, ping: int, status: str, error: Optional[str] = None) -> Optional[int]:
+    """探活结果落库（status/exitIp/ping 由后端覆盖，不经前端回写）。
+
+    失败计数：status=online 清零；其他状态（offline/error/disabled）累加。
+    返回累计失败次数（供调度器判断自动停用/删除），成功返回 0。
+    """
     with _lock:
         c = connect()
+        if status == "online":
+            c.execute(
+                "UPDATE nodes SET ping=?, status=?, consecutive_fails=0, updated_at=? WHERE id=?",
+                (int(ping), status, _conn_now(), node_id),
+            )
+            c.commit()
+            return 0
         c.execute(
-            "UPDATE nodes SET ping=?, status=?, updated_at=? WHERE id=?",
+            "UPDATE nodes SET ping=?, status=?, consecutive_fails=consecutive_fails+1, updated_at=? WHERE id=?",
             (int(ping), status, _conn_now(), node_id),
         )
         c.commit()
+        row = c.execute("SELECT consecutive_fails FROM nodes WHERE id=?", (node_id,)).fetchone()
+        return row["consecutive_fails"] if row else 0
 
 
 # ---------- 多域名轮询 ----------

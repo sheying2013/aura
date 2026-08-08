@@ -87,6 +87,7 @@ class NodePatch(BaseModel):
     entryProto: Optional[str] = None
     ssPass: Optional[str] = None
     selected: Optional[bool] = None
+    consecutiveFails: Optional[int] = None
 
 
 class PortUpdateRequest(BaseModel):

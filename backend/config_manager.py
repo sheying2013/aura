@@ -103,6 +103,9 @@ def build_config() -> Dict[str, Any]:
     outbound_tag_set: Set[str] = set()
 
     for node in nodes:
+        # 已停用节点（连续探活失败自动停用）：不生成 inbound/outbound，不参与轮询
+        if node.get("status") == "disabled":
+            continue
         sb_type = PROTOCOL_TYPE_MAP.get(node["protocol"])
         if sb_type is None:
             errors.append({"node": node["name"], "reason": f"协议 {node['protocol']} 不被 sing-box 1.7 支持，已跳过"})
@@ -207,7 +210,8 @@ def build_config() -> Dict[str, Any]:
         rd_in_tag = f"in-relay-{rd_id}"
         rd_out_tag = f"relay-auto-{rd_id}"
         selected_groups = rd.get("groups") or ["ALL"]
-        rd_nodes = [n for n in nodes if "ALL" in selected_groups or n.get("group") in selected_groups]
+        rd_nodes = [n for n in nodes if n.get("status") != "disabled"
+                    and ("ALL" in selected_groups or n.get("group") in selected_groups)]
         inbounds.append({
             "type": "mixed", "tag": rd_in_tag, "listen": listen_ip,
             "listen_port": rd_port,

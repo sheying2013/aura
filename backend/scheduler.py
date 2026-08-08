@@ -20,8 +20,16 @@ _guard_paused = False
 
 # ---------- 探活 ----------
 
+# 连续失败自动处理阈值
+DISABLE_AFTER_FAILS = 5   # 连续失败 ≥5 次 → 自动停用（不参与轮询/探活）
+DELETE_AFTER_FAILS = 10   # 连续失败 ≥10 次 → 自动删除（释放端口）
+
 async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> List[Dict[str, Any]]:
-    """对节点经 clash API 并发探活。返回 {id, tag, ping, status, error}。"""
+    """对节点经 clash API 并发探活。返回 {id, tag, ping, status, error}。
+
+    失败计数：连续失败 DISABLE_AFTER_FAILS 次自动停用（status=disabled），
+    达到 DELETE_AFTER_FAILS 次自动删除节点并重建配置；成功即清零。
+    """
     import config_manager as cm
 
     if not cm.is_running():
@@ -29,6 +37,8 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> Lis
     nodes = db.list_nodes()
     if not all_ and ids:
         nodes = [n for n in nodes if n["id"] in ids]
+    # 已停用的节点跳过探活（前端可手动重新启用）
+    nodes = [n for n in nodes if n.get("status") != "disabled"]
 
     async def _probe_one(node: Dict[str, Any]) -> Dict[str, Any]:
         tag = cm.outbound_tag(node["protocol"], node["port"])
@@ -42,23 +52,41 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True) -> Lis
                 )
             if r.status_code == 200:
                 delay = r.json().get("delay")
-                db.update_node_probe(node["id"], delay, "online")
                 return {"id": node["id"], "tag": tag, "ping": delay, "status": "online"}
             msg = None
             try:
                 msg = r.json().get("message")
             except Exception:
                 pass
-            db.update_node_probe(node["id"], 0, "offline")
             return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline",
                     "error": msg or f"HTTP {r.status_code}"}
         except Exception as e:
-            db.update_node_probe(node["id"], 0, "offline")
             return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline", "error": str(e)}
 
     if not nodes:
         return []
-    return await asyncio.gather(*(_probe_one(n) for n in nodes))
+    results = await asyncio.gather(*(_probe_one(n) for n in nodes))
+    # 结果落库 + 失败计数 → 自动停用/删除（_probe_one 不落库，避免双重计数）
+    for node, res in zip(nodes, results):
+        if res.get("status") == "online":
+            db.update_node_probe(node["id"], res.get("ping", 0), "online")  # 成功清零
+            continue
+        fails = db.update_node_probe(node["id"], 0, "offline")  # 失败 +1 并返回累计值
+        if fails >= DELETE_AFTER_FAILS:
+            print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动删除")
+            db.delete_node(node["id"])
+            try:
+                await cm.apply_config()
+            except Exception:
+                pass
+        elif fails >= DISABLE_AFTER_FAILS:
+            print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动停用")
+            db.update_node(node["id"], {"status": "disabled"})
+            try:
+                await cm.apply_config()
+            except Exception:
+                pass
+    return results
 
 
 async def _probe_loop() -> None:
