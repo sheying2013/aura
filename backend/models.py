@@ -19,6 +19,7 @@ class NodeCreate(BaseModel):
     authPass: Optional[str] = None
     rawConfig: Optional[Dict[str, Any]] = None
     subId: Optional[str] = None
+    subName: Optional[str] = None  # 订阅名（订阅导入节点，列表显示来源）
     status: Optional[str] = None
     ping: Optional[int] = None
     exitIp: Optional[str] = None

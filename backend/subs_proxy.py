@@ -507,21 +507,22 @@ def parse_content(content: str) -> List[Dict[str, Any]]:
 
 # ---------- 去重导入 ----------
 
-def import_nodes(sub_id: str, group: str, nodes: List[Dict[str, Any]], stale: bool = False) -> Dict[str, Any]:
+def import_nodes(sub_id: str, group: str, sub_name: str, nodes: List[Dict[str, Any]], stale: bool = False) -> Dict[str, Any]:
     """把解析出的节点导入 DB（对齐前端：按 server:port 去重、分组继承、随机 auth、subId 关联）。"""
-    from db import get_next_available_port, random_auth, create_node_batch
+    from db import random_auth, create_node_batch
 
     prepared: List[Dict[str, Any]] = []
     for pn in nodes:
         rc = pn.get("rawConfig") or {}
-        port = get_next_available_port(None)
-        user, passwd = random_auth(port)
+        user, passwd = random_auth(0)
         prepared.append({
             "id": db.new_node_id(),
             "name": pn.get("name", "未命名"),
             "protocol": pn.get("protocol", "shadowsocks"),
             "group": group,
-            "port": port,
+            # 端口取 0 = 交给 create_node_batch 批内自动分配（52001 起递增），
+            # 避免这里逐节点 get_next_available_port 拿到相同端口导致后续全 skip
+            "port": 0,
             "segment": 52,
             "authUser": user,
             "authPass": passwd,
@@ -532,6 +533,7 @@ def import_nodes(sub_id: str, group: str, nodes: List[Dict[str, Any]], stale: bo
             "downTraffic": 0,
             "rawConfig": rc,
             "subId": sub_id,
+            "subName": sub_name,
             "stale": stale,
             "selected": False,
             "entryProto": "mixed",
@@ -550,7 +552,7 @@ async def refresh_sub(sub: Dict[str, Any]) -> Dict[str, Any]:
         if not nodes:
             sub = db.update_sub(sub["id"], {"last_error": "解析 0 个节点"})
             return {"id": sub["id"], "ok": False, "count": 0, "stale": False, "imported": 0, "error": "解析 0 个节点"}
-        imported = import_nodes(sub["id"], sub.get("group", "订阅节点"), nodes, stale=False)
+        imported = import_nodes(sub["id"], sub.get("group", "订阅节点"), sub.get("name", ""), nodes, stale=False)
         db.update_sub(sub["id"], {
             "last_refresh": int(__import__("time").time() * 1000),
             "node_count": len(nodes),
@@ -573,7 +575,7 @@ async def refresh_sub(sub: Dict[str, Any]) -> Dict[str, Any]:
         try:
             nodes = json.loads(snap)
             if nodes:
-                imported = import_nodes(sub["id"], sub.get("group", "订阅节点"), nodes, stale=True)
+                imported = import_nodes(sub["id"], sub.get("group", "订阅节点"), sub.get("name", ""), nodes, stale=True)
                 # 兜底：已有节点也标 stale（快照是过期数据）
                 db.mark_nodes_stale_by_sub(sub["id"])
                 db.update_sub(sub["id"], {"last_error": res.get("error")})

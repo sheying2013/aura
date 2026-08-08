@@ -72,6 +72,7 @@ def init_db() -> None:
               sub_id        TEXT,
               stale         INTEGER DEFAULT 0,
               selected      INTEGER DEFAULT 0,
+              sub_name      TEXT,
               entry_proto   TEXT DEFAULT 'mixed',
               ss_pass       TEXT,
               created_at    INTEGER,
@@ -119,6 +120,8 @@ def init_db() -> None:
             c.execute("ALTER TABLE nodes ADD COLUMN entry_proto TEXT DEFAULT 'mixed'")
         if "ss_pass" not in cols:
             c.execute("ALTER TABLE nodes ADD COLUMN ss_pass TEXT")
+        if "sub_name" not in cols:
+            c.execute("ALTER TABLE nodes ADD COLUMN sub_name TEXT")
         if "consecutive_fails" not in cols:
             c.execute("ALTER TABLE nodes ADD COLUMN consecutive_fails INTEGER DEFAULT 0")
         # IP 情报列（探活成功后落库归属地/类型/评分）
@@ -154,6 +157,7 @@ def _row_to_node(row: sqlite3.Row) -> Dict[str, Any]:
         "downTraffic": row["down_traffic"],
         "rawConfig": json.loads(row["raw_config"] or "{}"),
         "subId": row["sub_id"],
+        "subName": row["sub_name"] if "sub_name" in row.keys() else None,
         "stale": bool(row["stale"]),
         "selected": bool(row["selected"]),
         "entryProto": row["entry_proto"] or "mixed",
@@ -188,6 +192,7 @@ def _node_to_params(node: Dict[str, Any]) -> tuple:
         node.get("downTraffic", 0),
         json.dumps(node.get("rawConfig", {}), ensure_ascii=False),
         node.get("subId"),
+        node.get("subName"),
         1 if node.get("stale") else 0,
         1 if node.get("selected") else 0,
         node.get("entryProto", "mixed"),
@@ -329,8 +334,8 @@ def create_node(node: Dict[str, Any]) -> Dict:
         c.execute(
             """INSERT INTO nodes
                (id,name,protocol,"group",port,segment,auth_user,auth_pass,status,ping,
-                exit_ip,up_traffic,down_traffic,raw_config,sub_id,stale,selected,entry_proto,ss_pass,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                exit_ip,up_traffic,down_traffic,raw_config,sub_id,sub_name,stale,selected,entry_proto,ss_pass,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             _node_to_params(node),
         )
         c.commit()
@@ -398,8 +403,8 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
                 c.execute(
                     """INSERT INTO nodes
                        (id,name,protocol,"group",port,segment,auth_user,auth_pass,status,ping,
-                        exit_ip,up_traffic,down_traffic,raw_config,sub_id,stale,selected,entry_proto,ss_pass,created_at,updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        exit_ip,up_traffic,down_traffic,raw_config,sub_id,sub_name,stale,selected,entry_proto,ss_pass,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     _node_to_params(nd),
                 )
             except sqlite3.IntegrityError:
@@ -427,7 +432,7 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
         c.execute(
             """UPDATE nodes SET name=?,protocol=?,"group"=?,port=?,segment=?,auth_user=?,
                auth_pass=?,status=?,ping=?,exit_ip=?,up_traffic=?,down_traffic=?,raw_config=?,
-               sub_id=?,stale=?,selected=?,entry_proto=?,ss_pass=?,consecutive_fails=?,
+               sub_id=?,sub_name=?,stale=?,selected=?,entry_proto=?,ss_pass=?,consecutive_fails=?,
                exit_country=?,exit_flag=?,exit_city=?,exit_type=?,exit_score=?,exit_risk=?,updated_at=?
                WHERE id=?""",
             (
@@ -436,7 +441,8 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
                 merged.get("status", "offline"), merged.get("ping", 0),
                 merged.get("exitIp", "N/A"), merged.get("upTraffic", 0),
                 merged.get("downTraffic", 0), json.dumps(merged.get("rawConfig", {}), ensure_ascii=False),
-                merged.get("subId"), 1 if merged.get("stale") else 0,
+                merged.get("subId"), merged.get("subName"),
+                1 if merged.get("stale") else 0,
                 1 if merged.get("selected") else 0,
                 merged.get("entryProto", "mixed"), merged.get("ssPass"),
                 merged.get("consecutiveFails", 0),
