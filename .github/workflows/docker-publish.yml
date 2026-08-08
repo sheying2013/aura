@@ -46,3 +46,13 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # GHCR 默认私有，VPS 匿名 pull 需要公开（幂等，重复设置无害）
+      - name: Set package visibility public
+        run: |
+          curl -s -o /dev/null -w "visibility patch HTTP %{http_code}\n" \
+            -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/user/packages/container/aura" \
+            -d '{"visibility":"public"}'
