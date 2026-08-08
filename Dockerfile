@@ -42,4 +42,5 @@ VOLUME ["/app/backend/data"]
 EXPOSE 19001
 
 # sing-box 管理 API（clash_api，默认 9090）仅在宿主机内部使用，无需对外暴露
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "19001"]
+# start.sh 自动读取 data/panel.conf 的面板端口启动
+CMD ["bash", "start.sh"]
