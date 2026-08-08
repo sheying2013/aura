@@ -1,26 +1,42 @@
 # Aura · SingBox 中转节点管理面板
 # 基于 Python + sing-box 内核的 socks5/http 出站中转面板
 # 构建：docker build -t aura-panel .
+# 多架构：amd64 / arm64 自动检测（buildx 或原生 docker 均可）
 FROM python:3.13-slim
 
 ARG SINGBOX_VERSION=1.7.7
-ARG SINGBOX_ARCH=amd64
+# sing-box 发布包架构名：amd64 | arm64（Apple Silicon/ARM 服务器自动匹配）
+ARG TARGETARCH
+
+# 映射 Docker TARGETARCH -> sing-box 发布架构名
+RUN if [ -z "$TARGETARCH" ]; then \
+      case "$(uname -m)" in \
+        x86_64|amd64)   echo "amd64" > /tmp/sbarch ;; \
+        aarch64|arm64)  echo "arm64" > /tmp/sbarch ;; \
+        *) echo "unsupported arch: $(uname -m)"; exit 1 ;; \
+      esac; \
+    else \
+      echo "$TARGETARCH" > /tmp/sbarch; \
+    fi \
+    && echo "sing-box arch: $(cat /tmp/sbarch)"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     SINGBOX_BIN=/usr/local/bin/sing-box \
     PYTHONUNBUFFERED=1
 
-# 安装 sing-box 内核（GitHub Release）
-RUN apt-get update \
+# 安装 sing-box 内核（GitHub Release，按架构下载）
+RUN SBARCH=$(cat /tmp/sbarch) \
+    && apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
-    && curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}.tar.gz" -o /tmp/singbox.tar.gz \
+    && curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${SBARCH}.tar.gz" -o /tmp/singbox.tar.gz \
     && tar -xzf /tmp/singbox.tar.gz -C /tmp \
-    && cp /tmp/sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}/sing-box /usr/local/bin/ \
+    && cp /tmp/sing-box-${SINGBOX_VERSION}-linux-${SBARCH}/sing-box /usr/local/bin/ \
     && chmod +x /usr/local/bin/sing-box \
     && rm -rf /tmp/singbox.tar.gz /tmp/sing-box-* \
     && apt-get purge -y curl \
     && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && sing-box version
 
 WORKDIR /app
 
