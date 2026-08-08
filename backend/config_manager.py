@@ -27,7 +27,8 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 CONFIG_BAK_PATH = os.path.join(DATA_DIR, "config.json.bak")
 LOG_PATH = os.path.join(DATA_DIR, "singbox.log")
 CLASH_HOST = "127.0.0.1"
-CLASH_PORT = 9090
+# 不用 9090（与其他面板/服务冲突常见），选 9095 避开常见占用
+CLASH_PORT = 9095
 
 # 前端 protocol 值 → sing-box outbound type；None = 不支持（跳过）
 PROTOCOL_TYPE_MAP: Dict[str, Optional[str]] = {
@@ -308,7 +309,7 @@ def check_config(config: Dict[str, Any]) -> tuple:
 def _detect_port_conflict(ports: Set[int]) -> List[int]:
     """端口冲突检测：独占 bind 探测。
     仅当 sing-box 运行时跳过其管理端口（此时确实被占）；未运行时这些端口
-    实际空闲，若外部进程占用必须报冲突。clash API 端口（9090）也纳入检测。"""
+    实际空闲，若外部进程占用必须报冲突。clash API 端口（9095）也纳入检测。"""
     managed = set()
     if is_running():
         for n in db.list_nodes():
@@ -355,7 +356,7 @@ def is_running() -> bool:
 
     Docker host 网络部署下 sing-box 子进程可能进入宿主机 PID 空间（容器内
     看不到 /proc，_wait_task 立即 done），此时用 clash API 探测兜底判断——
-    host 网络共享 127.0.0.1，容器内外都能访问 9090。
+    host 网络共享 127.0.0.1，容器内外都能访问 clash API 端口（9095）。
     """
     global _proc
     if _proc is not None and (_wait_task is None or not _wait_task.done()):
