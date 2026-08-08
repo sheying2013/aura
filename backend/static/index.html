@@ -1809,6 +1809,7 @@
             <button class="btn btn-gold btn-sm" onclick="openConvertEntryDialog()">↔ 转换入口协议</button>
             <button class="btn btn-outline btn-sm" onclick="reassignAllPorts()">重新编排端口</button>
             <button class="btn btn-secondary btn-sm" onclick="exportSelectedNodes()">导出选中节点</button>
+            <button class="btn btn-secondary btn-sm" onclick="enableSelectedNodes()">全选启用</button>
             <button class="btn btn-secondary btn-sm" onclick="disableSelectedNodes()">全选停用</button>
             <button class="btn btn-danger btn-sm" onclick="deleteSelectedNodes()">批量删除</button>
           </div>
@@ -3101,8 +3102,8 @@
         try {
           const parsedNode = parseProxyUri(line);
           if (parsedNode) {
-            // 自动判断 51/52 质量段
-            const isHighQuality = /(住宅|ISP|原生|家宽|residential|高速)/i.test(parsedNode.name);
+            // 自动判断 51/52 质量段（仅凭「家宽」字样不算，见 isHighQualityNode）
+            const isHighQuality = isHighQualityNode(parsedNode.name);
             parsedNode.segment = isHighQuality ? 51 : 52;
             parsedNode.group = targetGroup;
 
@@ -3229,7 +3230,7 @@
           protocol: pn.protocol,
           group: sub.group || '订阅节点',
           port: null, // 端口由后端按段自动分配
-          segment: /(住宅|ISP|原生|家宽|residential|高速)/i.test(pn.name || '') ? 51 : 52,
+          segment: isHighQualityNode(pn.name || '') ? 51 : 52,
           authUser: authUser || randStr(8),
           authPass: authPass || randStr(12),
           entryProto: 'mixed',
@@ -3270,7 +3271,7 @@
           dup++;
           return;
         }
-        const isHighQuality = /(住宅|ISP|原生|家宽|residential|高速)/i.test(pn.name || '');
+        const isHighQuality = isHighQualityNode(pn.name || '');
         const targetPort = getNextAvailablePort(isHighQuality ? 51001 : 52001);
         nodeState.push({
           id: 'node-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
@@ -3650,6 +3651,12 @@
       return candidate;
     }
 
+    // 判断是否高质量节点（51 段）。仅凭节点名「家宽」字样不算——那是机场营销命名，
+    // 不代表真实住宅/ISP IP；只有明确标识（住宅/ISP/原生/residential/高速）才归 51 段。
+    function isHighQualityNode(name) {
+      return /(住宅|ISP|原生|residential|高速)/i.test(name || '');
+    }
+
     function checkPortConflict(portValue, currentId) {
       const portNum = parseInt(portValue);
       if (isNaN(portNum)) return true;
@@ -3770,12 +3777,15 @@
     }
 
     function updateGroupsDropdowns() {
-      const groups = Array.from(new Set(nodeState.map(n => n.group || '默认分组')));
+      // 停用节点独立显示：分组下拉只列启用节点的分组（不含 disabled，disabled 只在「停用节点」里看）
+      const enabledNodes = nodeState.filter(n => n.status !== 'disabled');
+      const groups = Array.from(new Set(enabledNodes.map(n => n.group || '默认分组')));
+      const hasDisabled = nodeState.some(n => n.status === 'disabled');
 
       const filterSel = document.getElementById('filter-group');
       const curFilter = filterSel.value;
       filterSel.innerHTML = '<option value="ALL">全部分组</option>'
-        + (nodeState.some(n => n.status === 'disabled') ? '<option value="__DISABLED__">停用节点</option>' : '')
+        + (hasDisabled ? '<option value="__DISABLED__">停用节点</option>' : '')
         + groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
       filterSel.value = (curFilter === '__DISABLED__' || groups.includes(curFilter)) ? curFilter : 'ALL';
 
@@ -3889,9 +3899,10 @@
       const searchKw = document.getElementById('search-keyword').value.toLowerCase().trim();
 
       const filtered = nodeState.filter(node => {
-        // 「停用节点」特殊分组：跨分组显示全部 disabled 节点
-        const matchGroup = (selectedGroup === 'ALL'
-          || (selectedGroup === '__DISABLED__' ? node.status === 'disabled' : node.group === selectedGroup));
+        // 停用节点独立显示：不在「全部/具体分组」里出现，只在「停用节点」筛选下显示
+        if (selectedGroup === '__DISABLED__') return node.status === 'disabled';
+        if (node.status === 'disabled') return false;
+        const matchGroup = (selectedGroup === 'ALL' || node.group === selectedGroup);
         const matchKw = !searchKw || node.name.toLowerCase().includes(searchKw) || String(node.port).includes(searchKw) || (node.exitIp && node.exitIp.includes(searchKw));
         return matchGroup && matchKw;
       });
@@ -4091,6 +4102,35 @@
           addLog('WARN', `批量删除了 ${selectedIds.length} 个节点`);
           saveNodesToStorage();
         }
+      }
+    }
+
+    // 批量启用选中节点（状态置 enabled，恢复参与探活/轮询；后端 PATCH + 重建配置）
+    function enableSelectedNodes() {
+      const selectedIds = Array.from(document.querySelectorAll('.chk-node:checked')).map(c => c.value);
+      if (selectedIds.length === 0) {
+        alert('请先勾选需要启用的节点！');
+        return;
+      }
+      if (!confirm(`确认启用选中的 ${selectedIds.length} 个节点？启用后恢复参与探活和代理池轮询。`)) return;
+      const doEnable = () => {
+        nodeState.forEach(n => { if (selectedIds.includes(n.id) && n.status === 'disabled') n.status = 'enabled'; });
+        addLog('INFO', `批量启用了 ${selectedIds.length} 个节点`);
+        try { api('/api/config/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch(e) {}
+        renderAll();
+      };
+      if (window.__backendMode) {
+        const reqs = selectedIds.map(id =>
+          api('/api/nodes/' + encodeURIComponent(id), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'enabled' }),
+          })
+        );
+        Promise.allSettled(reqs).then(doEnable);
+      } else {
+        saveNodesToStorage();
+        doEnable();
       }
     }
 
