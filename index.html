@@ -2184,6 +2184,10 @@
           addLog('SUCCESS', '登录成功');
           // 登录成功后连接真实流量 SSE（此前未登录时的连接已被 401 拒绝）
           startTrafficSSE();
+          // 登录成功后再加载节点：页面加载时未登录 /api/nodes 返回 401，会误判
+          // "后端不可达" 而 __backendMode 未置位 → 导入/保存只写 localStorage 不落库。
+          // 登录后带 token 重新拉取，置位后端模式，后续导入/保存才真正落 DB。
+          loadNodesFromBackendOrStorage();
         }
       } catch (e) { errEl.textContent = '网络错误：' + e.message; }
     }
@@ -2224,6 +2228,8 @@
           localStorage.setItem(AUTH_TOKEN_KEY, authToken);
           // token 已变更，旧 SSE 连接失效，用新 token 重连
           startTrafficSSE();
+          // 首次登录强制改密场景：改密成功后同样重新加载节点（置位后端模式）
+          loadNodesFromBackendOrStorage();
         }
         if (fromFirstLogin) {
           document.getElementById('pwd-overlay').style.display = 'none';
@@ -2757,6 +2763,15 @@
               n.entryProto = n.entryProto || 'mixed';
               return n;
             });
+            // 后端空 + 浏览器 localStorage 有旧节点（历史 bug 遗留：保存只写 localStorage）
+            // → 提示一键迁移，否则用户以为节点丢了
+            const localNodes = loadLocalNodes();
+            if (data.items.length === 0 && localNodes.length > 0 && !window.__migratePromptShown) {
+              window.__migratePromptShown = true;
+              if (confirm(`检测到本地浏览器中还保存着 ${localNodes.length} 个节点（早期版本未同步到服务器）。\n\n是否一键导入到服务器？`)) {
+                migrateLocalNodesToBackend(localNodes);
+              }
+            }
             renderAll();
             return;
           }
@@ -2765,6 +2780,45 @@
       // 后端不可达：回退 localStorage（绝不用 demo 自动填充）
       loadNodesFromStorage();
       renderAll();
+    }
+
+    function loadLocalNodes() {
+      try {
+        const data = localStorage.getItem(STORAGE_NODES_KEY);
+        return data ? JSON.parse(data) : [];
+      } catch(e) { return []; }
+    }
+
+    async function migrateLocalNodesToBackend(localNodes) {
+      // 把浏览器 localStorage 里的旧节点批量导入后端（带 entryProto 兼容）
+      const payload = localNodes.map(n => ({
+        name: n.name || '未命名',
+        protocol: n.protocol || 'shadowsocks',
+        group: n.group || '默认分组',
+        port: n.port || null,
+        segment: n.segment || null,
+        authUser: n.authUser || null,
+        authPass: n.authPass || null,
+        entryProto: n.entryProto || 'mixed',
+        ssPass: n.ssPass || null,
+        rawConfig: n.rawConfig || {},
+      }));
+      try {
+        const resp = await api('/api/nodes/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nodes: payload }),
+        });
+        if (!resp.ok) throw new Error('迁移失败 ' + resp.status);
+        const data = await resp.json();
+        addLog('SUCCESS', `本地节点迁移完成：成功 ${data.created} 个，跳过 ${data.skipped} 个`);
+        if (data.created > 0) {
+          localStorage.removeItem(STORAGE_NODES_KEY); // 迁移成功清掉本地残留
+          loadNodesFromBackendOrStorage();
+        }
+      } catch (err) {
+        addLog('ERROR', '本地节点迁移失败: ' + err.message);
+      }
     }
 
     function saveSystemSettings() {
