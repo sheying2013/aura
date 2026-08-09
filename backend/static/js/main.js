@@ -105,6 +105,8 @@ const I18N_DICT = {
     "DISABLE": "停用",
     "ENABLE": "启用",
     "DROP": "删除",
+    "EXPORT": "导出",
+    "RESET": "重置",
     "SYNC": "刷新",
     "Subscription URL": "订阅链接（URL）",
     "Sub Name (Optional)": "订阅名称(可选)",
@@ -552,6 +554,12 @@ function formatBytes(bytes) {
 }
 
 /** HTML 转义（节点名/分组/订阅 URL 等外部可控数据渲染前必须调用） */
+/** 按当前语言取 I18N 文案（缺翻译时回退原文） */
+function L(key) {
+    const t = I18N_DICT[key];
+    return (t !== undefined && t !== '') ? t : key;
+}
+
 function escapeHtml(str) {
     if (str === null || str === undefined) return '';
     return String(str)
@@ -1031,12 +1039,12 @@ function renderNodesTable() {
             <td style="font-family: var(--font-mono); color: ${node.ping > 0 ? (node.ping < 200 ? 'var(--success)' : 'var(--rock)') : 'var(--danger)'}">${node.ping > 0 ? node.ping + ' ms' : '--'}</td>
             <td style="font-family: var(--font-mono);">${formatBytes(totalNodeTraffic)}</td>
             <td style="text-align: center;">
-                <div style="display:flex; gap:6px; justify-content:center;">
-                    <button class="btn-action" onclick="pingSingleNode('${esc(node.id)}')">PING</button>
-                    <button class="btn-action" onclick="openEditNodeModal('${esc(node.id)}')">EDIT</button>
-                    <button class="btn-action" onclick="exportSingleNode('${esc(node.id)}')">EXPORT</button>
-                    <button class="btn-action ${node.status === 'online' ? 'danger' : ''}" onclick="toggleNodeEnable('${esc(node.id)}')">${node.status === 'online' ? 'DISABLE' : 'ENABLE'}</button>
-                    <button class="btn-action danger" onclick="deleteSingleNode('${esc(node.id)}')">DROP</button>
+                <div style="display:flex; gap:3px; justify-content:center;">
+                    <button class="btn-action" onclick="pingSingleNode('${esc(node.id)}')">${L('PING')}</button>
+                    <button class="btn-action" onclick="openEditNodeModal('${esc(node.id)}')">${L('EDIT')}</button>
+                    <button class="btn-action" onclick="exportSingleNode('${esc(node.id)}')">${L('EXPORT')}</button>
+                    <button class="btn-action ${node.status === 'online' ? 'danger' : ''}" onclick="toggleNodeEnable('${esc(node.id)}')">${node.status === 'online' ? L('DISABLE') : L('ENABLE')}</button>
+                    <button class="btn-action danger" onclick="deleteSingleNode('${esc(node.id)}')">${L('DROP')}</button>
                 </div>
             </td>
         `;
@@ -1653,7 +1661,7 @@ function renderTrafficTable() {
             <td>${formatBytes(node.upTraffic || 0)}</td>
             <td>${formatBytes(node.downTraffic || 0)}</td>
             <td style="color: var(--rock); font-family: var(--font-mono);">${formatBytes(totalBytes)}</td>
-            <td><button class="btn-action danger" onclick="resetNodeTraffic('${escapeHtml(node.id)}')">RESET</button></td>
+            <td><button class="btn-action danger" onclick="resetNodeTraffic('${escapeHtml(node.id)}')">${L('RESET')}</button></td>
         `;
         tbody.appendChild(tr);
     });
@@ -1782,9 +1790,9 @@ function renderSubsList() {
                 <div style="font-size: 10px; opacity:0.6;">${escapeHtml(s.url)}</div>
             </div>
             <div style="display:flex; gap:6px;">
-                <button class="btn-action" onclick="openEditSubModal('${escapeHtml(s.id)}')">EDIT</button>
-                <button class="btn-action" onclick="refreshSub('${escapeHtml(s.id)}')">SYNC</button>
-                <button class="btn-action danger" onclick="deleteSub('${escapeHtml(s.id)}')">DROP</button>
+                <button class="btn-action" onclick="openEditSubModal('${escapeHtml(s.id)}')">${L('EDIT')}</button>
+                <button class="btn-action" onclick="refreshSub('${escapeHtml(s.id)}')">${L('SYNC')}</button>
+                <button class="btn-action danger" onclick="deleteSub('${escapeHtml(s.id)}')">${L('DROP')}</button>
             </div>
         </div>
     `).join('');
@@ -1808,9 +1816,9 @@ function renderSubsList() {
                 <td>${badge}</td>
                 <td>
                     <div style="display:flex; gap:6px;">
-                        <button class="btn-action" onclick="openEditSubModal('${escapeHtml(s.id)}')">EDIT</button>
-                        <button class="btn-action" onclick="refreshSub('${escapeHtml(s.id)}')">SYNC</button>
-                        <button class="btn-action danger" onclick="deleteSub('${escapeHtml(s.id)}')">DROP</button>
+                        <button class="btn-action" onclick="openEditSubModal('${escapeHtml(s.id)}')">${L('EDIT')}</button>
+                        <button class="btn-action" onclick="refreshSub('${escapeHtml(s.id)}')">${L('SYNC')}</button>
+                        <button class="btn-action danger" onclick="deleteSub('${escapeHtml(s.id)}')">${L('DROP')}</button>
                     </div>
                 </td>
             </tr>`;

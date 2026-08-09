@@ -32,3 +32,7 @@ env/
 .DS_Store
 .claude/
 Thumbs.db
+
+
+# 本地验证日志（团队排查用，不推送）
+验证日志.md
