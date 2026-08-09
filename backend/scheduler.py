@@ -395,6 +395,10 @@ async def _probe_loop() -> None:
 async def _sub_refresh_loop() -> None:
     while True:
         await asyncio.sleep(SUB_REFRESH_INTERVAL)
+        # settings.autoRefresh=false 时跳过自动刷新（前端「每 6 小时自动刷新」开关）
+        settings = db.get_setting("system", {}) or {}
+        if settings.get("autoRefresh") is False:
+            continue
         try:
             await subs_proxy.refresh_subs(all_=True)
         except Exception:

@@ -27,8 +27,18 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 CONFIG_BAK_PATH = os.path.join(DATA_DIR, "config.json.bak")
 LOG_PATH = os.path.join(DATA_DIR, "singbox.log")
 CLASH_HOST = "127.0.0.1"
-# 不用 9090（与其他面板/服务冲突常见），选 9095 避开常见占用
+# 不用 9090（与其他面板/服务冲突常见），选 9095 避开常见占用；
+# 面板设置里的 clashPort 可覆盖（sing-box external_controller 端口必须与探活一致）
 CLASH_PORT = 9095
+
+
+def get_clash_port() -> int:
+    try:
+        settings = db.get_setting("system", {}) or {}
+        p = int(settings.get("clashPort") or CLASH_PORT)
+        return p if 1 <= p <= 65535 else CLASH_PORT
+    except Exception:
+        return CLASH_PORT
 
 # 前端 protocol 值 → sing-box outbound type；None = 不支持（跳过）
 PROTOCOL_TYPE_MAP: Dict[str, Optional[str]] = {
@@ -148,7 +158,7 @@ def get_clash_secret() -> str:
 
 
 def clash_base() -> str:
-    return f"http://{CLASH_HOST}:{CLASH_PORT}"
+    return f"http://{CLASH_HOST}:{get_clash_port()}"
 
 
 def _signal_singbox(sig: signal.Signals) -> int:
@@ -400,7 +410,7 @@ def build_config() -> Dict[str, Any]:
         "log": {"level": "info", "timestamp": True},
         "experimental": {
             "clash_api": {
-                "external_controller": f"{CLASH_HOST}:{CLASH_PORT}",
+                "external_controller": f"{CLASH_HOST}:{get_clash_port()}",
                 "secret": get_clash_secret(),
                 "default_mode": "rule",
             }
@@ -444,9 +454,9 @@ def _detect_port_conflict(ports: Set[int]) -> List[int]:
         for rd in db.list_relay_domains():
             managed.add(int(rd["port"]))
         # sing-box 正运行时自己占着 clash API 端口，不算外部冲突
-        managed.add(CLASH_PORT)
+        managed.add(get_clash_port())
     conflicted = []
-    for p in ports | {CLASH_PORT}:
+    for p in ports | {get_clash_port()}:
         if p in managed:
             continue
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -494,7 +504,7 @@ def is_running() -> bool:
     try:
         import urllib.request
         req = urllib.request.Request(
-            f"http://{CLASH_HOST}:{CLASH_PORT}/version",
+            f"http://{CLASH_HOST}:{get_clash_port()}/version",
             headers={"Authorization": f"Bearer {get_clash_secret()}"},
         )
         r = urllib.request.urlopen(req, timeout=1)
@@ -675,7 +685,7 @@ async def status() -> Dict[str, Any]:
         "uptime": uptime,
         "version": version,
         "clashApiOk": clash_ok,
-        "controller": f"{CLASH_HOST}:{CLASH_PORT}",
+        "controller": f"{CLASH_HOST}:{get_clash_port()}",
     }
 
 

@@ -289,6 +289,25 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
                               "protocol": parts[2], "method": parts[3], "obfs": parts[4],
                               "password": _parse_base64_pwd(parts[5])},
             }
+        # socks5:// / http:// — user:pass@host:port（可省略认证）
+        for prefix, proto, cfg_type in (("socks5://", "socks5", "socks"),
+                                        ("http://", "http", "http")):
+            if line.startswith(prefix):
+                body = line[len(prefix):]
+                cred, sep, hostport = body.rpartition("@")
+                hp = hostport.rsplit(":", 1)
+                if len(hp) != 2:
+                    return None
+                rc = {"server": hp[0], "server_port": int(hp[1])}
+                if sep:
+                    u, _, p = cred.partition(":")
+                    if u:
+                        rc["username"] = u
+                        rc["password"] = p
+                return {
+                    "name": name or f"{proto}-{hp[0]}", "protocol": proto,
+                    "rawConfig": rc,
+                }
     except Exception:
         return None
     return None

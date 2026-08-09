@@ -38,14 +38,19 @@ def _client_ip(request: Request) -> str:
 
 
 def require_auth(request: Request) -> None:
-    """所有 /api 请求必须带有效 Bearer token。AUTH_DISABLED=1 时跳过（本地调试用）。"""
+    """所有 /api 请求必须带有效 Bearer token。AUTH_DISABLED=1 时跳过（本地调试用）。
+
+    兼容 query token（?token=）：EventSource 无法自定义 header，SSE 端点用它带 token。
+    """
     if os.environ.get("AUTH_DISABLED") == "1":
         return
+    token = ""
     auth_header = request.headers.get("authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="未登录或登录已过期")
-    token = auth_header[len("Bearer "):].strip()
-    if not auth.verify_token(token):
+    if auth_header.startswith("Bearer "):
+        token = auth_header[len("Bearer "):].strip()
+    else:
+        token = request.query_params.get("token", "")
+    if not token or not auth.verify_token(token):
         raise HTTPException(status_code=401, detail="未登录或登录已过期")
 
 
@@ -54,8 +59,13 @@ async def lifespan(app: FastAPI):
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(STATIC_DIR, exist_ok=True)
     db.init_db()
-    # 拉起 sing-box（若已有配置）
+    # 有配置时先按当前 DB 重建（settings 可能已改 clashPort/listenIp 等，
+    # 旧 config.json 可能是过期端口生成 → sing-box 起不来）再拉起
     if os.path.exists(config_manager.CONFIG_PATH) or os.path.exists(config_manager.CONFIG_BAK_PATH):
+        try:
+            await config_manager.apply_config()
+        except Exception:
+            pass
         await config_manager.start()
     # 后台任务
     scheduler.start_scheduler(asyncio.get_event_loop())
@@ -165,7 +175,23 @@ def create_node(body: models.NodeCreate):
 @app.post("/api/nodes/batch", response_model=models.NodeBatchResponse, dependencies=[Depends(require_auth)])
 def create_node_batch(body: models.NodeBatchRequest):
     prepared = []
+    skipped_unparsable = 0
     for n in body.nodes:
+        rc = n.rawConfig or {}
+        # 前端只传整条 URI（rawConfig.uri）→ 用完整解析器补 server/port/password 等结构字段
+        if rc.get("uri") and not rc.get("server"):
+            parsed = subs_proxy._parse_link(rc["uri"])
+            if not parsed:
+                # 无法解析的 URI 直接跳过：不产生 server/port 为空的坏节点
+                # （会污染批内端口分配，并在 config 生成时产出非法 outbound 致整批 apply 失败）
+                skipped_unparsable += 1
+                continue
+            rc = {**parsed.get("rawConfig", {}), "uri": rc["uri"]}
+            n_name = parsed.get("name") or n.name
+            n_proto = parsed.get("protocol") or n.protocol
+            n = models.NodeCreate(
+                **{**n.model_dump(), "name": n_name, "protocol": n_proto, "rawConfig": rc}
+            )
         prepared.append({
             "id": db.new_node_id(),
             "name": n.name,
@@ -181,7 +207,7 @@ def create_node_batch(body: models.NodeBatchRequest):
             "exitIp": n.exitIp or "N/A",
             "upTraffic": n.upTraffic or 0,
             "downTraffic": n.downTraffic or 0,
-            "rawConfig": n.rawConfig or {},
+            "rawConfig": rc,
             "subId": n.subId,
             "subName": n.subName,
             "stale": False,
@@ -189,7 +215,10 @@ def create_node_batch(body: models.NodeBatchRequest):
             "entryProto": n.entryProto or "mixed",
             "ssPass": n.ssPass,
         })
-    return db.create_node_batch(prepared)
+    result = db.create_node_batch(prepared)
+    if skipped_unparsable:
+        result["skipped"] += skipped_unparsable
+    return result
 
 
 @app.patch("/api/nodes/{node_id}", response_model=models.Node, dependencies=[Depends(require_auth)])
@@ -402,6 +431,18 @@ def create_sub(body: models.SubCreate):
 def delete_sub(sub_id: str):
     if not db.delete_sub(sub_id):
         raise HTTPException(status_code=404, detail="订阅不存在")
+
+
+@app.patch("/api/subs/{sub_id}", response_model=models.Subscription, dependencies=[Depends(require_auth)])
+def patch_sub(sub_id: str, body: dict):
+    """编辑订阅（名称/链接/分组），仅接受白名单字段。"""
+    allowed = {k: v for k, v in body.items() if k in ("name", "url", "group") and v is not None}
+    if not allowed:
+        raise HTTPException(status_code=400, detail="无可更新字段")
+    sub = db.update_sub(sub_id, allowed)
+    if not sub:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    return sub
 
 
 @app.post("/api/subs/{sub_id}/toggle", response_model=models.Subscription, dependencies=[Depends(require_auth)])

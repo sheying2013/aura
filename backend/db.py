@@ -713,7 +713,7 @@ def update_sub(sub_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
             return None
         allowed = {
             "name": "name", "group": '"group"', "enabled": "enabled",
-            "last_refresh": "last_refresh", "node_count": "node_count",
+            "url": "url", "last_refresh": "last_refresh", "node_count": "node_count",
             "last_error": "last_error", "snapshot": "snapshot",
         }
         sets = []
