@@ -179,10 +179,16 @@ _guard_paused = False
 # ---------- 探活 ----------
 
 # 连续失败自动处理阈值
-# 连续失败自动处理阈值（调保守：测活弱判定 + http:// testUrl 置空 bug 曾导致大量误杀）
-DISABLE_AFTER_FAILS = 8   # 连续失败 ≥8 次 → 自动停用（探活误判率高，需更高阈值才停）
-DELETE_AFTER_FAILS = 20   # 连续失败 ≥20 次 → 自动删除（释放端口；保守防止误删）
+# 调保守（2026-08-09 优化）：探活是弱判定（TCP/TLS 握手），单轮抖动/节点风控瞬时拒绝
+# 很常见。① 每轮 delay 失败已重试 1 次（吸收 reload/抖动瞬时失败）；② 握手成功即判在线，
+# 出口 IP 查询失败不再判死（IP 只是情报，不反证转发能力）；③ 阈值抬高——误停用要人工
+# 恢复（8 分钟 12 轮连续失败才停），删除阈值 30 基本只在节点彻底失联后触发。
+# 注意：disabled 节点不再被探活，计数冻结——DELETE_AFTER_FAILS 只在未到 DISABLE 前
+# 连续失败累计时触发（计数同时满足 12 与 30 前先被 12 停用，故 30 实际是死阈值保险）。
+DISABLE_AFTER_FAILS = 12  # 连续失败 ≥12 次（约 12 轮×60s）→ 自动停用
+DELETE_AFTER_FAILS = 30   # 连续失败 ≥30 次 → 自动删除（保险阈值，保守防止误删）
 PROBE_CONCURRENCY = 24    # 探活并发上限（176 全并发会瞬时打满网络/触发风控，限流）
+PROBE_DELAY_RETRY = 1     # 每轮 delay 失败重试次数（吸收 reload/瞬时抖动，防单次抖动误杀）
 
 async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
                       include_disabled: bool = False) -> List[Dict[str, Any]]:
@@ -227,37 +233,53 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
         # 导致探活测的不是配置的 URL、离线判定失真——强制回退 https 语义
         if not url or not str(url).startswith("https://"):
             url = "https://www.gstatic.com/generate_204"
-        try:
-            async with __import__("httpx").AsyncClient(timeout=4.0) as client:
-                r = await client.get(
-                    f"{cm.clash_base()}/proxies/{tag}/delay",
-                    params={"url": url, "timeout": "3000"},
-                    headers={"Authorization": f"Bearer {cm.get_clash_secret()}"},
-                )
-            if r.status_code == 200 and r.json().get("delay"):
-                # clash delay 只证明 TCP/TLS 握手能过（HEAD 不校验状态码，握手成功≠可用）。
-                # 已有出口 IP 的节点：delay 足够（前轮已全链路验证过）。首次/无 IP 节点：
-                # 追加真实出口链路验证（经 inbound curl 真实请求），能拿非空 IP 才判在线，
-                # 否则降级为离线——避免"握手通但实际不可用"的假在线。
-                cur_ip = node.get("exitIp")
-                if cur_ip and cur_ip not in ("N/A", "1.1.1.1"):
-                    return {"id": node["id"], "tag": tag, "ping": r.json().get("delay"),
-                            "status": "online"}
-                fetched = await _fetch_exit_ip(node)
-                if not fetched:
-                    return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline",
-                            "error": "握手成功但出口链路不可用"}
-                return {"id": node["id"], "tag": tag, "ping": r.json().get("delay"),
-                        "status": "online", "exitIp": fetched}
-            msg = None
+
+        async def _delay_once() -> Optional[Dict[str, Any]]:
+            """单次 clash delay 探测。返回 JSON dict；HTTP 失败/无 delay 返回 None。"""
             try:
-                msg = r.json().get("message")
+                async with __import__("httpx").AsyncClient(timeout=4.0) as client:
+                    r = await client.get(
+                        f"{cm.clash_base()}/proxies/{tag}/delay",
+                        params={"url": url, "timeout": "3000"},
+                        headers={"Authorization": f"Bearer {cm.get_clash_secret()}"},
+                    )
+                if r.status_code == 200:
+                    return r.json()
             except Exception:
-                pass
-            return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline",
-                    "error": msg or f"HTTP {r.status_code}"}
-        except Exception as e:
-            return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline", "error": str(e)}
+                return None
+            return None
+
+        # 失败重试：单轮 delay 抖动（reload 窗口/节点瞬时 RST）不该计一败。
+        # 重试 1 次（共 2 次机会），仍失败才判离线——阈值随之可以放宽。
+        resp = None
+        last_msg = None
+        for _ in range(PROBE_DELAY_RETRY + 1):
+            data = await _delay_once()
+            if data and data.get("delay"):
+                resp = data
+                break
+            if data:
+                last_msg = data.get("message")
+        if resp is not None:
+            # clash delay 只证明 TCP/TLS 握手能过（HEAD 不校验状态码，握手成功≠可用）。
+            # 已有出口 IP 的节点：delay 足够（前轮已全链路验证过）。首次/无 IP 节点：
+            # 追加真实出口链路验证（经 inbound 真实请求）——但注意：出口 IP 查询失败
+            # **不判死**（2026-08-09 优化）：握手已成功说明节点转发能力正常，出口 IP
+            # 只是情报补充（_lazy_enrich_ip 会异步重查），单次 socks5 查询超时/被风控
+            # 拒绝不应反过来把可用节点计失败。拿到 IP 顺手落库加速情报。
+            cur_ip = node.get("exitIp")
+            if cur_ip and cur_ip not in ("N/A", "1.1.1.1"):
+                return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
+                        "status": "online"}
+            fetched = await _fetch_exit_ip(node)
+            if not fetched:
+                return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
+                        "status": "online",
+                        "error": "出口IP查询失败(握手已通,情报异步补)"}
+            return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
+                    "status": "online", "exitIp": fetched}
+        return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline",
+                "error": last_msg or "delay探测失败"}
 
     if not nodes:
         return []
