@@ -4141,8 +4141,17 @@
     }
 
     // 出口 IP 情报渲染辅助
-    function exitTypeLabel(type) {
-      return { residential: '住宅', hosting: '数据中心', proxy: '代理/VPN', unknown: '' }[type] || '';
+    function exitTypeLabel(type, risk) {
+      const map = { residential: '住宅', hosting: '数据中心', proxy: '代理/VPN', unknown: '' };
+      const label = map[type];
+      if (label) return label;
+      // exitType=unknown 时根据 risk 风控值推测类型
+      if (type === 'unknown' && risk != null) {
+        if (risk <= 30) return '住宅/ISP';
+        if (risk <= 70) return '数据中心';
+        return '代理/VPN';
+      }
+      return '';
     }
     function exitScoreClass(score) {
       if (score == null || score === '') return '';
@@ -4168,7 +4177,7 @@
     function renderExitIp(n) {
       const esc = v => escapeHtml(v);
       const flag = esc(n.exitFlag || '');
-      const typeLabel = exitTypeLabel(n.exitType);
+      const typeLabel = exitTypeLabel(n.exitType, n.exitRisk);
       const score = n.exitScore;
       // score 为 0 视为无数据（ipinfo 双源失败），不渲染误导性低分徽标
       const hasScore = score > 0;
