@@ -1964,6 +1964,14 @@
             </select>
             <div style="font-size: 12px; color: var(--ink-gray); margin-top: 4px;">导入的 ss/vless/trojan/socks/http 节点统一转换为该出口协议对外提供。</div>
           </div>
+
+          <div class="form-group">
+            <label class="form-label">订阅来源（可选）</label>
+            <select id="sub-source" class="form-select">
+              <option value="">不关联订阅</option>
+            </select>
+            <div style="font-size: 12px; color: var(--ink-gray); margin-top: 4px;">选择后导入的节点在备注列显示订阅名，便于识别哪个订阅失效。</div>
+          </div>
         </div>
 
         <div class="form-group" id="import-pass-group" style="display:none;">
@@ -3142,6 +3150,17 @@
        5. 节点解析与导入逻辑 (真实解析器)
        ========================================== */
     let __importInFlight = false;
+    // 批量导入「订阅来源」下拉填充：列出 SubscriptionManager 的订阅，选中后导入节点带 subId/subName
+    function populateImportSubSource() {
+      const sel = document.getElementById('sub-source');
+      if (!sel) return;
+      const subs = (window.SubscriptionManager && typeof window.SubscriptionManager.getSubs === 'function')
+        ? window.SubscriptionManager.getSubs() : [];
+      sel.innerHTML = '<option value="">不关联订阅</option>' + subs.map(s =>
+        `<option value="${escapeHtml(s.id)}|${escapeHtml(s.name || s.url.slice(0, 30))}">${escapeHtml(s.name || '未命名')}</option>`
+      ).join('');
+    }
+
     function handleBatchImport() {
       // 防重入：导入中禁按钮，避免重复点击提交多个 batch/apply 排队
       if (window.__importInFlight) { addLog('WARN', '导入进行中，请稍候…'); return; }
@@ -3160,6 +3179,10 @@
       const authPass = document.getElementById('import-auth-pass').value.trim();
       const entryProto = document.getElementById('import-entry-proto') ? document.getElementById('import-entry-proto').value : 'mixed';
       const ssPass = document.getElementById('import-ss-pass') ? document.getElementById('import-ss-pass').value.trim() : '';
+      // 订阅来源：批量导入时选中的订阅（subId|subName），节点备注列可显示订阅名
+      const subSource = (document.getElementById('sub-source') ? document.getElementById('sub-source').value : '').split('|');
+      const importSubId = subSource.length > 1 ? subSource[0] : '';
+      const importSubName = subSource.length > 1 ? subSource[1] : '';
 
       // 持久化 socks5 认证，下次打开批量导入自动回填
       try {
@@ -3219,6 +3242,11 @@
             // 出口协议：按用户选择设置（mixed=转socks5+http；ss=转Shadowsocks）
             parsedNode.entryProto = entryProto;
             if (entryProto === 'ss') parsedNode.ssPass = ssPass || ('sb' + Math.random().toString(36).slice(2, 10));
+            // 订阅来源：批量导入关联订阅，备注列显示订阅名
+            if (importSubId) {
+              parsedNode.subId = importSubId;
+              parsedNode.subName = importSubName;
+            }
 
             importedNodes.push(parsedNode);
             importedCount++;
@@ -3979,6 +4007,8 @@
           if (saved.user) document.getElementById('import-auth-user').value = saved.user;
           if (saved.pass) document.getElementById('import-auth-pass').value = saved.pass;
         } catch (e) {}
+        // 订阅来源下拉填充（批量导入可关联订阅，备注列显示订阅名）
+        populateImportSubSource();
       }
     }
 
@@ -4123,7 +4153,13 @@
     }
     // 订阅来源徽标：有 subName 且非空才显示；stale 节点标警示色
     function renderSubBadge(n) {
-      const sn = n.subName;
+      // subName 优先；为空但有 subId 时从订阅列表反查（覆盖旧节点无 subName 落库的场景）
+      let sn = n.subName;
+      if (!sn && n.subId && window.SubscriptionManager && typeof window.SubscriptionManager.getSubs === 'function') {
+        const subs = window.SubscriptionManager.getSubs();
+        const hit = subs.find(s => s.id === n.subId);
+        sn = hit ? (hit.name || '') : '';
+      }
       if (!sn) return '';
       const cls = n.stale ? 'sub-tag stale' : 'sub-tag';
       return `<span class="${cls}" title="来自订阅 ${escapeHtml(sn)}${n.subId ? '（' + escapeHtml(n.subId) + '）' : ''}${n.stale ? ' · 订阅刷新失败，使用上次快照' : ''}">${iconSvg('subscription')}${escapeHtml(sn)}</span>`;
