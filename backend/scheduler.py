@@ -17,25 +17,70 @@ MAX_RESTARTS_PER_MIN = 3
 # IP 情报惰性补查：信号量限并发（ipinfo.io 免费 5 万次/月），仅补缺情报的节点
 _ip_enrich_sem = asyncio.Semaphore(8)
 _ip_enrich_pending: set = set()  # 防同一节点并发重复查
+_ip_enrich_last: Dict[str, float] = {}  # 节点 → 上次补查时间（防每轮探活重复查）
+_ENRICH_COOLDOWN = 300  # 5 分钟冷却：补查后即使情报不全也不重查（避免每轮 curl 所有节点）
+
+
+async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
+    """经节点自身 socks5 代理查真实出口 IP（复用 app.py 手动查出口的逻辑）。
+
+    仅探活确认在线后调用：节点不可用则代理连不上，返回 None。
+    """
+    port = node.get("port")
+    user = node.get("authUser") or "user"
+    passwd = node.get("authPass") or "pass"
+    if not port:
+        return None
+    import asyncio as _aio
+    import subprocess
+
+    def _run() -> Optional[str]:
+        try:
+            r = subprocess.run(
+                ["curl", "--socks5-hostname", f"{user}:{passwd}@127.0.0.1:{port}",
+                 "--max-time", "5", "http://api.ipify.org"],
+                capture_output=True, text=True, timeout=8,
+            )
+            ip = r.stdout.strip()
+            return ip if r.returncode == 0 and ip else None
+        except Exception:
+            return None
+
+    return await _aio.to_thread(_run)
 
 
 def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
-    """探活成功后惰性补查出口 IP 情报（归属地/评分 + ippure/ping0 风控值），已齐全则跳过。"""
+    """探活成功后惰性补查出口 IP 情报（归属地/评分 + ippure/ping0 风控值），已齐全则跳过。
+
+    节点 exitIp 为空/N/A/1.1.1.1（新导入未查过出口）时，先经节点自身代理查真实出口 IP
+    并落库，再补情报——否则探活永远触发不了 IP 质量数据（原逻辑直接 return 是根因）。
+    """
     ip = node.get("exitIp")
     nid = node["id"]
     if not ip or ip in ("N/A", "1.1.1.1"):
-        return
-    if node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
+        ip = None  # 需先查出口 IP
+    if ip and node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
         return  # 情报已齐全
     if nid in _ip_enrich_pending:
+        return
+    # 冷却：上次补查后 5 分钟内不重查（情报不全时避免每轮探活重复 curl 所有节点）
+    if time.time() - _ip_enrich_last.get(nid, 0) < _ENRICH_COOLDOWN:
         return
     _ip_enrich_pending.add(nid)
 
     async def _do() -> None:
+        cur_ip = ip  # 闭包捕获外层 ip（内层不重新赋值，避免 UnboundLocalError）
         try:
+            # 无出口 IP → 经节点自身代理查询（探活已确认在线，代理应可达）
+            if not cur_ip:
+                fetched = await _fetch_exit_ip(node)
+                if not fetched:
+                    return
+                cur_ip = fetched
+                db.update_node(nid, {"exitIp": cur_ip})
             async with _ip_enrich_sem:
                 import ipinfo
-                info = await asyncio.to_thread(ipinfo.lookup, ip)
+                info = await asyncio.to_thread(ipinfo.lookup, cur_ip)
             patch = {k: info[k] for k in
                      ("exitCountry", "exitFlag", "exitCity", "exitType", "exitScore")
                      if k in info}
@@ -53,7 +98,7 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
                     elif patch.get("exitCountry"):
                         try:
                             async with _ip_enrich_sem:
-                                p0 = await asyncio.to_thread(ipinfo.lookup_ping0, ip, online[:10])
+                                p0 = await asyncio.to_thread(ipinfo.lookup_ping0, cur_ip, online[:10])
                             if p0.get("exitRisk") is not None:
                                 patch["exitRisk"] = p0["exitRisk"]
                         except Exception:
@@ -66,6 +111,9 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
             pass
         finally:
             _ip_enrich_pending.discard(nid)
+            _ip_enrich_last[nid] = time.time()  # 记录补查时间（冷却用）
+            if len(_ip_enrich_last) > 5000:  # 防无限增长
+                _ip_enrich_last.clear()
 
     asyncio.create_task(_do())
 
@@ -152,6 +200,8 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
         nid = node["id"]
         if res.get("status") == "online":
             db.update_node_probe(nid, res.get("ping", 0), "online")  # 成功清零
+            # 探活成功 → 同步 node 快照状态为 online，供 _lazy_enrich_ip 风控补查用
+            node["status"] = "online"
             _lazy_enrich_ip(node)
             continue
         if nid in manual_disabled:

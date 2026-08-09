@@ -27,6 +27,14 @@ class NodeCreate(BaseModel):
     downTraffic: Optional[int] = None
     entryProto: Optional[str] = "mixed"  # mixed(ss+http) | ss
     ssPass: Optional[str] = None
+    # IP 情报（ipinfo/ippure/ping0 查得，探活/手动查出口后落库）——必须声明，
+    # 否则 Pydantic response_model 序列化时静默丢弃，前端 IP 质量列收不到数据
+    exitCountry: Optional[str] = None
+    exitFlag: Optional[str] = None
+    exitCity: Optional[str] = None
+    exitType: Optional[str] = None
+    exitScore: Optional[int] = None
+    exitRisk: Optional[int] = None
 
 
 class Node(NodeCreate):

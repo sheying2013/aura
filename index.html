@@ -3329,6 +3329,7 @@
           entryProto: 'mixed',
           ssPass: null,
           subId: sub.id,
+          subName: sub.name || '', // 订阅名 → 节点备注列显示来源徽标
           stale: !!stale,
           rawConfig: pn.rawConfig || {},
         }));
@@ -3400,12 +3401,27 @@
       box.innerHTML = subs.map(s => {
         const last = s.lastRefresh ? new Date(s.lastRefresh).toLocaleTimeString('zh-CN', { hour12: false }) : '从未';
         const next = s.lastRefresh ? Math.max(0, Math.round((s.lastRefresh + window.SubscriptionManager.REFRESH_INTERVAL - Date.now()) / 60000)) : '—';
-        const status = s.lastError ? `<span style="color:#e08a7e">${escapeHtml(s.lastError)}</span>` : (s.lastRefresh ? `<span style="color:#6fae8a">${s.nodeCount} 节点</span>` : '<span style="color:var(--ink-gray)">未拉取</span>');
+        // 失效状态徽标：优先失效（红），其次 stale 快照兜底（黄），正常（绿）
+        let statusBadge;
+        if (s.stale || s.lastError) {
+          const isHardFail = s.stale && !(s.snapshot && s.snapshot.length);
+          const text = isHardFail ? '失效' : '降级';
+          const color = isHardFail ? '#e08a7e' : '#e6b45a';
+          const bg = isHardFail ? 'rgba(224,138,126,.12)' : 'rgba(230,180,90,.12)';
+          const tip = s.lastError ? escapeHtml(s.lastError) : (isHardFail ? '订阅抓取失败，无可用快照' : '订阅抓取失败，已用上次快照兜底');
+          statusBadge = `<span style="color:${color};background:${bg};padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600;border:1px solid ${color}33;" title="${tip}">${text}</span>`;
+        } else if (s.lastRefresh) {
+          statusBadge = `<span style="color:#6fae8a;background:rgba(111,174,138,.12);padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600;">可用 · ${s.nodeCount} 节点</span>`;
+        } else {
+          statusBadge = '<span style="color:var(--ink-gray);font-size:12px;">未拉取</span>';
+        }
+        const errHint = s.lastError ? `<span style="color:#a88880;font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(s.lastError)}">${escapeHtml(s.lastError)}</span>` : '';
         return `<div style="display:flex; align-items:center; gap:12px; padding:10px 12px; border-bottom:1px solid rgba(180,165,140,.12); flex-wrap:wrap;">
           <span style="font-weight:600;">${escapeHtml(s.name)}</span>
           <span style="color:var(--ink-gray); font-size:12px; overflow:hidden; text-overflow:ellipsis; max-width:300px;">${escapeHtml(s.url)}</span>
           <span style="font-size:12px; color:var(--ink-gray);">分组: ${escapeHtml(s.group)}</span>
-          <span style="font-size:12px;">${status}</span>
+          <span style="font-size:12px;">${statusBadge}</span>
+          ${errHint}
           <span style="font-size:12px; color:var(--ink-gray);">上次: ${last} · 下次: ${next} 分钟后</span>
           <div style="margin-left:auto; display:flex; gap:6px;">
             <button class="btn btn-ghost btn-sm" onclick="refreshSubAndImport(window.SubscriptionManager.getSubs().find(x=>x.id==='${s.id}'))">立即刷新</button>

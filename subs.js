@@ -295,12 +295,14 @@ const SubscriptionManager = (() => {
       sub.lastRefresh = Date.now();
       sub.nodeCount = nodes.length;
       sub.lastError = null;
+      sub.stale = false;  // 刷新成功 → 清除失效标记
       // last-good 快照：成功后保存节点列表，供失败时回退
       sub.snapshot = nodes;
       save();
       return { ok: true, count: nodes.length };
     } catch (e) {
       sub.lastError = e.message;
+      sub.stale = true;  // 持久化失效标记：刷新失败 → 订阅列表红色"失效"徽标
       // 兜底：失败时若有过往快照，回退到快照（标黄）
       if (sub.snapshot && sub.snapshot.length && onNodeParsed) {
         onNodeParsed(sub, sub.snapshot, { stale: true, error: e.message });
