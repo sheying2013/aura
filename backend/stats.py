@@ -275,17 +275,17 @@ async def _broadcast() -> None:
 # ---------- 生命周期 ----------
 
 def start_tasks(loop: asyncio.AbstractEventLoop) -> None:
-    global _traffic_task, _conn_task
+    global _traffic_task, _conn_task, _tag_map_refresh_task, _broadcast_task
     _refresh_tag_maps()
     _traffic_task = loop.create_task(_traffic_reader())
     _conn_task = loop.create_task(_connections_sampler())
-    loop.create_task(_tag_map_refresh_loop())
-    loop.create_task(_broadcast())
+    _tag_map_refresh_task = loop.create_task(_tag_map_refresh_loop())
+    _broadcast_task = loop.create_task(_broadcast())
 
 
 def stop_tasks() -> None:
-    global _traffic_task, _conn_task
-    for t in (_traffic_task, _conn_task):
+    global _traffic_task, _conn_task, _tag_map_refresh_task, _broadcast_task
+    for t in (_traffic_task, _conn_task, _tag_map_refresh_task, _broadcast_task):
         if t:
             t.cancel()
-    _traffic_task = _conn_task = None
+    _traffic_task = _conn_task = _tag_map_refresh_task = _broadcast_task = None

@@ -551,21 +551,29 @@ def import_nodes(sub_id: str, group: str, sub_name: str, nodes: List[Dict[str, A
 
 async def refresh_sub(sub: Dict[str, Any]) -> Dict[str, Any]:
     """拉取→解析→导入；失败用 last-good snapshot 兜底标 stale。"""
+    sub_id = sub["id"]
     res = await fetch_subscription(sub["url"])
     if res["ok"]:
         nodes = parse_content(res["content"])
         if not nodes:
-            sub = db.update_sub(sub["id"], {"last_error": "解析 0 个节点"})
-            return {"id": sub["id"], "ok": False, "count": 0, "stale": False, "imported": 0, "error": "解析 0 个节点"}
-        imported = import_nodes(sub["id"], sub.get("group", "订阅节点"), sub.get("name", ""), nodes, stale=False)
+            _sub = db.update_sub(sub_id, {"last_error": "解析 0 个节点"})
+            if not _sub:
+                return {"id": sub_id, "ok": False, "count": 0, "stale": False, "imported": 0,
+                        "error": "订阅已被删除"}
+            return {"id": sub_id, "ok": False, "count": 0, "stale": False, "imported": 0,
+                    "error": "解析 0 个节点"}
+        imported = import_nodes(sub_id, sub.get("group", "订阅节点"), sub.get("name", ""), nodes, stale=False)
         # 订阅恢复正常：清除之前失败兜底标的 stale 警示（否则节点永久橙色"刷新失败"）
-        db.unmark_nodes_stale_by_sub(sub["id"])
-        db.update_sub(sub["id"], {
+        db.unmark_nodes_stale_by_sub(sub_id)
+        _sub = db.update_sub(sub_id, {
             "last_refresh": int(__import__("time").time() * 1000),
             "node_count": len(nodes),
             "last_error": None,
             "snapshot": json.dumps(nodes, ensure_ascii=False),
         })
+        if not _sub:
+            return {"id": sub_id, "ok": True, "count": len(nodes), "stale": False,
+                    "imported": imported, "warning": "订阅元数据更新失败（已删除）"}
         # 有新增节点 → 重建 sing-box 配置使新节点立即生效（无新增则跳过热重载）
         if imported["created"] > 0:
             try:

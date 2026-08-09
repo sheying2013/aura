@@ -194,7 +194,8 @@ def create_node_batch(body: models.NodeBatchRequest):
 
 @app.patch("/api/nodes/{node_id}", response_model=models.Node, dependencies=[Depends(require_auth)])
 def patch_node(node_id: str, body: models.NodePatch):
-    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    # exclude_unset=True 只取用户实际传的字段，允许显式传 None 清空可选字段
+    patch = {k: v for k, v in body.model_dump(exclude_unset=True).items()}
     node = db.update_node(node_id, patch)
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
