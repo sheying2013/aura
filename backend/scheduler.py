@@ -33,9 +33,11 @@ def _is_ip_address(s: str) -> bool:
         return False
 
 async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
-    """经节点自身 socks5 代理查真实出口 IP（复用 app.py 手动查出口的逻辑）。
+    """经节点自身代理查真实出口 IP。
 
-    仅探活确认在线后调用：节点不可用则代理连不上，返回 None。
+    - mixed entry（socks5 入口）：经 inbound socks5 代理请求 api.ipify.org
+    - ss entry（Shadowsocks 入口）：无 SOCKS5 握手协议——单跳 ss 落地节点
+      server 域名解析 IP 即出口（如 kookeey.info 系），直接 DNS 解析 rawConfig.server。
     """
     port = node.get("port")
     user = node.get("authUser") or "user"
@@ -43,11 +45,21 @@ async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
     if not port:
         return None
     import asyncio as _aio
+    entry = node.get("entryProto") or "mixed"
 
     def _run() -> Optional[str]:
+        import socket
+        # ss entry：Shadowsocks 无 SOCKS5 握手，单跳节点 server 即出口
+        if entry == "ss":
+            server = ((node.get("rawConfig") or {}).get("server") or "").strip()
+            if not server:
+                return None
+            try:
+                return socket.gethostbyname(server)  # 域名 → 出口 IP
+            except Exception:
+                return None
+        # mixed entry：SOCKS5 握手 → HTTP GET api.ipify.org
         try:
-            import socket
-            # 优先用 Python 原生 socks5 请求（slim 镜像无 curl）
             # 构造 socks5 代理请求：手工 SOCKS5 握手 → HTTP GET api.ipify.org
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5)
@@ -278,7 +290,8 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
             # 只是情报补充（_lazy_enrich_ip 会异步重查），单次 socks5 查询超时/被风控
             # 拒绝不应反过来把可用节点计失败。拿到 IP 顺手落库加速情报。
             cur_ip = node.get("exitIp")
-            if cur_ip and cur_ip not in ("N/A", "1.1.1.1"):
+            # hostname（如 us114.kookeey.info）不是真实出口 IP → 也触发补查
+            if cur_ip and cur_ip not in ("N/A", "1.1.1.1") and _is_ip_address(cur_ip):
                 return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
                         "status": "online"}
             fetched = await _fetch_exit_ip(node)
