@@ -191,17 +191,35 @@ def build_config() -> Dict[str, Any]:
             })
             if sb_type == "vmess":
                 out_item["security"] = cfg.get("security", "auto")
+            # TLS 生成：优先嵌套 tls 字典（clash YAML / JSON 解析后），否则对 vless
+            # 检测平铺 reality 键（vless:// URI 解析把 pbk/sid/spx 等存为平铺键）
             if tls:
                 out_item["tls"] = tls
             elif sb_type == "vless":
-                # vless 订阅节点（clash/vless://）几乎全走 TLS 端口；无 tls 配置时
-                # 按 sni/server 推断。推断场景 server_name 是猜的（IP 节点证书无 SAN），
-                # 必须 insecure 跳过证书校验，否则必然握手失败
-                out_item["tls"] = {
-                    "enabled": True,
-                    "server_name": cfg.get("sni") or cfg.get("server_name") or cfg.get("server", ""),
-                    "insecure": True,
-                }
+                has_reality = cfg.get("pbk") or cfg.get("spx") or cfg.get("public_key")
+                if has_reality:
+                    # reality 协议客户端：server_name 必须填（空→退化成普通 TLS x509），
+                    # 无 sni 用 server 兜底（IP 也行，由 pbk 校验成败），无需 insecure
+                    out_item["tls"] = {
+                        "enabled": True,
+                        "server_name": (cfg.get("sni") or cfg.get("server_name")
+                                        or cfg.get("server") or cfg.get("address", "")),
+                        "reality": {
+                            "enabled": True,
+                            "public_key": cfg.get("pbk") or cfg.get("spx") or cfg.get("public_key", ""),
+                            "short_id": cfg.get("sid") or cfg.get("short_id", ""),
+                        },
+                        "utls": {
+                            "enabled": True,
+                            "fingerprint": cfg.get("fp") or "chrome",
+                        },
+                    }
+                else:
+                    out_item["tls"] = {
+                        "enabled": True,
+                        "server_name": cfg.get("sni") or cfg.get("server_name") or cfg.get("server", ""),
+                        "insecure": True,
+                    }
             if cfg.get("flow"):
                 out_item["flow"] = cfg["flow"]
             tr = _normalize_transport(cfg.get("transport") or cfg.get("streamSettings"))
