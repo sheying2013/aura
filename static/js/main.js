@@ -198,6 +198,9 @@ function setLanguage(lang) {
     const langIcon = document.getElementById('lang-icon');
     if (langIcon) langIcon.innerText = lang === 'zh' ? "AURA / EN" : "AURA / 中文";
     applyTranslation(document.body);
+    // 页面标题随语言切换（title 无 data-orig，直接映射）
+    const titleZh = I18N_DICT['AURA SYSTEM'] || 'Aura - 节点管理系统';
+    document.title = lang === 'zh' ? titleZh : 'AURA SYSTEM';
 }
 
 const btnLang = document.getElementById('btn-lang');
@@ -671,7 +674,15 @@ async function doLogin() {
     const password = passEl ? passEl.value : '';
     if (errEl) errEl.textContent = '';
 
-    if (btn) btn.innerText = "AUTHENTICATING...";
+    if (!username || !password) {
+        if (errEl) errEl.textContent = '请输入用户名和密码';
+        return;
+    }
+    if (btn) {
+        btn.innerText = "AUTHENTICATING...";
+        btn.disabled = true;
+        btn.style.opacity = "0.6";
+    }
     try {
         const r = await fetch('/api/auth/login', {
             method: 'POST',
@@ -681,7 +692,11 @@ async function doLogin() {
         const data = await r.json();
         if (!r.ok) {
             if (errEl) errEl.textContent = data.detail || '登录失败';
-            if (btn) btn.innerText = "INITIALIZE LINK";
+            if (btn) {
+                btn.innerText = "INITIALIZE LINK";
+                btn.disabled = false;
+                btn.style.opacity = "1";
+            }
             return;
         }
         if (btn) {
@@ -709,7 +724,11 @@ async function doLogin() {
         }, 400);
     } catch (e) {
         if (errEl) errEl.textContent = '网络请求失败: ' + e.message;
-        if (btn) btn.innerText = "INITIALIZE LINK";
+        if (btn) {
+            btn.innerText = "INITIALIZE LINK";
+            btn.disabled = false;
+            btn.style.opacity = "1";
+        }
     }
 }
 
@@ -1880,7 +1899,7 @@ function fallbackCopy(text) {
     ta.value = text;
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); addLog('SUCCESS', '配置 JSON 已复制'); }
+    try { document.execCommand('copy'); addLog('SUCCESS', '已复制到剪贴板'); }
     catch (e) { addLog('ERROR', '复制失败: ' + e.message); }
     document.body.removeChild(ta);
 }

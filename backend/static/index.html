@@ -129,6 +129,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
+            pointer-events: auto; /* 显式接管点击，避免 backdrop-filter 层级下点击穿透 */
             transition: opacity 0.8s ease, visibility 0.8s ease;
         }
         .login-screen.hidden {
@@ -1575,5 +1576,5 @@
         </div>
     </div>
 
-    <script src="js/main.js"></script>
+    <script src="js/main.js?v=20260810"></script>
 </body>

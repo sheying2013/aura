@@ -137,11 +137,17 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
             else:
                 # legacy: base64(method:pass@host:port)
                 dec = _b64_decode(body) or body
+                # 名字可能嵌在 base64 载荷内部（如 "...#ss-Test"），外部剥离不到 → 解码后切出
+                frag = ""
+                di = dec.find("#")
+                if di != -1:
+                    frag = dec[di + 1:]
+                    dec = dec[:di]
                 m = re.match(r"^([^:]+):([^@]+)@([^:]+):(\d+)$", dec)
                 if not m:
                     return None
                 return {
-                    "name": name or f"ss-{m.group(3)}", "protocol": "shadowsocks",
+                    "name": name or frag or f"ss-{m.group(3)}", "protocol": "shadowsocks",
                     "rawConfig": {"server": m.group(3), "server_port": int(m.group(4)),
                                   "method": m.group(1), "password": m.group(2)},
                 }
