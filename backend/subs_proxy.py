@@ -211,7 +211,12 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
                     if params.get("path"):
                         rc["transport"]["path"] = params["path"]
                     if params.get("host"):
-                        rc["transport"]["headers"] = {"Host": params["host"]}
+                        # ws 传输 host 在 headers.Host；http/h2 传输 host 在 host 数组
+                        t = rc.get("transport", {}).get("type", "")
+                        if t in ("http", "h2"):
+                            rc["transport"]["host"] = [params["host"]]
+                        else:
+                            rc["transport"]["headers"] = {"Host": params["host"]}
                     if params.get("serviceName"):
                         rc["transport"]["service_name"] = params["serviceName"]
                 if params.get("security") == "reality":

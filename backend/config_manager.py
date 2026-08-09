@@ -66,13 +66,58 @@ def _normalize_transport(tr: Any) -> Optional[Dict[str, Any]]:
     老订阅节点 DB 里可能存字符串（如 "ws"），直接透传会让 check 失败
     （json: cannot unmarshal string into ... transport）。字符串 → {type: str}。
     tcp 是 sing-box 默认传输层，不生成 transport 字段（枚举无 tcp）。
+    类型映射：h2→http（sing-box 无 h2，HTTP/2 由 http 类型承载）。
+    v2ray streamSettings 嵌套结构也在此转换。
     """
     if isinstance(tr, dict):
-        t = tr.get("type")
-        return tr if t and t != "tcp" else None
-    if isinstance(tr, str) and tr and tr != "tcp":
-        return {"type": tr}
+        # v2ray streamSettings 格式：{network: "ws", wsSettings: {path: "/", headers: {...}}}
+        if "network" in tr:
+            mapped = _v2ray_stream_to_transport(tr)
+            if mapped:
+                return mapped
+        t = (tr.get("type") or "").strip()
+        if t and t != "tcp":
+            tr = dict(tr)
+            # 类型映射：h2 → http，grpc → grpc（不变）
+            _type_map = {"h2": "http", "h2c": "http", "httpupgrade": "httpupgrade"}
+            tr["type"] = _type_map.get(t, t)
+            return tr
+        return None
+    if isinstance(tr, str) and tr and tr.strip() != "tcp":
+        t = tr.strip()
+        _type_map = {"h2": "http", "h2c": "http", "httpupgrade": "httpupgrade"}
+        return {"type": _type_map.get(t, t)}
     return None
+
+
+def _v2ray_stream_to_transport(stream: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """v2ray streamSettings → sing-box V2RayTransportOptions"""
+    network = (stream.get("network") or "").strip()
+    if not network or network == "tcp":
+        return None
+    _type_map = {"h2": "http", "ws": "ws", "grpc": "grpc", "httpupgrade": "httpupgrade"}
+    stype = _type_map.get(network, network)
+    result: Dict[str, Any] = {"type": stype}
+    # wsSettings
+    ws = stream.get("wsSettings")
+    if isinstance(ws, dict):
+        if ws.get("path"):
+            result["path"] = ws["path"]
+        if isinstance(ws.get("headers"), dict):
+            result["headers"] = ws["headers"]
+    # grpcSettings
+    grpc = stream.get("grpcSettings")
+    if isinstance(grpc, dict):
+        if grpc.get("serviceName"):
+            result["service_name"] = grpc["serviceName"]
+    # httpSettings (v2ray h2/http)
+    hs = stream.get("httpSettings")
+    if isinstance(hs, dict):
+        if hs.get("path"):
+            result["path"] = hs["path"]
+        if isinstance(hs.get("host"), list) and hs["host"]:
+            result["host"] = hs["host"]
+    return result if result.get("type") else None
 
 
 # 进程状态
@@ -194,6 +239,15 @@ def build_config() -> Dict[str, Any]:
             # TLS 生成：优先嵌套 tls 字典（clash YAML / JSON 解析后），否则对 vless
             # 检测平铺 reality 键（vless:// URI 解析把 pbk/sid/spx 等存为平铺键）
             if tls:
+                # P0 fix: tls dict 有 reality 但缺 server_name → 从 rawConfig 兜底
+                if tls.get("reality") and not tls.get("server_name"):
+                    tls["server_name"] = (cfg.get("sni") or cfg.get("server_name")
+                                          or cfg.get("server") or cfg.get("address", ""))
+                # P0 fix: tls dict 无 server_name 且非 reality → 补 insecure 兜底
+                if not tls.get("server_name") and not tls.get("reality"):
+                    tls["server_name"] = (cfg.get("sni") or cfg.get("server_name")
+                                          or cfg.get("server") or cfg.get("address", ""))
+                    tls["insecure"] = True
                 out_item["tls"] = tls
             elif sb_type == "vless":
                 has_reality = cfg.get("pbk") or cfg.get("spx") or cfg.get("public_key")
@@ -220,7 +274,7 @@ def build_config() -> Dict[str, Any]:
                         "server_name": cfg.get("sni") or cfg.get("server_name") or cfg.get("server", ""),
                         "insecure": True,
                     }
-            if cfg.get("flow"):
+            if sb_type == "vless" and cfg.get("flow"):
                 out_item["flow"] = cfg["flow"]
             tr = _normalize_transport(cfg.get("transport") or cfg.get("streamSettings"))
             if tr:

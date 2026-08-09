@@ -3718,13 +3718,14 @@
         if (q.fp) cfg.fp = q.fp;
         if (q.pbk) cfg.pbk = q.pbk;
         if (q.sid) cfg.sid = q.sid;
-        // 清洗 markdown 自动链接残留（sni=[www.yahoo.com&fp=...](https://... 被渲染破坏）
+        // 兼容 V2RayN 导出格式 servername= 及 Xray 标准格式 insecure=
         if (q.sni) cfg.sni = cleanMdValue(q.sni);
+        if (q.servername) cfg.sni = cfg.sni || cleanMdValue(q.servername);
         if (q.host) cfg.host = cleanMdValue(q.host);
         if (q.path) cfg.path = cleanMdValue(q.path);
         if (q.alpn) cfg.alpn = cleanMdValue(q.alpn);
         if (q.serviceName) cfg.serviceName = q.serviceName;
-        if (q.allowInsecure === '1' || q.allowInsecure === 'true') cfg.insecure = true;
+        if (q.allowInsecure === '1' || q.allowInsecure === 'true' || q.insecure === '1' || q.insecure === 'true') cfg.insecure = true;
         const transportType = q.type || q.net;
         if (transportType && transportType !== 'tcp' && transportType !== 'none') {
           const transport = { type: transportType };
