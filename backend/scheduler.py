@@ -125,8 +125,10 @@ _guard_paused = False
 # ---------- 探活 ----------
 
 # 连续失败自动处理阈值
-DISABLE_AFTER_FAILS = 5   # 连续失败 ≥5 次 → 自动停用（不参与轮询/探活）
-DELETE_AFTER_FAILS = 10   # 连续失败 ≥10 次 → 自动删除（释放端口）
+# 连续失败自动处理阈值（调保守：测活弱判定 + http:// testUrl 置空 bug 曾导致大量误杀）
+DISABLE_AFTER_FAILS = 8   # 连续失败 ≥8 次 → 自动停用（探活误判率高，需更高阈值才停）
+DELETE_AFTER_FAILS = 20   # 连续失败 ≥20 次 → 自动删除（释放端口；保守防止误删）
+PROBE_CONCURRENCY = 24    # 探活并发上限（176 全并发会瞬时打满网络/触发风控，限流）
 
 async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
                       include_disabled: bool = False) -> List[Dict[str, Any]]:
@@ -167,6 +169,10 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
     async def _probe_one(node: Dict[str, Any]) -> Dict[str, Any]:
         tag = cm.outbound_tag(node["protocol"], node["port"])
         url = (db.get_setting("system", {}) or {}).get("testUrl", "https://www.gstatic.com/generate_204")
+        # sing-box clash API 对 http:// 开头 url 会置空并回退测 gstatic（源码 getProxyDelay），
+        # 导致探活测的不是配置的 URL、离线判定失真——强制回退 https 语义
+        if not url or not str(url).startswith("https://"):
+            url = "https://www.gstatic.com/generate_204"
         try:
             async with __import__("httpx").AsyncClient(timeout=4.0) as client:
                 r = await client.get(
@@ -174,9 +180,21 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
                     params={"url": url, "timeout": "3000"},
                     headers={"Authorization": f"Bearer {cm.get_clash_secret()}"},
                 )
-            if r.status_code == 200:
-                delay = r.json().get("delay")
-                return {"id": node["id"], "tag": tag, "ping": delay, "status": "online"}
+            if r.status_code == 200 and r.json().get("delay"):
+                # clash delay 只证明 TCP/TLS 握手能过（HEAD 不校验状态码，握手成功≠可用）。
+                # 已有出口 IP 的节点：delay 足够（前轮已全链路验证过）。首次/无 IP 节点：
+                # 追加真实出口链路验证（经 inbound curl 真实请求），能拿非空 IP 才判在线，
+                # 否则降级为离线——避免"握手通但实际不可用"的假在线。
+                cur_ip = node.get("exitIp")
+                if cur_ip and cur_ip not in ("N/A", "1.1.1.1"):
+                    return {"id": node["id"], "tag": tag, "ping": r.json().get("delay"),
+                            "status": "online"}
+                fetched = await _fetch_exit_ip(node)
+                if not fetched:
+                    return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline",
+                            "error": "握手成功但出口链路不可用"}
+                return {"id": node["id"], "tag": tag, "ping": r.json().get("delay"),
+                        "status": "online", "exitIp": fetched}
             msg = None
             try:
                 msg = r.json().get("message")
@@ -189,7 +207,15 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
 
     if not nodes:
         return []
-    results = await asyncio.gather(*(_probe_one(n) for n in nodes))
+    # 并发限流：176 节点全 gather 会瞬时打满网络/触发节点风控（之前无上限），
+    # 用信号量把同时在建连的探活压到 PROBE_CONCURRENCY 个
+    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+    async def _probe_limited(n: Dict[str, Any]) -> Dict[str, Any]:
+        async with sem:
+            return await _probe_one(n)
+
+    results = await asyncio.gather(*(_probe_limited(n) for n in nodes))
     # 结果落库 + 失败计数 → 自动停用/删除（_probe_one 不落库，避免双重计数）
     # 注意：只标记需要重建，循环结束后统一 apply 一次——每个节点单独 apply_config
     # 会触发大量 reload，sing-box 反复重启累积 TIME-WAIT 导致 bind 冲突（1.7.7 无 SO_REUSEADDR）
@@ -200,8 +226,13 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
         nid = node["id"]
         if res.get("status") == "online":
             db.update_node_probe(nid, res.get("ping", 0), "online")  # 成功清零
+            # 探活真实出口验证拿到的 IP 一并落库（出口链路已验证可用）
+            if res.get("exitIp"):
+                db.update_node(nid, {"exitIp": res["exitIp"]})
+                node["exitIp"] = res["exitIp"]
             # 探活成功 → 同步 node 快照状态为 online，供 _lazy_enrich_ip 风控补查用
             node["status"] = "online"
+            # exitIp 已确认 → 情报补查（归属地/风控）可直接进行，无重复出口查询
             _lazy_enrich_ip(node)
             continue
         if nid in manual_disabled:
@@ -273,6 +304,9 @@ async def _rotate_random_relay() -> None:
     online = [n for n in nodes if n.get("status") == "online"]
     pool = online or nodes
     test_url = (db.get_setting("system", {}) or {}).get("testUrl", "https://www.gstatic.com/generate_204")
+    # 同 probe：sing-box 对 http:// url 置空回退 gstatic，强制 https 语义
+    if not test_url or not str(test_url).startswith("https://"):
+        test_url = "https://www.gstatic.com/generate_204"
     hdrs = {"Authorization": f"Bearer {cm.get_clash_secret()}"}
 
     async def _is_alive(node: Dict[str, Any]) -> bool:

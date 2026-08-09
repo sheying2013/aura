@@ -479,6 +479,12 @@ def get_settings():
 
 @app.put("/api/settings", dependencies=[Depends(require_auth)])
 async def put_settings(body: dict):
+    # testUrl 校验：sing-box clash API 对 http:// url 置空并回退 gstatic，探活测的不是
+    # 配置的 URL → 强制 https://（否则所有节点探活失真，曾导致大量误停用）
+    if body.get("testUrl"):
+        tu = str(body["testUrl"])
+        if tu.startswith("http://"):
+            body["testUrl"] = tu.replace("http://", "https://", 1)
     db.set_setting("system", body)
     # 同步 relay_domains 表（供后端查询用）
     if isinstance(body.get("relayDomains"), list):
