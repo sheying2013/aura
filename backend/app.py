@@ -318,6 +318,10 @@ async def get_exit_ip(node_id: str):
     if not ip:
         raise HTTPException(status_code=502, detail="出口 IP 探测失败")
     patch = {"exitIp": ip}
+    # 域名节点（动态 IP，如 kookeey）：出口 IP 仅用于情报查询，不固化 exitIp 保持域名
+    server = ((node.get("rawConfig") or {}).get("server") or "").strip()
+    if server and not scheduler._is_ip_address(server):
+        patch.pop("exitIp", None)
     # 异步查 IP 情报（ipinfo.io 归属地 + ipapi.is 纯净度评分），失败降级不阻塞
     try:
         import ipinfo

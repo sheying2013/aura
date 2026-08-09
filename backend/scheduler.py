@@ -122,13 +122,17 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
     """
     ip = node.get("exitIp")
     nid = node["id"]
+    # 节点 server 是域名（动态 IP，如 kookeey）→ exitIp 保持域名；解析 IP 仅临时查情报
+    server = ((node.get("rawConfig") or {}).get("server") or "").strip()
+    domain_server = bool(server) and not _is_ip_address(server)
     if not ip or ip in ("N/A", "1.1.1.1"):
         ip = None  # 需先查出口 IP
     # exitIp 存的是 hostname（如 rooster465.autos）→ ipinfo 对 hostname 的
     # country 解析常失败 → 视为无效 IP，重新通过代理查真实 IP
     if ip and not _is_ip_address(ip):
         ip = None
-    if ip and node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
+    # 情报已齐全（域名节点同样适用：之前已用解析 IP 查过 type/risk）→ 跳过
+    if (ip or domain_server) and node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
         return  # 情报已齐全
     if nid in _ip_enrich_pending:
         return
@@ -140,13 +144,18 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
     async def _do() -> None:
         cur_ip = ip  # 闭包捕获外层 ip（内层不重新赋值，避免 UnboundLocalError）
         try:
+            # server 是域名（动态 IP）→ exitIp 保持域名不固化；解析 IP 仅临时查情报
+            server = ((node.get("rawConfig") or {}).get("server") or "").strip()
+            domain_server = bool(server) and not _is_ip_address(server)
             # 无出口 IP → 经节点自身代理查询（探活已确认在线，代理应可达）
             if not cur_ip:
                 fetched = await _fetch_exit_ip(node)
                 if not fetched:
                     return
                 cur_ip = fetched
-                db.update_node(nid, {"exitIp": cur_ip})
+                # 域名节点：临时解析 IP 不写 exitIp（动态 IP 固化会过期）
+                if not domain_server:
+                    db.update_node(nid, {"exitIp": cur_ip})
             async with _ip_enrich_sem:
                 import ipinfo
                 info = await asyncio.to_thread(ipinfo.lookup, cur_ip)
@@ -290,7 +299,10 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
             # 只是情报补充（_lazy_enrich_ip 会异步重查），单次 socks5 查询超时/被风控
             # 拒绝不应反过来把可用节点计失败。拿到 IP 顺手落库加速情报。
             cur_ip = node.get("exitIp")
-            # hostname（如 us114.kookeey.info）不是真实出口 IP → 也触发补查
+            # 节点自身 server 是域名（如 kookeey 动态IP）→ exitIp 保持域名，不固化解析 IP
+            server = ((node.get("rawConfig") or {}).get("server") or "").strip()
+            domain_server = bool(server) and not _is_ip_address(server)
+            # 已有出口 IP 且不是 hostname → 直接用；域名节点/无 IP 节点触发补查
             if cur_ip and cur_ip not in ("N/A", "1.1.1.1") and _is_ip_address(cur_ip):
                 return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
                         "status": "online"}
@@ -299,6 +311,10 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
                 return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
                         "status": "online",
                         "error": "出口IP查询失败(握手已通,情报异步补)"}
+            # 域名节点：出口 IP 是动态的，只用于情报查询，不落库 exitIp（域名保持）
+            if domain_server:
+                return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
+                        "status": "online", "exitIpTmp": fetched}
             return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
                     "status": "online", "exitIp": fetched}
         return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline",
@@ -326,9 +342,12 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
         if res.get("status") == "online":
             db.update_node_probe(nid, res.get("ping", 0), "online")  # 成功清零
             # 探活真实出口验证拿到的 IP 一并落库（出口链路已验证可用）
+            # 域名节点返回 exitIpTmp（临时解析 IP）——不落库，仅同步快照供情报补查
             if res.get("exitIp"):
                 db.update_node(nid, {"exitIp": res["exitIp"]})
                 node["exitIp"] = res["exitIp"]
+            elif res.get("exitIpTmp"):
+                node["exitIp"] = res["exitIpTmp"]  # 快照用临时 IP（不写库），enrich 直接用
             # 探活成功 → 同步 node 快照状态为 online，供 _lazy_enrich_ip 风控补查用
             node["status"] = "online"
             # exitIp 已确认 → 情报补查（归属地/风控）可直接进行，无重复出口查询
