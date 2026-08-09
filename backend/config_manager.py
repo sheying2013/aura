@@ -68,25 +68,33 @@ def _normalize_transport(tr: Any) -> Optional[Dict[str, Any]]:
     tcp 是 sing-box 默认传输层，不生成 transport 字段（枚举无 tcp）。
     类型映射：h2→http（sing-box 无 h2，HTTP/2 由 http 类型承载）。
     v2ray streamSettings 嵌套结构也在此转换。
+    未知/不支持类型（kcp/quic/mkcp 等 sing-box 1.7.7 不支持）静默丢弃。
     """
+    _known = frozenset({"ws", "http", "grpc", "httpupgrade"})
     if isinstance(tr, dict):
         # v2ray streamSettings 格式：{network: "ws", wsSettings: {path: "/", headers: {...}}}
         if "network" in tr:
             mapped = _v2ray_stream_to_transport(tr)
-            if mapped:
+            if mapped and mapped.get("type") in _known:
                 return mapped
+            return None
         t = (tr.get("type") or "").strip()
         if t and t != "tcp":
             tr = dict(tr)
             # 类型映射：h2 → http，grpc → grpc（不变）
             _type_map = {"h2": "http", "h2c": "http", "httpupgrade": "httpupgrade"}
             tr["type"] = _type_map.get(t, t)
+            if tr["type"] not in _known:
+                return None  # kcp/quic 等 sing-box 不支持，丢弃
             return tr
         return None
     if isinstance(tr, str) and tr and tr.strip() != "tcp":
         t = tr.strip()
         _type_map = {"h2": "http", "h2c": "http", "httpupgrade": "httpupgrade"}
-        return {"type": _type_map.get(t, t)}
+        mapped_type = _type_map.get(t, t)
+        if mapped_type not in _known:
+            return None  # kcp/quic 等 sing-box 不支持，丢弃
+        return {"type": mapped_type}
     return None
 
 
