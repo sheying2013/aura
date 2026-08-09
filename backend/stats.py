@@ -44,11 +44,22 @@ def _clash_headers() -> Dict[str, str]:
 
 
 def _refresh_tag_maps() -> None:
-    """重建 outbound tag → node id 映射（节点增删/端口变更后由 scheduler 周期调用）。"""
+    """重建 outbound tag → node id 映射（节点增删/端口变更后由 scheduler 周期调用）。
+    同时清理 _node_rate / _relay_rate 中已删除节点/域名的条目防内存泄漏。"""
     global _tag_to_node
     _tag_to_node = {}
+    valid_node_ids = set()
     for n in db.list_nodes():
         _tag_to_node[config_manager.outbound_tag(n["protocol"], n["port"])] = n["id"]
+        valid_node_ids.add(n["id"])
+    # 清理已删除节点的速率条目（H11 fix：_node_rate 从不清理 → 内存泄漏）
+    stale_node_ids = [nid for nid in _node_rate if nid not in valid_node_ids]
+    for nid in stale_node_ids:
+        del _node_rate[nid]
+    valid_relay_tags = {f"relay-auto-{rd['id']}" for rd in db.list_relay_domains()}
+    stale_relay_tags = [t for t in _relay_rate if t not in valid_relay_tags]
+    for t in stale_relay_tags:
+        del _relay_rate[t]
 
 
 async def _tag_map_refresh_loop() -> None:
@@ -188,13 +199,18 @@ def _process_connections(conns: List[Dict[str, Any]]) -> None:
         if node_id:
             db.add_traffic(node_id, dup, ddown)
             nr = _node_rate.setdefault(node_id, {"up": 0.0, "down": 0.0, "ts": now})
-            nr["up"] += dup / dt
-            nr["down"] += ddown / dt
+            # H10 fix：先衰减旧值再叠加本窗口增量，防止速率值无限增长
+            age = max(0.001, now - nr.get("ts", now))
+            decay = 0.5 ** (age / 5.0)
+            nr["up"] = nr["up"] * decay + dup / dt
+            nr["down"] = nr["down"] * decay + ddown / dt
             nr["ts"] = now
         elif leaf.startswith("relay-auto-"):
             rr = _relay_rate.setdefault(leaf, {"up": 0.0, "down": 0.0, "ts": now})
-            rr["up"] += dup / dt
-            rr["down"] += ddown / dt
+            age = max(0.001, now - rr.get("ts", now))
+            decay = 0.5 ** (age / 5.0)
+            rr["up"] = rr["up"] * decay + dup / dt
+            rr["down"] = rr["down"] * decay + ddown / dt
             rr["ts"] = now
     # 清理消失连接
     for cid in [k for k in _conn_state if k not in seen]:
@@ -250,6 +266,7 @@ def unsubscribe_sse(q: "asyncio.Queue") -> None:
 
 async def _broadcast() -> None:
     """每 1s 广播一次 stats 快照到所有 SSE 客户端。"""
+    _full_count: Dict[int, int] = {}  # queue id → 连续满次数
     while True:
         await asyncio.sleep(1)
         if not _clients:
@@ -268,8 +285,14 @@ async def _broadcast() -> None:
         for q in list(_clients):
             try:
                 q.put_nowait(payload)
+                _full_count.pop(id(q), None)
             except asyncio.QueueFull:
-                pass
+                # H3 fix：连续满 60 次（约 60s）的客户端视为断连泄漏，清理
+                cnt = _full_count.get(id(q), 0) + 1
+                _full_count[id(q)] = cnt
+                if cnt >= 60:
+                    _clients.remove(q)
+                    _full_count.pop(id(q), None)
 
 
 # ---------- 生命周期 ----------

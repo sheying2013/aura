@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import config_manager
 import db
+import httpx
 import stats
 import subs_proxy
 
@@ -42,11 +43,10 @@ async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
     if not port:
         return None
     import asyncio as _aio
-    import subprocess
 
     def _run() -> Optional[str]:
         try:
-            import socket, urllib.request
+            import socket
             # 优先用 Python 原生 socks5 请求（slim 镜像无 curl）
             # 构造 socks5 代理请求：手工 SOCKS5 握手 → HTTP GET api.ipify.org
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -76,7 +76,10 @@ async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
             # SOCKS5 CONNECT to api.ipify.org:80
             host = b"api.ipify.org"
             s.send(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + b"\x00\x50")
-            s.recv(10)  # connection reply
+            conn_reply = s.recv(10)  # connection reply
+            if len(conn_reply) < 2 or conn_reply[1] != 0x00:
+                s.close()
+                return None
             # HTTP GET
             s.send(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\n\r\n")
             data = b""
@@ -166,8 +169,10 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
         finally:
             _ip_enrich_pending.discard(nid)
             _ip_enrich_last[nid] = time.time()  # 记录补查时间（冷却用）
-            if len(_ip_enrich_last) > 5000:  # 防无限增长
-                _ip_enrich_last.clear()
+            if len(_ip_enrich_last) > 5000:  # LRU 淘汰最旧 20%（防全清后冷却重置风暴）
+                oldest = sorted(_ip_enrich_last, key=_ip_enrich_last.get)[:1000]
+                for k in oldest:
+                    del _ip_enrich_last[k]
 
     asyncio.create_task(_do())
 
@@ -180,15 +185,13 @@ _guard_paused = False
 
 # 连续失败自动处理阈值
 # 调保守（2026-08-09 优化）：探活是弱判定（TCP/TLS 握手），单轮抖动/节点风控瞬时拒绝
-# 很常见。① 每轮 delay 失败已重试 1 次（吸收 reload/抖动瞬时失败）；② 握手成功即判在线，
+# 很常见。① 每轮 delay 失败已重试 2 次（吸收 reload/抖动瞬时失败）；② 握手成功即判在线，
 # 出口 IP 查询失败不再判死（IP 只是情报，不反证转发能力）；③ 阈值抬高——误停用要人工
-# 恢复（8 分钟 12 轮连续失败才停），删除阈值 30 基本只在节点彻底失联后触发。
-# 注意：disabled 节点不再被探活，计数冻结——DELETE_AFTER_FAILS 只在未到 DISABLE 前
-# 连续失败累计时触发（计数同时满足 12 与 30 前先被 12 停用，故 30 实际是死阈值保险）。
-DISABLE_AFTER_FAILS = 12  # 连续失败 ≥12 次（约 12 轮×60s）→ 自动停用
-DELETE_AFTER_FAILS = 30   # 连续失败 ≥30 次 → 自动删除（保险阈值，保守防止误删）
-PROBE_CONCURRENCY = 24    # 探活并发上限（176 全并发会瞬时打满网络/触发风控，限流）
-PROBE_DELAY_RETRY = 1     # 每轮 delay 失败重试次数（吸收 reload/瞬时抖动，防单次抖动误杀）
+# 恢复（约 20 分钟 20 轮连续失败才停），删除阈值仅在节点彻底失联后触发。
+DISABLE_AFTER_FAILS = 20  # 连续失败 ≥20 次（约 20 轮×60s）→ 自动停用
+DELETE_AFTER_FAILS = 60   # 连续失败 ≥60 次 → 自动删除（保险阈值）
+PROBE_CONCURRENCY = 16    # 探活并发上限（降低对 clash API 的瞬时压力，减少超时误判）
+PROBE_DELAY_RETRY = 2     # 每轮 delay 失败重试次数（共 3 次机会，进一步吸收抖动）
 
 async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
                       include_disabled: bool = False) -> List[Dict[str, Any]]:
@@ -203,6 +206,10 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
     import config_manager as cm
 
     if not cm.is_running():
+        return []
+    # 防竞态误杀：若 config_manager 正在 apply/reload（_op_lock 被占），clash API 处于
+    # 不可达窗口——此时探活必然全部失败。跳过本轮，等 reload 完成后再探活。
+    if cm._op_lock.locked():
         return []
     nodes = db.list_nodes()
     if not all_ and ids:
@@ -237,10 +244,10 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
         async def _delay_once() -> Optional[Dict[str, Any]]:
             """单次 clash delay 探测。返回 JSON dict；HTTP 失败/无 delay 返回 None。"""
             try:
-                async with __import__("httpx").AsyncClient(timeout=4.0) as client:
+                async with httpx.AsyncClient(timeout=6.0) as client:
                     r = await client.get(
                         f"{cm.clash_base()}/proxies/{tag}/delay",
-                        params={"url": url, "timeout": "3000"},
+                        params={"url": url, "timeout": "5000"},
                         headers={"Authorization": f"Bearer {cm.get_clash_secret()}"},
                     )
                 if r.status_code == 200:
@@ -250,10 +257,13 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
             return None
 
         # 失败重试：单轮 delay 抖动（reload 窗口/节点瞬时 RST）不该计一败。
-        # 重试 1 次（共 2 次机会），仍失败才判离线——阈值随之可以放宽。
+        # 重试 PROBE_DELAY_RETRY 次（共 PROBE_DELAY_RETRY+1 次机会），带指数退避，
+        # 仍失败才判离线——阈值随之可以放宽。
         resp = None
         last_msg = None
-        for _ in range(PROBE_DELAY_RETRY + 1):
+        for attempt in range(PROBE_DELAY_RETRY + 1):
+            if attempt > 0:
+                await asyncio.sleep(0.5 * attempt)  # 指数退避：0.5s, 1.0s
             data = await _delay_once()
             if data and data.get("delay"):
                 resp = data
@@ -338,7 +348,12 @@ async def _probe_loop() -> None:
         await asyncio.sleep(PING_INTERVAL)
         if config_manager.is_running():
             try:
-                await probe_nodes()
+                results = await probe_nodes()
+                # apply_config 触发了 reload → 追加 grace period，给 sing-box 重建连接池
+                # 的时间，下一轮探活不会紧跟着 reload 窗口误判全挂
+                if results and any(r.get("status") == "offline" for r in results):
+                    if config_manager._op_lock.locked():
+                        await asyncio.sleep(10)  # 等 reload 完成 + 稳定
             except Exception:
                 pass
 

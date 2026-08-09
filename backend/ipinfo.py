@@ -34,7 +34,7 @@ COUNTRY_CN: Dict[str, str] = {
     "ID": "印度尼西亚", "MO": "中国澳门", "PA": "巴拿马", "KZ": "哈萨克斯坦",
     "LT": "立陶宛", "LV": "拉脱维亚", "EE": "爱沙尼亚", "LU": "卢森堡", "CY": "塞浦路斯",
     "MT": "马耳他", "IS": "冰岛", "PK": "巴基斯坦", "BD": "孟加拉", "NG": "尼日利亚",
-    "EG": "埃及", "SA": "沙特阿拉伯", "QA": "卡塔尔", "KW": "科威特", "AE": "阿联酋",
+    "EG": "埃及", "SA": "沙特阿拉伯", "QA": "卡塔尔", "KW": "科威特",
 }
 
 # 国家代码 → 国旗 emoji（区域指示符计算）
@@ -74,8 +74,10 @@ def _cached(ip: str) -> Optional[Dict[str, Any]]:
 
 def _store(ip: str, data: Dict[str, Any]) -> None:
     _cache[ip] = {"ts": time.time(), "data": data}
-    if len(_cache) > 5000:  # 防无限增长
-        _cache.clear()
+    if len(_cache) > 5000:  # LRU 淘汰最旧 20%（防缓存雪崩，不再 .clear() 全清）
+        oldest = sorted(_cache, key=lambda k: _cache[k]["ts"])[:1000]
+        for k in oldest:
+            del _cache[k]
 
 
 # ---------- 数据源查询 ----------
@@ -233,8 +235,10 @@ def lookup_ping0(ip: str, nodes) -> Dict[str, Any]:
         data = _fetch_ping0_via_proxy(ip, proxy)
         if data:
             _ping0_cache[ip] = {"ts": time.time(), "data": data}
-            if len(_ping0_cache) > 2000:
-                _ping0_cache.clear()
+            if len(_ping0_cache) > 2000:  # LRU 淘汰最旧 20%
+                oldest = sorted(_ping0_cache, key=lambda k: _ping0_cache[k]["ts"])[:400]
+                for k in oldest:
+                    del _ping0_cache[k]
             return data
     return {}
 
@@ -303,7 +307,9 @@ def lookup_ippure(nodes) -> Dict[str, Any]:
             data = _parse_ippure(d)
             data["exitIp"] = ip
             _ippure_cache[ip] = {"ts": time.time(), "data": data}
-            if len(_ippure_cache) > 2000:
-                _ippure_cache.clear()
+            if len(_ippure_cache) > 2000:  # LRU 淘汰最旧 20%
+                oldest = sorted(_ippure_cache, key=lambda k: _ippure_cache[k]["ts"])[:400]
+                for k in oldest:
+                    del _ippure_cache[k]
         return data
     return {}

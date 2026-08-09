@@ -35,6 +35,7 @@ class NodeCreate(BaseModel):
     exitType: Optional[str] = None
     exitScore: Optional[int] = None
     exitRisk: Optional[int] = None
+    consecutiveFails: Optional[int] = 0
 
 
 class Node(NodeCreate):

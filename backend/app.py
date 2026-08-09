@@ -143,7 +143,7 @@ def create_node(body: models.NodeCreate):
         "protocol": body.protocol,
         "group": body.group or "默认分组",
         "port": port,
-        "segment": 52,
+        "segment": None,
         "authUser": body.authUser,
         "authPass": body.authPass,
         "status": body.status or "offline",
@@ -173,7 +173,7 @@ def create_node_batch(body: models.NodeBatchRequest):
             "group": n.group or "默认分组",
             # port 交给 db.create_node_batch 批内自动分配（52001 起自增，避免批内冲突）
             "port": n.port,
-            "segment": 52,
+            "segment": None,
             "authUser": n.authUser,
             "authPass": n.authPass,
             "status": n.status or "offline",
@@ -314,18 +314,9 @@ async def get_exit_ip(node_id: str):
     port = node["port"]
     user = node.get("authUser") or "user"
     passwd = node.get("authPass") or "pass"
-    import subprocess
-    try:
-        r = subprocess.run(
-            ["curl", "--socks5-hostname", f"{user}:{passwd}@127.0.0.1:{port}",
-             "--max-time", "5", "http://api.ipify.org"],
-            capture_output=True, text=True, timeout=8,
-        )
-        ip = r.stdout.strip()
-        if r.returncode != 0 or not ip:
-            raise HTTPException(status_code=502, detail="出口 IP 探测失败")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"出口 IP 探测失败: {e}")
+    ip = await scheduler._fetch_exit_ip(node)
+    if not ip:
+        raise HTTPException(status_code=502, detail="出口 IP 探测失败")
     patch = {"exitIp": ip}
     # 异步查 IP 情报（ipinfo.io 归属地 + ipapi.is 纯净度评分），失败降级不阻塞
     try:

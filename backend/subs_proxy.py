@@ -8,6 +8,7 @@ import ipaddress
 import json
 import re
 import socket
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
@@ -55,8 +56,17 @@ async def fetch_subscription(url: str) -> Dict[str, Any]:
     if not _is_public_url(url):
         return {"ok": False, "error": "仅允许公网 http/https 订阅 URL"}
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=15.0) as client:
             resp = await client.get(url, headers={"User-Agent": _UA})
+            # 手动处理重定向，逐次校验目标 URL 的安全性
+            for _ in range(5):
+                if 300 <= resp.status_code < 400:
+                    loc = resp.headers.get("location", "")
+                    if not loc or not _is_public_url(loc):
+                        return {"ok": False, "error": "重定向目标 URL 不安全（内网地址）"}
+                    resp = await client.get(loc, headers={"User-Agent": _UA})
+                else:
+                    break
             if resp.status_code >= 400:
                 return {"ok": False, "status": resp.status_code, "error": f"HTTP {resp.status_code}"}
             return {"ok": True, "status": resp.status_code, "content": resp.text}
@@ -442,8 +452,6 @@ def _parse_clash_yaml(content: str) -> List[Dict[str, Any]]:
             obj["transport"] = transport
         # hy2 obfs 参数 → rawConfig 保留（config_manager 生成 outbound 时映射）
         if proto == "hysteria2":
-            if obj.get("obfs"):
-                obj["obfs"] = obj["obfs"]
             if obj.get("obfs-password"):
                 obj["obfsPassword"] = obj["obfs-password"]
         nodes.append({"name": obj["name"], "protocol": proto, "rawConfig": obj})
@@ -566,7 +574,7 @@ async def refresh_sub(sub: Dict[str, Any]) -> Dict[str, Any]:
         # 订阅恢复正常：清除之前失败兜底标的 stale 警示（否则节点永久橙色"刷新失败"）
         db.unmark_nodes_stale_by_sub(sub_id)
         _sub = db.update_sub(sub_id, {
-            "last_refresh": int(__import__("time").time() * 1000),
+            "last_refresh": int(time.time() * 1000),
             "node_count": len(nodes),
             "last_error": None,
             "snapshot": json.dumps(nodes, ensure_ascii=False),

@@ -440,8 +440,7 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
         # camelCase patch → 合并
         merged = {**cur}
         for k, v in patch.items():
-            if v is not None:
-                merged[k] = v
+            merged[k] = v
         c.execute(
             """UPDATE nodes SET name=?,protocol=?,"group"=?,port=?,segment=?,auth_user=?,
                auth_pass=?,status=?,ping=?,exit_ip=?,up_traffic=?,down_traffic=?,raw_config=?,
@@ -692,17 +691,18 @@ def get_sub(sub_id: str) -> Optional[Dict]:
 
 
 def create_sub(url: str, name: Optional[str], group: Optional[str]) -> Optional[Dict]:
+    sub_id = new_sub_id()
     with _lock:
         c = connect()
         try:
             c.execute(
                 'INSERT INTO subscriptions (id,url,name,"group",enabled,created_at) VALUES (?,?,?,?,1,?)',
-                (new_sub_id(), url, name or url[:40], group or "订阅节点", _conn_now()),
+                (sub_id, url, name or url[:40], group or "订阅节点", _conn_now()),
             )
             c.commit()
         except sqlite3.IntegrityError:
             return None
-    return get_sub(c.execute("SELECT id FROM subscriptions WHERE url=?", (url,)).fetchone()["id"])
+    return get_sub(sub_id)
 
 
 def update_sub(sub_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
