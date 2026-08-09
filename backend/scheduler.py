@@ -21,6 +21,16 @@ _ip_enrich_last: Dict[str, float] = {}  # 节点 → 上次补查时间（防每
 _ENRICH_COOLDOWN = 300  # 5 分钟冷却：补查后即使情报不全也不重查（避免每轮 curl 所有节点）
 
 
+
+def _is_ip_address(s: str) -> bool:
+    """判断字符串是否为 IP 地址（v4/v6），非 hostname。"""
+    try:
+        import ipaddress
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
 async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
     """经节点自身 socks5 代理查真实出口 IP（复用 app.py 手动查出口的逻辑）。
 
@@ -36,13 +46,53 @@ async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
 
     def _run() -> Optional[str]:
         try:
-            r = subprocess.run(
-                ["curl", "--socks5-hostname", f"{user}:{passwd}@127.0.0.1:{port}",
-                 "--max-time", "5", "http://api.ipify.org"],
-                capture_output=True, text=True, timeout=8,
-            )
-            ip = r.stdout.strip()
-            return ip if r.returncode == 0 and ip else None
+            import socket, urllib.request
+            # 优先用 Python 原生 socks5 请求（slim 镜像无 curl）
+            # 构造 socks5 代理请求：手工 SOCKS5 握手 → HTTP GET api.ipify.org
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect(("127.0.0.1", int(port)))
+            # SOCKS5 握手 (no auth)
+            s.send(b"\x05\x01\x00")
+            resp = s.recv(2)
+            if resp != b"\x05\x00":
+                # try user/pass auth
+                s.close()
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5)
+                s.connect(("127.0.0.1", int(port)))
+                s.send(b"\x05\x01\x02")
+                resp = s.recv(2)
+                if resp != b"\x05\x02":
+                    s.close()
+                    return None
+                ubytes = user.encode()
+                pbytes = passwd.encode()
+                s.send(b"\x01" + bytes([len(ubytes)]) + ubytes + bytes([len(pbytes)]) + pbytes)
+                auth_resp = s.recv(2)
+                if auth_resp != b"\x01\x00":
+                    s.close()
+                    return None
+            # SOCKS5 CONNECT to api.ipify.org:80
+            host = b"api.ipify.org"
+            s.send(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + b"\x00\x50")
+            s.recv(10)  # connection reply
+            # HTTP GET
+            s.send(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\n\r\n")
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            # parse HTTP response
+            parts = data.split(b"\r\n\r\n", 1)
+            if len(parts) == 2:
+                ip = parts[1].strip().decode()
+                if ip and len(ip) < 50 and not ip.startswith("<"):
+                    return ip
+            return None
         except Exception:
             return None
 
@@ -59,6 +109,10 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
     nid = node["id"]
     if not ip or ip in ("N/A", "1.1.1.1"):
         ip = None  # 需先查出口 IP
+    # exitIp 存的是 hostname（如 rooster465.autos）→ ipinfo 对 hostname 的
+    # country 解析常失败 → 视为无效 IP，重新通过代理查真实 IP
+    if ip and not _is_ip_address(ip):
+        ip = None
     if ip and node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
         return  # 情报已齐全
     if nid in _ip_enrich_pending:
