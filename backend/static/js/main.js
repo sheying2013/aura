@@ -2,6 +2,9 @@
 function openModal(id) {
     const el = document.getElementById(id);
     if (el) el.classList.add('active');
+    // 打开导入弹窗时初始化 ss 密码框显隐联动
+    if (id === 'import-modal') toggleImportPassField();
+    if (id === 'edit-modal') toggleEditEntryPassField();
 }
 function closeModal(id) {
     const el = document.getElementById(id);
@@ -848,7 +851,14 @@ function updateGroupFilterOptions() {
             opt.textContent = g === 'ALL' ? (I18N_DICT['ALL GROUPS'] || 'ALL GROUPS') : g;
             select.appendChild(opt);
         });
-        select.value = groups.has(currentVal) ? currentVal : 'ALL';
+        // 停用节点筛选（仅节点列表分组下拉）
+        if (select === filterGroupSelect && nodeState.some(n => n.status === 'disabled')) {
+            const opt = document.createElement('option');
+            opt.value = '__DISABLED__';
+            opt.textContent = '停用节点';
+            select.appendChild(opt);
+        }
+        select.value = groups.has(currentVal) || currentVal === '__DISABLED__' ? currentVal : 'ALL';
     });
 }
 
@@ -920,6 +930,9 @@ function getFilteredNodes() {
     const keyword = searchInput ? searchInput.value.trim().toLowerCase() : '';
 
     return nodeState.filter(node => {
+        // 停用节点独立视图：__DISABLED__ 只看停用；普通列表排除 disabled
+        if (selectedGroup === '__DISABLED__') return node.status === 'disabled';
+        if (node.status === 'disabled') return false;
         if (selectedGroup !== 'ALL' && node.group !== selectedGroup) return false;
         if (keyword) {
             const nameMatch = (node.name || '').toLowerCase().includes(keyword);
@@ -929,6 +942,63 @@ function getFilteredNodes() {
         }
         return true;
     });
+}
+
+// ---------- 出口 IP 情报渲染（旧版 renderExitIp 移植） ----------
+
+function exitTypeLabel(type, risk) {
+    const map = { residential: '住宅', hosting: '数据中心', proxy: '代理/VPN', unknown: '' };
+    const label = map[type];
+    if (label) return label;
+    if (type === 'unknown' && risk != null) {
+        if (risk <= 30) return '住宅/ISP';
+        if (risk <= 70) return '数据中心';
+        return '代理/VPN';
+    }
+    return '';
+}
+
+function exitScoreClass(score) {
+    if (score == null || score === '') return '';
+    return score >= 80 ? 'high' : (score >= 50 ? 'mid' : 'low');
+}
+
+function exitRiskClass(risk) {
+    if (risk == null || risk === '') return '';
+    return risk <= 50 ? 'low' : (risk <= 70 ? 'mid' : 'high');
+}
+
+/** 订阅来源徽标：subName 优先，空则按 subId 从订阅列表反查；stale 警示色 */
+function renderSubBadge(n) {
+    let sn = n.subName;
+    if (!sn && n.subId && subState && subState.length) {
+        const hit = subState.find(s => s.id === n.subId);
+        sn = hit ? (hit.name || '') : '';
+    }
+    if (!sn) return '';
+    const cls = n.stale ? 'sub-tag stale' : 'sub-tag';
+    return `<span class="${cls}" title="来自订阅 ${escapeHtml(sn)}${n.stale ? ' · 订阅刷新失败，使用上次快照' : ''}">${escapeHtml(sn)}</span>`;
+}
+
+/** 出口 IP 完整情报：国旗/类型徽标/纯净度/风控值/归属地 tooltip（后端字段已有） */
+function renderExitIp(n) {
+    const esc = v => escapeHtml(v);
+    const flag = esc(n.exitFlag || '');
+    const typeLabel = exitTypeLabel(n.exitType, n.exitRisk);
+    const score = n.exitScore;
+    const hasScore = score > 0;
+    const scoreBadge = hasScore ? `<span class="exit-score ${exitScoreClass(score)}">${esc(score)}</span>` : '';
+    const typeBadge = typeLabel ? `<span class="exit-badge ${esc(n.exitType || 'unknown')}">${esc(typeLabel)}</span>` : '';
+    const risk = n.exitRisk;
+    const hasRisk = risk != null && risk !== '';
+    const riskBadge = hasRisk ? `<span class="exit-risk ${exitRiskClass(risk)}" title="风控值: ${esc(risk)}/100（越低越安全）">风控${esc(risk)}</span>` : '';
+    const city = esc(n.exitCity || '');
+    const country = esc(n.exitCountry || '');
+    const tooltip = [esc(n.exitIp), country ? `归属地: ${country}${city ? ' ' + city : ''}` : '', typeLabel ? `类型: ${typeLabel}` : '', hasScore ? `纯净度: ${esc(score)}/100` : '', hasRisk ? `风控值: ${esc(risk)}/100（越低越安全）` : ''].filter(Boolean).join('\n');
+    const ip = esc(n.exitIp) || 'N/A';
+    const ipTxt = ip === 'N/A' ? 'N/A' : `<span class="ipaddr" title="${tooltip}">${ip}</span>`;
+    const badges = [flag ? `<span class="flag">${flag}</span>` : '', ipTxt, typeBadge, scoreBadge, riskBadge].filter(Boolean).join('');
+    return badges ? `<span class="exit-ip-cell">${badges}</span>` : 'N/A';
 }
 
 function renderNodesTable() {
@@ -946,22 +1016,25 @@ function renderNodesTable() {
         const isSelected = selectedNodeIds.has(node.id);
         const totalNodeTraffic = (node.upTraffic || 0) + (node.downTraffic || 0);
         const esc = escapeHtml;
+        const isDisabled = node.status === 'disabled';
+        const statusTitle = isDisabled ? '已停用（连续探活失败自动）' : (node.status || 'offline');
         const tr = document.createElement('tr');
         tr.innerHTML = `
             <td><input type="checkbox" class="chk-node" data-id="${esc(node.id)}" ${isSelected ? 'checked' : ''} onchange="toggleSelectNode('${esc(node.id)}')"></td>
-            <td><span class="status-indicator ${esc(node.status) || 'offline'}"></span></td>
-            <td style="font-family: var(--font-mono); font-weight: bold;">${esc(node.port) || '--'}</td>
+            <td><span class="status-indicator ${esc(node.status) || 'offline'}" title="${esc(statusTitle)}"></span></td>
+            <td style="font-family: var(--font-mono);"><input type="number" class="port-input" value="${esc(node.port)}" onchange="updateNodePort('${esc(node.id)}', this.value)" style="width:72px; background:transparent; border:1px solid var(--dim); color:inherit; border-radius:4px; padding:2px 6px; font-family:var(--font-mono); font-size:11px;"></td>
             <td><span class="group-tag">${esc(node.group) || '默认分组'}</span></td>
             <td style="font-family: var(--font-mono);">${esc(node.protocol) || 'mixed'}</td>
             <td style="font-family: var(--font-mono);">${esc(node.entryProto) || 'mixed'}</td>
-            <td><strong>${esc(node.name) || '未命名'}</strong></td>
-            <td><span style="font-size: 11px; opacity:0.8;">${node.exitCountry ? (esc(node.exitFlag) || '') + ' ' + esc(node.exitCountry) : (esc(node.exitIp) || 'N/A')}</span></td>
+            <td><strong>${esc(node.name) || '未命名'}</strong>${renderSubBadge(node)}${isDisabled ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
+            <td style="font-size:12px;">${renderExitIp(node)}</td>
             <td style="font-family: var(--font-mono); color: ${node.ping > 0 ? (node.ping < 200 ? 'var(--success)' : 'var(--rock)') : 'var(--danger)'}">${node.ping > 0 ? node.ping + ' ms' : '--'}</td>
             <td style="font-family: var(--font-mono);">${formatBytes(totalNodeTraffic)}</td>
             <td style="text-align: center;">
                 <div style="display:flex; gap:6px; justify-content:center;">
                     <button class="btn-action" onclick="pingSingleNode('${esc(node.id)}')">PING</button>
                     <button class="btn-action" onclick="openEditNodeModal('${esc(node.id)}')">EDIT</button>
+                    <button class="btn-action" onclick="exportSingleNode('${esc(node.id)}')">EXPORT</button>
                     <button class="btn-action ${node.status === 'online' ? 'danger' : ''}" onclick="toggleNodeEnable('${esc(node.id)}')">${node.status === 'online' ? 'DISABLE' : 'ENABLE'}</button>
                     <button class="btn-action danger" onclick="deleteSingleNode('${esc(node.id)}')">DROP</button>
                 </div>
@@ -974,6 +1047,46 @@ function renderNodesTable() {
     if (chkAll) {
         chkAll.checked = nodes.length > 0 && nodes.every(n => selectedNodeIds.has(n.id));
     }
+}
+
+/** 行内端口编辑：PATCH 端口并重建配置；失败恢复原值 */
+async function updateNodePort(id, val) {
+    const port = parseInt(val, 10);
+    if (!port || port < 1024 || port > 65535) { addLog('WARN', '端口无效（1024-65535）'); renderNodesTable(); return; }
+    try {
+        const r = await api(`/api/nodes/${id}/port`, {
+            method: 'PUT',
+            body: JSON.stringify({ port: port })
+        });
+        if (!r.ok) {
+            addLog('WARN', `端口更新失败 (HTTP ${r.status})`);
+            renderNodesTable();
+            return;
+        }
+        addLog('INFO', `节点端口已改为 ${port}`);
+        await applyConfigSilent();
+        await loadNodes();
+    } catch (e) {
+        addLog('ERROR', '端口更新失败: ' + e.message);
+        renderNodesTable();
+    }
+}
+
+/** 单节点导出：生成文本写导出框 + 切 tab + 复制剪贴板 */
+async function exportSingleNode(nodeId) {
+    const node = nodeState.find(n => n.id === nodeId);
+    if (!node) return;
+    const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
+    const vpsIp = window.location.hostname || '127.0.0.1';
+    const text = `# 节点: ${node.name} | 协议: ${(node.protocol || '').toUpperCase()}\n${exportLinkLines(node, vpsIp, protoSel).join('\n')}`;
+    const area = document.getElementById('export-text-area');
+    if (area) {
+        area.value = text;
+        const exportNav = document.querySelector('.nav-item[data-target="export"]');
+        if (exportNav) exportNav.click();
+    }
+    copyToClipboard(text);
+    addLog('SUCCESS', `已生成节点 [${node.name}] 的中转链接`);
 }
 
 // Checkbox and Toolbar Handlers
@@ -1055,8 +1168,51 @@ function openEditNodeModal(id) {
     if (passEl) passEl.value = node.authPass || '';
     if (entryEl) entryEl.value = node.entryProto || 'mixed';
     if (ssPassEl) ssPassEl.value = node.ssPass || '';
+    // 协议/端口静态信息行（旧版 edit-node-sub）
+    const subEl = document.getElementById('edit-node-sub');
+    if (subEl) subEl.textContent = `协议: ${(node.protocol || '').toUpperCase()} | 端口: ${node.port}${node.subName ? ' | 订阅: ' + node.subName : ''}`;
+    toggleEditEntryPassField();
 
     openModal('edit-modal');
+}
+
+// ---------- 对话框 ss 密码框显隐联动（旧版 toggle*PassField 移植） ----------
+
+function toggleImportPassField() {
+    // 按打开的表单判断：modal 打开时读 modal select，否则读页面 select
+    const modalEl = document.getElementById('import-modal');
+    const modalOpen = modalEl && modalEl.classList.contains('active');
+    const selectId = modalOpen ? 'modal-import-entry-proto' : 'import-entry-proto';
+    const groupId = modalOpen ? 'modal-import-pass-group' : 'import-pass-group';
+    const sel = document.getElementById(selectId);
+    const el = document.getElementById(groupId);
+    if (sel && el) el.style.display = sel.value === 'ss' ? 'block' : 'none';
+}
+
+function toggleConvertPassField() {
+    const dir = document.getElementById('convert-direction');
+    const el = document.getElementById('convert-pass-group');
+    if (dir && el) el.style.display = dir.value === 'ss' ? 'block' : 'none';
+}
+
+function toggleEditEntryPassField() {
+    const proto = document.getElementById('edit-node-entry');
+    const el = document.getElementById('edit-node-sspass-group');
+    if (proto && el) el.style.display = proto.value === 'ss' ? 'block' : 'none';
+}
+
+/** 转换弹窗打开时动态更新 scope 提示（旧版 openConvertEntryDialog） */
+function openConvertEntryModal() {
+    const hint = document.getElementById('convert-scope-hint');
+    if (hint) {
+        hint.textContent = selectedNodeIds.size > 0
+            ? `转换范围: 当前选中的 ${selectedNodeIds.size} 个节点`
+            : '转换范围: 全部节点';
+    }
+    toggleConvertPassField();
+    const errEl = document.getElementById('convert-error');
+    if (errEl) errEl.textContent = '';
+    openModal('convert-entry-modal');
 }
 
 async function handleSaveNodeEdit() {
@@ -1257,7 +1413,7 @@ function exportLinkLines(node, vpsIp, protoSel) {
 function generateExportText() {
     const groupSel = document.getElementById('export-group-select') ? document.getElementById('export-group-select').value : 'ALL';
     const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
-    const vpsIp = (relayState && relayState.length > 0) ? '127.0.0.1' : window.location.hostname || '127.0.0.1';
+    const vpsIp = window.location.hostname || '127.0.0.1';
 
     const nodesToExport = nodeState.filter(n => groupSel === 'ALL' || n.group === groupSel);
 
@@ -1636,13 +1792,20 @@ function renderSubsList() {
     // 订阅管理页表格（subs-tbody）同步填充
     const tbody = document.getElementById('subs-tbody');
     if (tbody) {
-        tbody.innerHTML = subState.map(s => `
+        tbody.innerHTML = subState.map(s => {
+            // 状态徽标三态：失效（stale 无快照）/ 降级（有快照兜底）/ 可用
+            let badge = '';
+            if (s.stale) badge = `<span class="sub-badge sub-badge-fail" title="${escapeHtml(s.lastError || '刷新失败')}">失效</span>`;
+            else if (s.degraded) badge = `<span class="sub-badge sub-badge-degraded" title="${escapeHtml(s.lastError || '刷新失败，使用上次快照')}">降级</span>`;
+            else badge = `<span class="sub-badge sub-badge-ok">可用 · ${escapeHtml(s.nodeCount ?? s.node_count ?? 0)} 节点</span>`;
+            return `
             <tr>
                 <td><strong>${escapeHtml(s.name)}</strong></td>
-                <td style="font-family: var(--font-mono); font-size: 11px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(s.url)}</td>
+                <td style="font-family: var(--font-mono); font-size: 11px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(s.lastError || '')}">${escapeHtml(s.url)}</td>
                 <td><span class="group-tag">${escapeHtml(s.group) || '默认分组'}</span></td>
                 <td>${escapeHtml(s.nodeCount ?? s.node_count ?? '-')}</td>
                 <td style="font-size: 11px; opacity: 0.8;">${escapeHtml(s.lastRefresh ? new Date(s.lastRefresh).toLocaleString() : '-')}</td>
+                <td>${badge}</td>
                 <td>
                     <div style="display:flex; gap:6px;">
                         <button class="btn-action" onclick="openEditSubModal('${escapeHtml(s.id)}')">EDIT</button>
@@ -1650,8 +1813,8 @@ function renderSubsList() {
                         <button class="btn-action danger" onclick="deleteSub('${escapeHtml(s.id)}')">DROP</button>
                     </div>
                 </td>
-            </tr>
-        `).join('');
+            </tr>`;
+        }).join('');
     }
 }
 
@@ -1840,7 +2003,8 @@ async function saveSystemSettings() {
         stickyEnabled: getChk('setting-sticky-enabled'),
         stickyTimeout: getVal('setting-sticky-timeout') || '5m',
         randomRotateEnabled: getChk('setting-random-rotate-enabled'),
-        randomRotateInterval: parseInt(getVal('setting-random-rotate-interval')) || 30
+        randomRotateInterval: parseInt(getVal('setting-random-rotate-interval')) || 30,
+        autoRefresh: getChk('sub-auto-refresh')   // 全量 PUT 不能冲掉订阅自动刷新开关
     };
 
     try {

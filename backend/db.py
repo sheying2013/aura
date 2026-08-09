@@ -672,6 +672,9 @@ def list_subs() -> List[Dict]:
                 "group": r["group"], "enabled": bool(r["enabled"]),
                 "lastRefresh": r["last_refresh"], "nodeCount": r["node_count"],
                 "lastError": r["last_error"],
+                # stale：上次刷新失败且无 last-good 快照 → 失效；有快照 → 降级
+                "stale": bool(r["last_error"] and not r["snapshot"]),
+                "degraded": bool(r["last_error"] and r["snapshot"]),
             })
         return out
 

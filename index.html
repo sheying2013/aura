@@ -363,6 +363,49 @@
             box-shadow: 0 0 10px var(--rock);
             animation: pulse 2s infinite ease-in-out;
         }
+        /* 节点表状态点三态（renderNodesTable status-indicator） */
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            vertical-align: middle;
+        }
+        .status-indicator.online {
+            background: var(--success, #2ecc71);
+            box-shadow: 0 0 8px var(--success, #2ecc71);
+        }
+        .status-indicator.offline {
+            background: var(--danger, #e74c3c);
+            box-shadow: 0 0 6px var(--danger, #e74c3c);
+        }
+        .status-indicator.disabled {
+            background: var(--ink-gray, #7f8c8d);
+            box-shadow: none;
+        }
+        /* 出口 IP 情报徽标（renderExitIp） */
+        .exit-ip-cell { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+        .exit-ip-cell .flag { font-size: 12px; }
+        .exit-ip-cell .ipaddr { cursor: help; text-decoration: underline dotted rgba(200,184,154,.4); }
+        .exit-badge { font-size: 9px; padding: 1px 5px; border-radius: 8px; background: rgba(200,184,154,.15); color: var(--rock); letter-spacing: .5px; }
+        .exit-badge.residential { background: rgba(46,204,113,.15); color: var(--success); }
+        .exit-badge.hosting { background: rgba(230,126,34,.15); color: #e67e22; }
+        .exit-badge.proxy { background: rgba(231,76,60,.15); color: var(--danger); }
+        .exit-score { font-size: 9px; padding: 1px 5px; border-radius: 8px; font-weight: 600; }
+        .exit-score.high { background: rgba(46,204,113,.18); color: var(--success); }
+        .exit-score.mid { background: rgba(230,126,34,.18); color: #e67e22; }
+        .exit-score.low { background: rgba(231,76,60,.18); color: var(--danger); }
+        .exit-risk { font-size: 9px; padding: 1px 5px; border-radius: 8px; cursor: help; }
+        .exit-risk.low { background: rgba(46,204,113,.15); color: var(--success); }
+        .exit-risk.mid { background: rgba(230,126,34,.15); color: #e67e22; }
+        .exit-risk.high { background: rgba(231,76,60,.18); color: var(--danger); }
+        .sub-tag { font-size: 9px; padding: 1px 6px; border-radius: 8px; background: rgba(180,165,140,.15); color: var(--rock); margin-left: 6px; vertical-align: middle; letter-spacing: .5px; }
+        .sub-tag.stale { background: rgba(231,76,60,.18); color: var(--danger); }
+        .proto-tag { font-size: 9px; padding: 1px 6px; border-radius: 8px; background: rgba(180,165,140,.15); margin-left: 4px; vertical-align: middle; letter-spacing: .5px; }
+        .sub-badge { font-size: 9px; padding: 1px 7px; border-radius: 8px; letter-spacing: .5px; white-space: nowrap; }
+        .sub-badge-ok { background: rgba(46,204,113,.15); color: var(--success); }
+        .sub-badge-degraded { background: rgba(230,126,34,.18); color: #e67e22; }
+        .sub-badge-fail { background: rgba(231,76,60,.18); color: var(--danger); }
         @keyframes pulse {
             0% { transform: scale(0.8); opacity: 0.4; box-shadow: 0 0 0 0 rgba(var(--particle-color), 0.7); }
             50% { transform: scale(1.2); opacity: 1; box-shadow: 0 0 0 8px rgba(var(--particle-color), 0); }
@@ -940,7 +983,7 @@
                             <input type="text" id="search-keyword" class="form-input" placeholder="搜索节点名称/IP/端口..." style="width: 200px; padding: 8px 12px;">
                         </div>
                         <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                            <button class="btn" onclick="openModal('convert-entry-modal')">↔ 转换入口协议</button>
+                            <button class="btn" onclick="openConvertEntryModal()">↔ 转换入口协议</button>
                             <button class="btn" onclick="reassignAllPorts()">重新编排端口</button>
                             <button class="btn" onclick="exportSelectedNodes()">导出选中节点</button>
                             <button class="btn" onclick="enableSelectedNodes()">启用选中</button>
@@ -1025,7 +1068,7 @@
                         </div>
                         <div class="form-group">
                             <label class="form-label">对外出口协议</label>
-                            <select id="import-entry-proto" class="form-select">
+                            <select id="import-entry-proto" class="form-select" onchange="toggleImportPassField()">
                                 <option value="mixed">socks5 + http（中转代理）</option>
                                 <option value="ss">Shadowsocks (aes-256-gcm)</option>
                             </select>
@@ -1101,6 +1144,7 @@
                                 <th>分组</th>
                                 <th>节点数</th>
                                 <th>上次同步</th>
+                                <th>状态</th>
                                 <th>操作</th>
                             </tr>
                         </thead>
@@ -1385,7 +1429,7 @@
                     <label class="login-label">ACCESS ID</label>
                 </div>
                 <div class="login-input-group">
-                    <input type="password" id="login-password" class="login-input" placeholder=" " autocomplete="current-password">
+                    <input type="password" id="login-password" class="login-input" placeholder=" " autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
                     <label class="login-label">CREDENTIALS</label>
                 </div>
                 <div id="login-error" style="color: var(--danger); font-size: 10px; letter-spacing: 1px; text-align: center; margin-bottom: 20px; min-height: 14px;"></div>
@@ -1423,7 +1467,7 @@
             <h2 class="modal-title">批量转换入口协议</h2>
             <div class="form-group">
                 <label class="form-label">转换方向</label>
-                <select id="convert-direction" class="form-select">
+                <select id="convert-direction" class="form-select" onchange="toggleConvertPassField()">
                     <option value="ss">转为 Shadowsocks (socks5/http → ss)</option>
                     <option value="mixed">转回 socks5+http (ss → mixed)</option>
                 </select>
@@ -1462,12 +1506,12 @@
             <div style="display:flex; gap: 16px;">
                 <div class="form-group" style="flex:1;">
                     <label class="form-label">对外出口协议</label>
-                    <select id="modal-import-entry-proto" class="form-select">
+                    <select id="modal-import-entry-proto" class="form-select" onchange="toggleImportPassField()">
                         <option value="mixed">socks5 + http</option>
                         <option value="ss">Shadowsocks</option>
                     </select>
                 </div>
-                <div class="form-group" style="flex:1;">
+                <div class="form-group" style="flex:1;" id="modal-import-pass-group">
                     <label class="form-label">Shadowsocks 密码</label>
                     <input type="text" id="modal-import-ss-pass" class="form-input" placeholder="留空自动生成">
                 </div>
@@ -1517,9 +1561,10 @@
                     <input type="text" id="edit-node-auth-pass" class="form-input" placeholder="密码">
                 </div>
             </div>
+            <div id="edit-node-sub" style="font-size: 11px; opacity: 0.7; margin-bottom: 12px; font-family: var(--font-mono);"></div>
             <div class="form-group">
                 <label class="form-label">对外出口协议</label>
-                <select id="edit-node-entry" class="form-select">
+                <select id="edit-node-entry" class="form-select" onchange="toggleEditEntryPassField()">
                     <option value="mixed">socks5 + http（中转代理）</option>
                     <option value="ss">Shadowsocks (aes-256-gcm)</option>
                 </select>
