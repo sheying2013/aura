@@ -1905,25 +1905,24 @@ function fallbackCopy(text) {
 }
 
 async function addRelayDomain() {
-    const domain = prompt('请输入轮询域名:');
-    if (!domain) return;
-    const portStr = prompt('请输入监听端口:', '33440');
-    if (!portStr) return;
-    const port = parseInt(portStr, 10);
-    if (!port) { alert('端口无效'); return; }
     try {
-        // 读取当前 settings，追加 relayDomains 后保存（后端 upsert + 重建配置）
+        // 读取当前 settings，直接追加一张默认卡片（字段在卡片内联编辑，无弹窗）
         const r = await api('/api/settings');
         const s = await r.json();
         const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
-        const nextPort = port === 33440 && list.length > 0
-            ? Math.max(...list.map(x => parseInt(x.port) || 0), 33440) + 1
-            : port;
-        list.push({ id: 'relay-' + Date.now().toString(36), domain: domain, port: nextPort, authUser: 'relayuser', authPass: 'relaypass', groups: ['ALL'] });
+        const maxPort = list.length > 0 ? Math.max(...list.map(x => parseInt(x.port) || 0), 33440) : 33439;
+        list.push({
+            id: 'relay-' + Date.now().toString(36),
+            domain: 'relay' + (list.length + 1) + '.example.com',
+            port: maxPort + 1,
+            authUser: 'relayuser',
+            authPass: 'relaypass',
+            groups: ['ALL']
+        });
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         if (!save.ok) { alert('保存失败 (HTTP ' + save.status + ')'); return; }
         relayState = list;
-        addLog('SUCCESS', `已添加轮询域名 ${domain}:${nextPort}`);
+        addLog('SUCCESS', `已添加轮询域名，请在卡片上填写域名/端口/用户/密码`);
         renderRelayDomains();
     } catch (e) {
         alert('添加轮询域名失败: ' + e.message);
@@ -1981,7 +1980,13 @@ async function updateRelayDomainField(id, field, val) {
         const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
         const rd = list.find(x => x.id === id);
         if (!rd) return;
-        rd[field] = field === 'port' ? (parseInt(val) || 0) : val;
+        if (field === 'port') {
+            const p = parseInt(val, 10);
+            if (!p || p < 1024 || p > 65535) { addLog('WARN', '端口无效（1024-65535），已保留原值'); renderRelayDomains(); return; }
+            rd[field] = p;
+        } else {
+            rd[field] = val;
+        }
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         if (!save.ok) { addLog('WARN', `更新失败 (HTTP ${save.status})`); return; }
         relayState = list;
