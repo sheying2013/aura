@@ -1907,7 +1907,7 @@ function fallbackCopy(text) {
 async function addRelayDomain() {
     const domain = prompt('请输入轮询域名:');
     if (!domain) return;
-    const portStr = prompt('请输入监听端口:', '53000');
+    const portStr = prompt('请输入监听端口:', '33440');
     if (!portStr) return;
     const port = parseInt(portStr, 10);
     if (!port) { alert('端口无效'); return; }
@@ -1916,17 +1916,21 @@ async function addRelayDomain() {
         const r = await api('/api/settings');
         const s = await r.json();
         const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
-        list.push({ id: 'relay-' + Date.now().toString(36), domain: domain, port: port, authUser: '', authPass: '', groups: [] });
+        const nextPort = port === 33440 && list.length > 0
+            ? Math.max(...list.map(x => parseInt(x.port) || 0), 33440) + 1
+            : port;
+        list.push({ id: 'relay-' + Date.now().toString(36), domain: domain, port: nextPort, authUser: 'relayuser', authPass: 'relaypass', groups: ['ALL'] });
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         if (!save.ok) { alert('保存失败 (HTTP ' + save.status + ')'); return; }
-        addLog('SUCCESS', `已添加轮询域名 ${domain}:${port}`);
+        relayState = list;
+        addLog('SUCCESS', `已添加轮询域名 ${domain}:${nextPort}`);
         renderRelayDomains();
     } catch (e) {
         alert('添加轮询域名失败: ' + e.message);
     }
 }
 
-/** 渲染轮询域名列表（relay-domain-list） */
+/** 渲染轮询域名卡片（域名/端口/用户/密码可编辑 + 分组勾选 + URI 显示复制） */
 function renderRelayDomains() {
     const listEl = document.getElementById('relay-domain-list');
     if (!listEl) return;
@@ -1934,14 +1938,86 @@ function renderRelayDomains() {
         listEl.innerHTML = `<div style="color: var(--rock); padding: 12px 0;">暂无轮询域名，点击上方添加。</div>`;
         return;
     }
-    listEl.innerHTML = relayState.map(rd => `
-        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px dashed var(--dim); padding:8px 0;">
-            <div><strong>${escapeHtml(rd.domain)}</strong> <span class="group-tag">:${escapeHtml(rd.port)}</span></div>
-            <div style="display:flex; gap:6px;">
+    const groups = Array.from(new Set(nodeState.map(n => n.group || '默认分组')));
+    const allGroups = ['ALL', ...groups];
+
+    listEl.innerHTML = relayState.map((rd, idx) => {
+        const uri = `socks5://${rd.authUser || ''}:${rd.authPass || ''}@${rd.domain}:${rd.port}`;
+        return `<div style="border:1px solid rgba(180,165,140,.18); border-radius:8px; padding:14px 16px; background:rgba(11,15,20,.5);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <span style="font-weight:600; font-size:15px;">域名 ${idx + 1}</span>
                 <button class="btn-action danger" onclick="removeRelayDomain('${escapeHtml(rd.id)}')">删除</button>
             </div>
-        </div>
-    `).join('');
+            <div style="display:grid; grid-template-columns: 1.5fr 0.7fr 0.7fr 0.7fr; gap:12px; margin-bottom:10px;">
+                <div><label class="form-label" style="font-size:12px;">域名 / IP</label>
+                    <input type="text" class="form-input" value="${escapeHtml(rd.domain)}" onchange="updateRelayDomainField('${escapeHtml(rd.id)}','domain',this.value)"></div>
+                <div><label class="form-label" style="font-size:12px;">端口</label>
+                    <input type="number" class="form-input" value="${escapeHtml(rd.port)}" onchange="updateRelayDomainField('${escapeHtml(rd.id)}','port',this.value)"></div>
+                <div><label class="form-label" style="font-size:12px;">用户</label>
+                    <input type="text" class="form-input" value="${escapeHtml(rd.authUser || '')}" onchange="updateRelayDomainField('${escapeHtml(rd.id)}','authUser',this.value)"></div>
+                <div><label class="form-label" style="font-size:12px;">密码</label>
+                    <input type="text" class="form-input" value="${escapeHtml(rd.authPass || '')}" onchange="updateRelayDomainField('${escapeHtml(rd.id)}','authPass',this.value)"></div>
+            </div>
+            <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+                <span style="font-size:12px; opacity:0.8;">轮询分组：</span>
+                ${allGroups.map(g => `
+                    <label style="font-size:12px; cursor:pointer; display:flex; align-items:center; gap:4px;">
+                        <input type="checkbox" ${(rd.groups || []).includes(g) ? 'checked' : ''} onchange="toggleRelayDomainGroup('${escapeHtml(rd.id)}','${escapeHtml(g)}',this.checked)"> ${escapeHtml(g)}
+                    </label>`).join('')}
+            </div>
+            <div style="margin-top:10px; display:flex; align-items:center; gap:8px; font-family: var(--font-mono); font-size:11px; opacity:0.8;">
+                <span style="word-break:break-all;">${escapeHtml(uri)}</span>
+                <button class="btn-action" onclick="copyToClipboard('${uri.replace(/'/g, "\\'")}')">复制</button>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+/** 编辑 relay 域名字段（域名/端口/用户/密码），保存后重建配置生效 */
+async function updateRelayDomainField(id, field, val) {
+    try {
+        const r = await api('/api/settings');
+        const s = await r.json();
+        const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
+        const rd = list.find(x => x.id === id);
+        if (!rd) return;
+        rd[field] = field === 'port' ? (parseInt(val) || 0) : val;
+        const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
+        if (!save.ok) { addLog('WARN', `更新失败 (HTTP ${save.status})`); return; }
+        relayState = list;
+        addLog('INFO', `已更新 ${field} → ${val}`);
+        renderRelayDomains();
+    } catch (e) {
+        addLog('ERROR', '更新失败: ' + e.message);
+    }
+}
+
+/** 勾选/取消 relay 域名轮询分组 */
+async function toggleRelayDomainGroup(id, group, checked) {
+    try {
+        const r = await api('/api/settings');
+        const s = await r.json();
+        const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
+        const rd = list.find(x => x.id === id);
+        if (!rd) return;
+        if (!Array.isArray(rd.groups)) rd.groups = [];
+        if (checked && !rd.groups.includes(group)) rd.groups.push(group);
+        if (!checked) rd.groups = rd.groups.filter(g => g !== group);
+        const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
+        if (!save.ok) { addLog('WARN', `分组更新失败 (HTTP ${save.status})`); return; }
+        relayState = list;
+        addLog('INFO', `轮询分组 ${group} ${checked ? '加入' : '移除'}`);
+        renderRelayDomains();
+    } catch (e) {
+        addLog('ERROR', '分组更新失败: ' + e.message);
+    }
+}
+
+/** 复制文本到剪贴板（通用） */
+function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => addLog('SUCCESS', '已复制到剪贴板')).catch(() => fallbackCopy(text));
+    } else fallbackCopy(text);
 }
 
 async function removeRelayDomain(id) {
@@ -1953,6 +2029,7 @@ async function removeRelayDomain(id) {
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         if (!save.ok) { alert('删除失败 (HTTP ' + save.status + ')'); return; }
         addLog('SUCCESS', `已删除轮询域名 ${id}`);
+        relayState = list;
         renderRelayDomains();
     } catch (e) {
         alert('删除失败: ' + e.message);
