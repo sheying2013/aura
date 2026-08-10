@@ -217,7 +217,7 @@ def create_node_batch(body: models.NodeBatchRequest):
         })
     result = db.create_node_batch(prepared)
     if skipped_unparsable:
-        result["skipped"] += skipped_unparsable
+        result["failed"] = skipped_unparsable
     return result
 
 

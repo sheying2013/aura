@@ -1581,9 +1581,8 @@ async function handleBatchImport() {
         }
         const rows = [
             ['成功导入', opts.created, 'var(--success)'],
-            ['跳过（无法解析/重复）', opts.skipped, 'var(--rock)'],
             ['重复（已存在）', opts.duplicate, 'var(--fg)'],
-            ['失败', opts.failed, 'var(--danger)']
+            ['失败（无法解析）', opts.failed, 'var(--danger)']
         ].filter(([, v]) => v > 0);
         rl.innerHTML = `
             <div class="import-panel">

@@ -70,6 +70,7 @@ class NodeBatchResponse(BaseModel):
     created: int = 0
     skipped: int = 0
     duplicate: int = 0
+    failed: int = 0
     items: List[Node] = []
 
 
