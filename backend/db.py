@@ -439,7 +439,8 @@ def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = F
                     skipped += 1
                     continue
                 existing_servers.add(key)
-            # 端口冲突则跳过（不入库，避免 IntegrityError 中断整批）
+            # 端口冲突则顺位分配（不入库会跳过整个节点，回归修复：指定端口被占
+            # 时顺位到下一个空闲端口，而不是整批 skipped）
             port = nd.get("port")
             if not port:
                 # 自动分配：从 52001 起找既不在 DB 也不在批内已用端口的空闲端口
@@ -448,8 +449,15 @@ def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = F
                 while port in db_used or port in batch_ports:
                     port += 1
             elif port in db_used or port in batch_ports:
-                skipped += 1
-                continue
+                # 指定端口被占用 → 顺位找下一个空闲端口（保持批内连续递增语义）
+                while port in db_used or port in batch_ports:
+                    port += 1
+                    if port > 65535:
+                        port = 0
+                        break
+                if port == 0:
+                    skipped += 1
+                    continue
             batch_ports.add(port)
             db_used.add(port)
             nd["port"] = port
