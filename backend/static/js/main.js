@@ -880,7 +880,7 @@ function renderDashRelayStatus() {
         return;
     }
     el.innerHTML = relayState.map(rd => {
-        const label = `${escapeHtml(rd.domain)}:${escapeHtml(rd.port)}`;
+        const label = `Port ${escapeHtml(rd.port)}`;
         const tip = `socks5://${escapeHtml(rd.authUser || '')}:***@${escapeHtml(rd.domain)}:${escapeHtml(rd.port)}`;
         return `<span title="${tip}" style="color: var(--success); border: 1px solid var(--success); padding: 2px 8px; border-radius: 4px;">${label}</span>`;
     }).join('');
