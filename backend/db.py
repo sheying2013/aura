@@ -706,17 +706,16 @@ def list_relay_domains() -> List[Dict]:
 
 
 def upsert_relay_domains(domains: List[Dict]) -> None:
-    """整表替换（settings 里 relayDomains 全量 PUT 时同步）。
+    """整表替换（settings 里 relayDomains 全量 PUT 时同步，settings 是唯一真源）。
 
-    P2-3：port UNIQUE 约束下 INSERT OR REPLACE 会静默删旧行（同名/同端口新域名
-    覆盖旧域名，且可能破坏其他关联）。改为：先按 id 删对应行，再 INSERT——同 id
-    更新、不同 id 同端口冲突时抛 IntegrityError（由调用方捕获提示，不静默删行）。
+    必须全删再插：settings 与 relay_domains 双份数据，若只删"列表内 id"，
+    用户删除旧 relay 后旧行永不清理 → config 生成用残留旧数据（旧凭据/旧端口），
+    新 relay 配置不生效（pu.993699.xyz 连不通事故根因）。
+    端口 UNIQUE 冲突时跳过新行（保留 DB 已有行，不静默覆盖）。
     """
     with _lock:
         c = connect()
-        ids = [d["id"] for d in domains if d.get("id")]
-        if ids:
-            c.executemany("DELETE FROM relay_domains WHERE id = ?", [(i,) for i in ids])
+        c.execute("DELETE FROM relay_domains")
         for d in domains:
             try:
                 c.execute(
@@ -725,7 +724,7 @@ def upsert_relay_domains(domains: List[Dict]) -> None:
                      d.get("authPass"), json.dumps(d.get("groups", ["ALL"]), ensure_ascii=False)),
                 )
             except sqlite3.IntegrityError:
-                continue  # 端口冲突：跳过新行，保留旧行（不静默删）
+                continue  # 端口冲突：跳过新行（不静默覆盖已有行）
         c.commit()
 
 
