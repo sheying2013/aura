@@ -1113,8 +1113,14 @@ async function exportSingleNode(nodeId) {
     const node = nodeState.find(n => n.id === nodeId);
     if (!node) return;
     const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
+    const exportType = document.getElementById('export-type-select') ? document.getElementById('export-type-select').value : 'converted';
     const vpsIp = window.location.hostname || '127.0.0.1';
-    const text = `# 节点: ${node.name} | 协议: ${(node.protocol || '').toUpperCase()}\n${exportLinkLines(node, vpsIp, protoSel).join('\n')}`;
+    const uriLines = exportNodeLines(node, vpsIp, protoSel, exportType);
+    if (uriLines.length === 0) {
+        addLog('WARN', `节点 [${node.name}] 没有可导出的原始链接`);
+        return;
+    }
+    const text = `# 节点: ${node.name} | 协议: ${(node.protocol || '').toUpperCase()}${exportType === 'original' ? ' | 原始链接' : ''}\n${uriLines.join('\n')}`;
     const area = document.getElementById('export-text-area');
     if (area) {
         area.value = text;
@@ -1122,7 +1128,7 @@ async function exportSingleNode(nodeId) {
         if (exportNav) exportNav.click();
     }
     copyToClipboard(text);
-    addLog('SUCCESS', `已生成节点 [${node.name}] 的中转链接`);
+    addLog('SUCCESS', `已生成节点 [${node.name}] 的${exportType === 'original' ? '原始链接' : '中转链接'}`);
 }
 
 // Checkbox and Toolbar Handlers
@@ -1445,18 +1451,30 @@ function exportLinkLines(node, vpsIp, protoSel) {
     return lines;
 }
 
-/** 导出页：按分组/协议生成全部节点导出文本 */
+/** 按导出类型取节点链接行：converted=本机转换后入口，original=原始链接 */
+function exportNodeLines(node, vpsIp, protoSel, exportType) {
+    if (exportType === 'original') {
+        const uri = node.rawConfig && node.rawConfig.uri;
+        return uri ? [uri] : [];
+    }
+    return exportLinkLines(node, vpsIp, protoSel);
+}
+
+/** 导出页：按分组/类型/协议生成全部节点导出文本 */
 function generateExportText() {
     const groupSel = document.getElementById('export-group-select') ? document.getElementById('export-group-select').value : 'ALL';
     const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
+    const exportType = document.getElementById('export-type-select') ? document.getElementById('export-type-select').value : 'converted';
     const vpsIp = window.location.hostname || '127.0.0.1';
 
     const nodesToExport = nodeState.filter(n => groupSel === 'ALL' || n.group === groupSel);
 
     const lines = [];
     nodesToExport.forEach(n => {
-        lines.push(`# 节点: ${n.name} | 协议: ${n.protocol} | 分组: ${n.group}`);
-        lines.push(...exportLinkLines(n, vpsIp, protoSel));
+        const uriLines = exportNodeLines(n, vpsIp, protoSel, exportType);
+        if (uriLines.length === 0) return;
+        lines.push(`# 节点: ${n.name} | 协议: ${n.protocol} | 分组: ${n.group}${exportType === 'original' ? ' | 原始链接' : ''}`);
+        lines.push(...uriLines);
         lines.push('');
     });
 
@@ -1487,12 +1505,15 @@ async function exportSelectedNodes() {
     if (!exportArea) return;
 
     const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
+    const exportType = document.getElementById('export-type-select') ? document.getElementById('export-type-select').value : 'converted';
     const vpsIp = window.location.hostname || '127.0.0.1';
 
     let text = '';
     targetNodes.forEach(n => {
-        text += `# 节点: ${n.name} | 协议: ${n.protocol} | 分组: ${n.group}\n`;
-        text += exportLinkLines(n, vpsIp, protoSel).join('\n');
+        const uriLines = exportNodeLines(n, vpsIp, protoSel, exportType);
+        if (uriLines.length === 0) return;
+        text += `# 节点: ${n.name} | 协议: ${n.protocol} | 分组: ${n.group}${exportType === 'original' ? ' | 原始链接' : ''}\n`;
+        text += uriLines.join('\n');
         text += '\n\n';
     });
     exportArea.value = text;

@@ -1308,6 +1308,13 @@
                             </select>
                         </div>
                         <div class="form-group" style="flex: 1; margin: 0; min-width: 140px;">
+                            <label class="form-label">导出类型</label>
+                            <select id="export-type-select" class="form-select" onchange="generateExportText()">
+                                <option value="converted">转换后节点（本机入口）</option>
+                                <option value="original">原始节点（原链接）</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="flex: 1; margin: 0; min-width: 140px;">
                             <label class="form-label">协议</label>
                             <select id="export-proto-select" class="form-select" onchange="generateExportText()">
                                 <option value="both">socks5 + http</option>
@@ -1718,5 +1725,5 @@
         </div>
     </div>
 
-    <script src="js/main.js?v=20260810f"></script>
+    <script src="js/main.js?v=20260810g"></script>
 </body>
