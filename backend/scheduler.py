@@ -21,6 +21,9 @@ _ip_enrich_pending: set = set()  # 防同一节点并发重复查
 _ip_enrich_last: Dict[str, float] = {}  # 节点 → 上次补查时间（防每轮探活重复查）
 _ENRICH_COOLDOWN = 300  # 5 分钟冷却：补查后即使情报不全也不重查（避免每轮 curl 所有节点）
 
+# relay 出口切换时间戳（relay_id → 上次 PUT 切换的 epoch 秒），粘滞超时跨探活轮次保持
+_relay_switch_time: Dict[str, float] = {}
+
 
 
 def _is_ip_address(s: str) -> bool:
@@ -387,12 +390,129 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
             await cm.apply_config()
         except Exception:
             pass
+    # 探活后同步 relay 出口（粘滞超时逻辑）：
+    # 粘滞期内保持当前出口不动；超过粘滞时长切到延迟最优节点。
+    # 每次探活刷新出口（探活周期=粘滞决策周期），已是最优则不动。
+    try:
+        await _sync_relay_exits_after_probe()
+    except Exception:
+        pass
     return results
+
+
+# ---------- relay 出口粘滞超时 ----------
+
+async def _sync_relay_exits_after_probe() -> None:
+    """探活后按粘滞超时刷新 relay 出口（selector 运行时切换，零热重载）。
+
+    语义：每个 relay-auto-<id> 出口记录切换时间；距离上次切换 < 粘滞时长 →
+    保持不动；已超时 → 在当前分组可达节点里挑延迟最优（clash delay）切换。
+    关闭粘滞 → 每次探活都切最优。设置是唯一真源（与 upsert 一致）。
+    """
+    import config_manager as cm
+    import httpx
+
+    settings = db.get_setting("system", {}) or {}
+    sticky_enabled = bool(settings.get("stickyEnabled"))
+    sticky_timeout = (settings.get("stickyTimeout") or "5m").strip().lower()
+    # 解析粘滞时长（30s / 5m / 10m / 1h）
+    try:
+        unit = sticky_timeout[-1]
+        val = float(sticky_timeout[:-1])
+        if unit == "s":
+            sticky_sec = val
+        elif unit == "m":
+            sticky_sec = val * 60
+        elif unit == "h":
+            sticky_sec = val * 3600
+        else:
+            sticky_sec = 300
+    except (ValueError, IndexError):
+        sticky_sec = 300
+    sticky_sec = max(sticky_sec, 5)
+
+    relays = db.list_relay_domains()
+    if not relays:
+        return
+    # 节点快照：name/group/status/协议端口 tag（排除停用）
+    nodes = [n for n in db.list_nodes() if n.get("status") != "disabled"]
+    node_by_tag = {cm.outbound_tag(n["protocol"], n["port"]): n for n in nodes}
+    hdrs = {"Authorization": f"Bearer {cm.get_clash_secret()}"}
+    test_url = settings.get("testUrl", "https://www.gstatic.com/generate_204")
+    if not test_url or not str(test_url).startswith("https://"):
+        test_url = "https://www.gstatic.com/generate_204"
+
+    async def _delay(tag: str) -> Optional[int]:
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(
+                    f"{cm.clash_base()}/proxies/{tag}/delay",
+                    params={"url": test_url, "timeout": "3000"},
+                    headers=hdrs,
+                )
+            if r.status_code == 200:
+                d = r.json().get("delay")
+                return int(d) if d is not None else None
+        except Exception:
+            return None
+        return None
+
+    async def _current(rd_tag: str) -> Optional[str]:
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.get(f"{cm.clash_base()}/proxies/{rd_tag}", headers=hdrs)
+            if r.status_code == 200:
+                now = r.json().get("now")
+                return now if now and now != rd_tag else None
+        except Exception:
+            pass
+        return None
+
+    for rd in relays:
+        rd_tag = f"relay-auto-{rd['id']}"
+        # 按 relay 的 groups 过滤可达节点（与 config 生成一致：ALL 或包含该分组）
+        sel_groups = rd.get("groups") or ["ALL"]
+        targets = [
+            t for t, n in node_by_tag.items()
+            if ("ALL" in sel_groups or n.get("group") in sel_groups)
+        ]
+        if not targets:
+            continue
+        cur = await _current(rd_tag)
+        # 粘滞期内：保持当前出口（当前出口必须仍在本组可达池，否则强制切换）
+        if sticky_enabled and cur and cur in targets:
+            last = _relay_switch_time.get(rd["id"], 0)
+            if time.time() - last < sticky_sec:
+                continue
+        # 挑延迟最优（当前出口也参与比较；全不通则跳过）
+        best, best_delay = None, None
+        cands = targets if cur not in targets else targets
+        for t in cands:
+            d = await _delay(t)
+            if d is not None and (best_delay is None or d < best_delay):
+                best, best_delay = t, d
+        if best is None or best == cur:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.put(f"{cm.clash_base()}/proxies/{rd_tag}",
+                                     json={"name": best}, headers=hdrs)
+            if r.status_code in (200, 204):
+                _relay_switch_time[rd["id"]] = time.time()
+                print(f"[relay-exit] {rd_tag} 出口 → {best} (delay {best_delay}ms)")
+        except Exception as e:
+            print(f"[relay-exit] PUT 切换 {rd_tag} 失败: {e}")
 
 
 async def _probe_loop() -> None:
     while True:
-        await asyncio.sleep(PING_INTERVAL)
+        # 探活间隔可配置（系统设置「自动延迟探活间隔（秒）」），下限 10s 防误配
+        settings = db.get_setting("system", {}) or {}
+        try:
+            interval = max(int(settings.get("probeInterval") or PING_INTERVAL), 10)
+        except (TypeError, ValueError):
+            interval = PING_INTERVAL
+        await asyncio.sleep(interval)
         if config_manager.is_running():
             try:
                 results = await probe_nodes()
@@ -434,7 +554,8 @@ async def _rotate_random_relay() -> None:
     PUT /proxies/{tag} 只影响新连接、不断已有连接——与固定节点互不干扰。
     轮询时**实时探活候选节点**（clash delay，不走 60s 探活快照）：不通就跳过
     换下一个候选（最多试 10 个），全部不通则维持当前出口不切换——轮询模式
-    自动避开已断线节点。返回选中的 outbound tag（无可用节点返回 None）。
+    自动避开已断线节点。**按每个 relay 的分组过滤候选**（与 config 生成一致），
+    避免把分组外的节点切到该 relay 的出口。返回选中的 outbound tag（无可用节点返回 None）。
     """
     import config_manager as cm
     import httpx
@@ -465,7 +586,12 @@ async def _rotate_random_relay() -> None:
         except Exception:
             return False
 
-    # 实时校验：随机打乱候选，逐个 delay 探测，跳过不通的节点
+    def _group_candidates(rd: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """按 relay 的 groups 过滤候选池（与 config 生成一致：ALL 或包含该分组）。"""
+        sel_groups = rd.get("groups") or ["ALL"]
+        return [n for n in pool if "ALL" in sel_groups or n.get("group") in sel_groups]
+
+    # 先随机挑一个可用节点（全局池），各 relay 再按分组过滤/回退
     candidates = list(pool)
     random.shuffle(candidates)
     chosen = None
@@ -477,14 +603,25 @@ async def _rotate_random_relay() -> None:
         print("[relay-rotate] 本轮候选节点全部不通，维持当前出口")
         return None
     tag = outbound_tag_for(chosen)
-    # 运行时切换：selector 支持 PUT /proxies（urltest 不支持，故生成层已改用 selector）
+    # 运行时切换：selector 支持 PUT /proxies（urltest 不支持，故生成层已改用 selector）。
+    # 每个 relay 独立：分组内有可达候选 → 分组内随机切换；否则回退全局已选出口。
     for rd in db.list_relay_domains():
         rd_tag = f"relay-auto-{rd['id']}"
+        rd_cands = _group_candidates(rd)
+        target = tag
+        if rd_cands:
+            # 分组内随机挑（与全局选择互相独立：每个 relay 有各自的分组轮询出口）
+            g = list(rd_cands)
+            random.shuffle(g)
+            for node in g[:10]:
+                if await _is_alive(node):
+                    target = outbound_tag_for(node)
+                    break
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
                 await client.put(
                     f"{cm.clash_base()}/proxies/{rd_tag}",
-                    json={"name": tag},
+                    json={"name": target},
                     headers=hdrs,
                 )
         except Exception as e:

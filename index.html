@@ -1088,6 +1088,7 @@
                         <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                             <button class="btn" onclick="openConvertEntryModal()">↔ 转换入口协议</button>
                             <button class="btn" onclick="reassignAllPorts()">重新编排端口</button>
+                            <button class="btn" onclick="openBatchGroupModal()">批量编辑分组</button>
                             <button class="btn" onclick="exportSelectedNodes()">导出选中节点</button>
                             <button class="btn" onclick="enableSelectedNodes()">启用选中</button>
                             <button class="btn" onclick="enableAllDisabledNodes()">全部启用</button>
@@ -1591,6 +1592,24 @@
             <div class="modal-actions">
                 <button class="btn" onclick="closeModal('convert-entry-modal')">取消</button>
                 <button class="btn btn-primary" onclick="handleConvertEntry()">开始转换</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3b. 批量编辑分组 Modal -->
+    <div class="modal-overlay" id="batch-group-modal">
+        <div class="modal-content" style="max-width: 460px;">
+            <h2 class="modal-title">批量编辑分组</h2>
+            <div id="batch-group-hint" style="font-size: 12px; opacity: 0.8; margin-bottom: 14px;"></div>
+            <div class="form-group">
+                <label class="form-label">目标分组</label>
+                <input type="text" id="batch-group-input" class="form-input" list="batch-group-options" placeholder="输入分组名（支持已有分组补全）" autocomplete="off">
+                <datalist id="batch-group-options"></datalist>
+            </div>
+            <div id="batch-group-error" style="color: var(--danger); font-size: 11px; margin-bottom: 14px; min-height: 16px;"></div>
+            <div class="modal-actions">
+                <button class="btn" onclick="closeModal('batch-group-modal')">取消</button>
+                <button class="btn btn-primary" onclick="handleBatchGroup()">应用分组</button>
             </div>
         </div>
     </div>

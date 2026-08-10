@@ -164,13 +164,13 @@ def clash_base() -> str:
 def _signal_singbox(sig: signal.Signals) -> int:
     """向本面板的 sing-box 进程发信号，返回命中数。
 
-    host 网络 + slim 镜像（无 pkill/ps）下遍历 /proc 找 sing-box 进程。
-    host 网络下 sing-box 可能逃逸到宿主 PID 空间，容器内 /proc 若看不到
-    则返回 0（调用方应回退到宿主机手段）。
+    Linux（host 网络 + slim 镜像无 pkill/ps）遍历 /proc 按命令行特征找进程；
+    macOS/其他无 /proc 平台回退 pkill -f（按完整命令匹配，避免误杀其他 sing-box）。
+    命中数为 0 时调用方应降级处理（如冷重启兜底）。
     """
     hits = 0
+    cmdline_marker = f"sing-box run -c {CONFIG_PATH}"
     try:
-        cmdline_marker = f"sing-box run -c {CONFIG_PATH}"
         for pid in os.listdir("/proc"):
             if not pid.isdigit():
                 continue
@@ -185,8 +185,20 @@ def _signal_singbox(sig: signal.Signals) -> int:
                     hits += 1
                 except (OSError, ProcessLookupError):
                     pass
+        if hits:
+            return hits
     except OSError:
         pass
+    # 无 /proc（macOS 等）或未命中：pkill 按命令行特征兜底（信号参数必须在最前，
+    # 否则被当作 pattern 的一部分，macOS 会退化成默认 SIGTERM 直接杀进程）
+    try:
+        import subprocess
+        sig_name = signal.Signals(sig).name  # SIGHUP / SIGTERM → "-HUP" / "-TERM"
+        proc = subprocess.run(["pkill", f"-{sig_name}", "-f", cmdline_marker],
+                              capture_output=True, timeout=5)
+        hits = 1 if proc.returncode == 0 else 0
+    except Exception:
+        hits = 0
     return hits
 
 
@@ -220,6 +232,7 @@ def build_config() -> Dict[str, Any]:
     route_rules: List[Dict] = []
     errors: List[Dict[str, str]] = []
     outbound_tag_set: Set[str] = set()
+    used_inbound_ports: Set[int] = set()  # 已占用的入站端口（节点 + relay），防总入口冲突
 
     for node in nodes:
         # 已停用节点（连续探活失败自动停用）：不生成 inbound/outbound，不参与轮询
@@ -232,6 +245,7 @@ def build_config() -> Dict[str, Any]:
         tag_in = f"in-mixed-{node['port']}"
         tag_out = outbound_tag(node["protocol"], node["port"])
         entry_proto = node.get("entryProto") or "mixed"
+        used_inbound_ports.add(int(node["port"]))
         if entry_proto == "ss":
             # Shadowsocks 单协议入站：aes-256-gcm + 节点 ss 密码
             ss_pass = node.get("ssPass") or node.get("authPass") or "relaypass"
@@ -402,6 +416,7 @@ def build_config() -> Dict[str, Any]:
         selected_groups = rd.get("groups") or ["ALL"]
         rd_nodes = [n for n in nodes if n.get("status") != "disabled"
                     and ("ALL" in selected_groups or n.get("group") in selected_groups)]
+        used_inbound_ports.add(rd_port)
         inbounds.append({
             "type": "mixed", "tag": rd_in_tag, "listen": listen_ip,
             "listen_port": rd_port,
@@ -424,11 +439,43 @@ def build_config() -> Dict[str, Any]:
         outbounds.append(rd_selector)
         route_rules.append({"inbound": [rd_in_tag], "outbound": rd_out_tag})
 
+    # 面板总入口（系统设置「入站监听端口」）：全局 mixed 入口 + main-auto selector，
+    # 出口由探活/粘滞/随机轮询调度（与 relay 同一套机制，ALL 组语义）。
+    # 端口为 0/冲突/未配置时不生成（避免占用端口和启动失败）。
+    main_port = _safe_int(settings.get("inboundPort") or 0)
+    if main_port > 0 and main_port not in used_inbound_ports:
+        main_nodes = [n for n in nodes if n.get("status") != "disabled"]
+        main_targets = [outbound_tag(n["protocol"], n["port"]) for n in main_nodes]
+        main_targets = [t for t in main_targets if t in outbound_tag_set]
+        if main_targets:
+            main_selector = {
+                "type": "selector", "tag": "main-auto",
+                "outbounds": main_targets,
+            }
+            # 随机轮询开启时沿用当前选中（与 relay 一致，重启后不丢出口）
+            if settings.get("randomRotateEnabled") and settings.get("randomRotateCurrent"):
+                cur = settings["randomRotateCurrent"]
+                if cur in main_targets:
+                    main_selector["default"] = cur
+            outbounds.append(main_selector)
+            inbounds.append({
+                "type": "mixed", "tag": "in-main", "listen": listen_ip,
+                "listen_port": main_port,
+                "users": [{"username": settings.get("mainAuthUser") or "user",
+                           "password": settings.get("mainAuthPass") or "pass"}],
+            })
+            route_rules.append({"inbound": ["in-main"], "outbound": "main-auto"})
+
     outbounds.append({"type": "direct", "tag": "direct"})
     outbounds.append({"type": "block", "tag": "block"})
 
+    # 日志等级可配置（系统设置「日志等级」）；白名单校验防误配
+    log_level = str((db.get_setting("system", {}) or {}).get("logLevel") or "info").lower()
+    if log_level not in ("trace", "debug", "info", "warn", "error", "fatal"):
+        log_level = "info"
+
     config = {
-        "log": {"level": "info", "timestamp": True},
+        "log": {"level": log_level, "timestamp": True},
         "experimental": {
             "clash_api": {
                 "external_controller": f"{CLASH_HOST}:{get_clash_port()}",
@@ -476,6 +523,8 @@ def _detect_port_conflict(ports: Set[int]) -> List[int]:
             managed.add(_safe_int(rd["port"]))
         # sing-box 正运行时自己占着 clash API 端口，不算外部冲突
         managed.add(get_clash_port())
+        # 面板总入口端口（in-main）也由 sing-box 自己监听，不算外部冲突
+        managed.add(_safe_int((db.get_setting("system", {}) or {}).get("inboundPort") or 0))
     conflicted = []
     for p in ports | {get_clash_port()}:
         if p in managed:
@@ -609,38 +658,43 @@ async def _start_unlocked() -> bool:
 
 
 async def stop() -> None:
-    global _proc, _logf, _wait_task
     async with _op_lock:
-        if _proc is not None:
+        await _stop_unlocked()
+
+
+async def _stop_unlocked() -> None:
+    """无锁内核版 stop（调用方需已持 _op_lock，如 _apply_config_impl 内）。"""
+    global _proc, _logf, _wait_task
+    if _proc is not None:
+        try:
+            _proc.send_signal(signal.SIGTERM)
             try:
-                _proc.send_signal(signal.SIGTERM)
-                try:
-                    await asyncio.wait_for(_proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    _proc.kill()
+                await asyncio.wait_for(_proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                _proc.kill()
+        except Exception:
+            pass
+        # 取消收割任务，避免其 try/finally 中访问已回收的 _proc
+        if _wait_task is not None:
+            _wait_task.cancel()
+            try:
+                await _wait_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            _wait_task = None
+        _proc = None
+        # 关闭日志句柄避免 fd 泄漏
+        if _logf is not None:
+            try:
+                _logf.close()
             except Exception:
                 pass
-            # 取消收割任务，避免其 try/finally 中访问已回收的 _proc
-            if _wait_task is not None:
-                _wait_task.cancel()
-                try:
-                    await _wait_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                _wait_task = None
-            _proc = None
-            # 关闭日志句柄避免 fd 泄漏
-            if _logf is not None:
-                try:
-                    _logf.close()
-                except Exception:
-                    pass
-                _logf = None
-            return
-        # _proc 丢失但 clash 探测仍活着（如 uvicorn 崩溃重启后 sing-box 残留），
-        # 兜底遍历 /proc 按命令行特征清理，避免面板显示已停止而 sing-box 仍占用端口。
-        if is_running():
-            _signal_singbox(signal.SIGTERM)
+            _logf = None
+        return
+    # _proc 丢失但 clash 探测仍活着（如 uvicorn 崩溃重启后 sing-box 残留），
+    # 兜底遍历 /proc 按命令行特征清理，避免面板显示已停止而 sing-box 仍占用端口。
+    if is_running():
+        _signal_singbox(signal.SIGTERM)
 
 
 async def reload_config() -> bool:
@@ -666,21 +720,67 @@ async def reload_config() -> bool:
     else:
         if _signal_singbox(signal.SIGHUP) == 0:
             return False
-    # 等 clash API 恢复（旧实例关闭到新实例就绪的窗口 <1s 左右；最多 5s）
+    # 等 clash API 恢复 + 验证新配置真正加载：
+    # /version 可达只说明实例活着——旧实例 SIGHUP 后 check() 失败会保留旧配置，
+    # 此时 /version 依然 200，仅靠可达性会误报重载成功（曾致配置更新不生效）。
+    # 判据：socket 探测新配置的 inbound 端口是否已监听（reload 成功 = 新端口已起）。
+    # sing-box /configs 不返回 inbounds（Clash 兼容字段），不能用它比对。
+    disk_cfg = _last_good_config or {}
+    # 探测地址：inbound 的 listen（可能是 0.0.0.0 → 用 127.0.0.1 探测）
+    probe_ports = []
+    listen_ip = "127.0.0.1"
+    for ib in disk_cfg.get("inbounds", []):
+        if ib.get("listen_port"):
+            probe_ports.append(int(ib["listen_port"]))
+            lip = str(ib.get("listen") or "127.0.0.1")
+            if lip in ("0.0.0.0", "::"):
+                listen_ip = "127.0.0.1"
+            else:
+                listen_ip = lip
     hdrs = {"Authorization": f"Bearer {get_clash_secret()}"}
+
+    async def _probe_ok() -> bool:
+        """探测新配置全部 inbound 端口是否已监听。
+        open_connection 成功即端口可连；只关 writer（StreamReader 无 close）。"""
+        ok = True
+        for p in probe_ports:
+            try:
+                _, ww = await asyncio.open_connection(listen_ip, p)
+                ww.close()
+                try:
+                    await ww.wait_closed()
+                except Exception:
+                    pass
+            except Exception:
+                ok = False
+                break
+        return ok
+
     try:
+        # 信号发出后立即探测一次（reload 可能 <0.5s 完成，轮询首拍可能漏）
         async with httpx.AsyncClient(timeout=1.0) as client:
-            for _ in range(10):
+            try:
+                r = await client.get(f"{clash_base()}/version", headers=hdrs)
+                if r.status_code == 200 and await _probe_ok():
+                    return True
+            except Exception:
+                pass
+        # 未立即命中：轮询等待 clash API 恢复窗口 + 端口监听
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            for _ in range(12):
                 await asyncio.sleep(0.5)
                 try:
                     r = await client.get(f"{clash_base()}/version", headers=hdrs)
-                    if r.status_code == 200:
-                        return True
+                    if r.status_code != 200:
+                        continue  # 旧实例已关，等待新实例就绪
                 except Exception:
-                    pass
+                    continue
+                if await _probe_ok():
+                    return True
+                print(f"[reload] 等待端口监听中: {probe_ports}")
     except Exception:
         pass
-    # clash API 一直没恢复——旧实例可能仍在（check 失败）或已死，交由调用方验证兜底
+    # 6s 内新端口未全部监听——热重载未生效，返回 False 由调用方冷重启兜底
     return False
 
 
@@ -766,7 +866,21 @@ async def _apply_config_impl(provided: Optional[Dict] = None) -> Dict[str, Any]:
 
     # 4. 运行中则热重载，未运行则启动（_apply_config_impl 已持锁，用无锁内核版）
     if is_running():
-        await reload_config()
+        reloaded = await reload_config()
+        if not reloaded:
+            # 热重载未生效（信号没发出 / sing-box check 失败保留旧实例）：
+            # 冷重启兜底，保证新配置真正运行（否则界面报成功但配置一直是旧的）
+            print("[apply] SIGHUP 热重载未生效，降级冷重启")
+            await _stop_unlocked()
+            started = await _start_unlocked()
+            if not started:
+                return {
+                    "ok": False,
+                    "message": "sing-box 重启失败（热重载未生效，请查看 singbox.log）",
+                    "running": False,
+                    "clashApiOk": False,
+                    "errors": errors,
+                }
     else:
         started = await _start_unlocked()
         if not started:

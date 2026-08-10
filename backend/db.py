@@ -582,6 +582,22 @@ def delete_node(node_id: str) -> bool:
         return cur.rowcount > 0
 
 
+def update_nodes_group(ids: List[str], group: str) -> int:
+    """批量更新节点分组（节点列表"批量编辑分组"）。
+    空 ids 返回 0；返回实际更新行数。"""
+    if not ids:
+        return 0
+    with _lock:
+        c = connect()
+        cur = c.execute(
+            "UPDATE nodes SET \"group\"=?, updated_at=? WHERE id IN (%s)"
+            % ",".join("?" * len(ids)),
+            (group, _conn_now(), *ids),
+        )
+        c.commit()
+        return cur.rowcount
+
+
 def delete_node_batch(ids: List[str]) -> int:
     with _lock:
         c = connect()

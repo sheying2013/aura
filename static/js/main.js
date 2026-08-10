@@ -1262,6 +1262,76 @@ function openConvertEntryModal() {
     openModal('convert-entry-modal');
 }
 
+// ---------- 批量编辑分组 ----------
+
+function openBatchGroupModal() {
+    const hint = document.getElementById('batch-group-hint');
+    if (hint) {
+        hint.textContent = selectedNodeIds.size > 0
+            ? `将修改选中的 ${selectedNodeIds.size} 个节点分组`
+            : '未选中节点，请先在列表勾选要修改的节点';
+    }
+    // datalist 补全：已有分组（含默认分组）
+    const options = document.getElementById('batch-group-options');
+    if (options) {
+        const groups = new Set(nodeState.map(n => n.group || '默认分组'));
+        options.innerHTML = [...groups].map(g => `<option value="${escapeHtml(g)}"></option>`).join('');
+    }
+    const errEl = document.getElementById('batch-group-error');
+    if (errEl) errEl.textContent = '';
+    const input = document.getElementById('batch-group-input');
+    if (input) input.value = '';
+    openModal('batch-group-modal');
+    if (input) input.focus();
+}
+
+async function handleBatchGroup() {
+    if (selectedNodeIds.size === 0) {
+        const errEl = document.getElementById('batch-group-error');
+        if (errEl) errEl.textContent = '请先勾选要修改的节点';
+        return;
+    }
+    const input = document.getElementById('batch-group-input');
+    const group = (input ? input.value : '').trim();
+    if (!group) {
+        const errEl = document.getElementById('batch-group-error');
+        if (errEl) errEl.textContent = '请输入目标分组';
+        return;
+    }
+    const ids = Array.from(selectedNodeIds);
+    const btn = document.querySelector('#batch-group-modal .btn-primary');
+    if (btn) { btn.disabled = true; btn.textContent = '应用中...'; }
+    try {
+        const r = await api('/api/nodes/batch-group', {
+            method: 'POST',
+            body: JSON.stringify({ ids, group })
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            const errEl = document.getElementById('batch-group-error');
+            if (errEl) errEl.textContent = (data && data.detail) || `请求失败 (HTTP ${r.status})`;
+            return;
+        }
+        const updated = (data && data.updated) || 0;
+        addLog('SUCCESS', `已将 ${updated} 个节点分组改为 [${group}]`);
+        // 分组是节点属性：本地重载节点（分组影响 relay 轮询池，后端已重建配置）
+        selectedNodeIds.clear();
+        closeModal('batch-group-modal');
+        await loadNodes();
+        updateGroupFilterOptions();
+        renderDashRelayStatus();
+        if (data && data.configApplied === false) {
+            addLog('WARN', `分组已修改，但配置未生效：${data.configMessage || ''}`);
+            alert(`分组已修改，但配置未生效：${data.configMessage || '请查看系统日志'}`);
+        }
+    } catch (e) {
+        const errEl = document.getElementById('batch-group-error');
+        if (errEl) errEl.textContent = '操作失败: ' + e.message;
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '应用分组'; }
+    }
+}
+
 async function handleSaveNodeEdit() {
     if (!editingNodeId) return;
     const name = document.getElementById('edit-node-name').value.trim();
@@ -2196,8 +2266,11 @@ async function loadSettings() {
         const r = await api('/api/settings');
         if (!r.ok) return;
         const s = await r.json();
-        // 轮询域名列表 → relayState + 渲染；relayExits（当前出口）供仪表盘徽标显示
-        relayState = Array.isArray(s.relayDomains) ? s.relayDomains : [];
+        // 轮询域名列表 → relayState + 渲染；relayExits（当前出口）供仪表盘徽标显示。
+        // 有未保存编辑（relayDirty 非空）时不覆盖 relayState，避免周期刷新冲掉本地修改
+        if (relayDirty.size === 0) {
+            relayState = Array.isArray(s.relayDomains) ? s.relayDomains : [];
+        }
         window.__relayExits = (s.relayExits && typeof s.relayExits === 'object') ? s.relayExits : {};
         renderRelayDomains();
         renderDashRelayStatus();
@@ -2339,7 +2412,11 @@ async function addRelayDomain() {
     }
 }
 
-/** 渲染轮询域名卡片（域名/端口/用户/密码可编辑 + 分组勾选 + URI 显示复制） */
+/** relay 卡片本地编辑缓冲：字段改动只记内存（不落库），点"保存并生效"才全量 PUT */
+const relayEditState = {};   // rd.id -> {domain, port, authUser, authPass, groups}
+const relayDirty = new Set(); // 有未保存修改的 rd.id
+
+/** 渲染轮询域名卡片（本地编辑 + 保存按钮；保存时才 PUT /api/settings 并显示配置生效结果） */
 function renderRelayDomains() {
     const listEl = document.getElementById('relay-domain-list');
     if (!listEl) return;
@@ -2351,82 +2428,146 @@ function renderRelayDomains() {
     const allGroups = ['ALL', ...groups];
 
     listEl.innerHTML = relayState.map((rd, idx) => {
-        const uri = `socks5://${rd.authUser || ''}:${rd.authPass || ''}@${rd.domain}:${rd.port}`;
-        return `<div style="border:1px solid rgba(180,165,140,.18); border-radius:8px; padding:14px 16px; background:rgba(11,15,20,.5);">
+        const ed = relayEditState[rd.id] || { domain: rd.domain, port: rd.port, authUser: rd.authUser, authPass: rd.authPass, groups: [...(rd.groups || [])] };
+        const dirty = relayDirty.has(rd.id);
+        const uri = `socks5://${ed.authUser || ''}:${ed.authPass || ''}@${ed.domain}:${ed.port}`;
+        return `<div id="relay-card-${escapeHtml(rd.id)}" style="border:1px solid rgba(180,165,140,.18); border-radius:8px; padding:14px 16px; background:rgba(11,15,20,.5);">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                <span style="font-weight:600; font-size:15px;">域名 ${idx + 1}</span>
-                <button class="btn-action danger" onclick="removeRelayDomain(decodeURIComponent('${encodeURIComponent(rd.id)}'))">删除</button>
+                <span class="relay-card-title" style="font-weight:600; font-size:15px;">域名 ${idx + 1}${dirty ? '<span class="relay-dirty-tag" style="color:#e0b84f; font-size:11px;"> (未保存)</span>' : ''}</span>
+                <div style="display:flex; gap:8px;">
+                    <button class="btn-action relay-save-btn ${dirty ? 'primary' : ''}" ${dirty ? '' : 'disabled style="opacity:.45; cursor:not-allowed;"'} onclick="saveRelayDomain(decodeURIComponent('${encodeURIComponent(rd.id)}'))">${dirty ? '保存并生效' : '已保存 ✓'}</button>
+                    <button class="btn-action danger" onclick="removeRelayDomain(decodeURIComponent('${encodeURIComponent(rd.id)}'))">删除</button>
+                </div>
             </div>
             <div style="display:grid; grid-template-columns: 1.5fr 0.7fr 0.7fr 0.7fr; gap:12px; margin-bottom:10px;">
                 <div><label class="form-label" style="font-size:12px;">域名 / IP</label>
-                    <input type="text" class="form-input" value="${escapeHtml(rd.domain)}" onchange="updateRelayDomainField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'domain',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(ed.domain || '')}" oninput="relayEditField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'domain',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">端口</label>
-                    <input type="number" class="form-input" value="${escapeHtml(rd.port)}" onchange="updateRelayDomainField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'port',this.value)"></div>
+                    <input type="number" class="form-input" value="${escapeHtml(ed.port)}" oninput="relayEditField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'port',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">用户</label>
-                    <input type="text" class="form-input" value="${escapeHtml(rd.authUser || '')}" onchange="updateRelayDomainField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'authUser',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(ed.authUser || '')}" oninput="relayEditField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'authUser',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">密码</label>
-                    <input type="text" class="form-input" value="${escapeHtml(rd.authPass || '')}" onchange="updateRelayDomainField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'authPass',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(ed.authPass || '')}" oninput="relayEditField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'authPass',this.value)"></div>
             </div>
             <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
                 <span style="font-size:12px; opacity:0.8;">轮询分组：</span>
                 ${allGroups.map(g => `
                     <label style="font-size:12px; cursor:pointer; display:flex; align-items:center; gap:4px;">
-                        <input type="checkbox" ${(rd.groups || []).includes(g) ? 'checked' : ''} onchange="toggleRelayDomainGroup(decodeURIComponent('${encodeURIComponent(rd.id)}'),decodeURIComponent('${encodeURIComponent(g)}'),this.checked)"> ${escapeHtml(g)}
+                        <input type="checkbox" ${(ed.groups || []).includes(g) ? 'checked' : ''} onchange="relayEditGroup(decodeURIComponent('${encodeURIComponent(rd.id)}'),decodeURIComponent('${encodeURIComponent(g)}'),this.checked)"> ${escapeHtml(g)}
                     </label>`).join('')}
             </div>
             <div style="margin-top:10px; display:flex; align-items:center; gap:8px; font-family: var(--font-mono); font-size:11px; opacity:0.8;">
-                <span style="word-break:break-all;">${escapeHtml(uri)}</span>
+                <span class="relay-uri-text" style="word-break:break-all;">${escapeHtml(uri)}</span>
                 <button class="btn-action" onclick="copyToClipboard(decodeURIComponent('${encodeURIComponent(uri)}'))">复制</button>
             </div>
         </div>`;
     }).join('');
 }
 
-/** 编辑 relay 域名字段（域名/端口/用户/密码），保存后重建配置生效 */
-async function updateRelayDomainField(id, field, val) {
-    try {
-        const r = await api('/api/settings');
-        const s = await r.json();
-        const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
-        const rd = list.find(x => x.id === id);
-        if (!rd) return;
-        if (field === 'port') {
-            const p = parseInt(val, 10);
-            if (!p || p < 1024 || p > 65535) { addLog('WARN', '端口无效（1024-65535），已保留原值'); renderRelayDomains(); return; }
-            rd[field] = p;
-        } else {
-            rd[field] = val;
+/** 本地编辑 relay 字段（不落库，只标记脏 + 局部刷新按钮状态/URI 预览，避免整卡重渲染失焦） */
+function relayEditField(id, field, val) {
+    const rd = relayState.find(x => x.id === id);
+    if (!rd) return;
+    const ed = relayEditState[id] || (relayEditState[id] = { domain: rd.domain, port: rd.port, authUser: rd.authUser, authPass: rd.authPass, groups: [...(rd.groups || [])] });
+    if (field === 'port') {
+        const p = parseInt(val, 10);
+        if (!p || p < 1024 || p > 65535) { addLog('WARN', '端口无效（1024-65535），已保留原值'); return; }
+        ed.port = p;
+    } else {
+        ed[field] = val;
+    }
+    relayDirty.add(id);
+    const card = document.getElementById('relay-card-' + id);
+    if (card) {
+        const btn = card.querySelector('.relay-save-btn');
+        if (btn) {
+            btn.textContent = '保存并生效';
+            btn.classList.add('primary');
+            btn.removeAttribute('disabled');
+            btn.style.opacity = '';
+            btn.style.cursor = '';
         }
-        const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
-        if (!save.ok) { addLog('WARN', `更新失败 (HTTP ${save.status})`); return; }
-        relayState = list;
-        renderDashRelayStatus();
-        addLog('INFO', `已更新 ${field} → ${val}`);
-        renderRelayDomains();
-    } catch (e) {
-        addLog('ERROR', '更新失败: ' + e.message);
+        const title = card.querySelector('.relay-card-title');
+        if (title && !title.querySelector('.relay-dirty-tag')) {
+            const tag = document.createElement('span');
+            tag.className = 'relay-dirty-tag';
+            tag.style.cssText = 'color:#e0b84f; font-size:11px;';
+            tag.textContent = ' (未保存)';
+            title.appendChild(tag);
+        }
+        const uriEl = card.querySelector('.relay-uri-text');
+        if (uriEl) uriEl.textContent = `socks5://${ed.authUser || ''}:${ed.authPass || ''}@${ed.domain}:${ed.port}`;
     }
 }
 
-/** 勾选/取消 relay 域名轮询分组 */
-async function toggleRelayDomainGroup(id, group, checked) {
+/** 本地勾选轮询分组（不落库，保存时一并提交） */
+function relayEditGroup(id, group, checked) {
+    const rd = relayState.find(x => x.id === id);
+    if (!rd) return;
+    const ed = relayEditState[id] || (relayEditState[id] = { domain: rd.domain, port: rd.port, authUser: rd.authUser, authPass: rd.authPass, groups: [...(rd.groups || [])] });
+    if (!Array.isArray(ed.groups)) ed.groups = [];
+    if (checked && !ed.groups.includes(group)) ed.groups.push(group);
+    if (!checked) ed.groups = ed.groups.filter(g => g !== group);
+    relayDirty.add(id);
+    const card = document.getElementById('relay-card-' + id);
+    if (card) {
+        const btn = card.querySelector('.relay-save-btn');
+        if (btn) {
+            btn.textContent = '保存并生效';
+            btn.classList.add('primary');
+            btn.removeAttribute('disabled');
+            btn.style.opacity = '';
+            btn.style.cursor = '';
+        }
+    }
+}
+
+/** 保存单张 relay 卡片（本地编辑 → 全量 PUT → 显示配置是否真正生效） */
+async function saveRelayDomain(id) {
+    const rd = relayState.find(x => x.id === id);
+    if (!rd) return;
+    const ed = relayEditState[id] || { domain: rd.domain, port: rd.port, authUser: rd.authUser, authPass: rd.authPass, groups: [...(rd.groups || [])] };
+    const domain = (ed.domain || '').trim();
+    const port = parseInt(ed.port, 10);
+    if (!domain) { alert('域名 / IP 不能为空'); return; }
+    if (!port || port < 1024 || port > 65535) { alert('端口无效（1024-65535）'); return; }
+    if (!ed.authUser) { alert('用户名不能为空（客户端连接需要认证）'); return; }
+    // 端口冲突预检：inbounds listen_port 唯一，同端口不同域名必冲突
+    const clash = relayState.find(x => x.id !== id && parseInt(x.port, 10) === port);
+    if (clash) { alert(`端口 ${port} 已被 [${clash.domain}] 占用，请先修改端口`); return; }
     try {
         const r = await api('/api/settings');
+        if (!r.ok) { alert('读取设置失败 (HTTP ' + r.status + ')'); return; }
         const s = await r.json();
         const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
-        const rd = list.find(x => x.id === id);
-        if (!rd) return;
-        if (!Array.isArray(rd.groups)) rd.groups = [];
-        if (checked && !rd.groups.includes(group)) rd.groups.push(group);
-        if (!checked) rd.groups = rd.groups.filter(g => g !== group);
+        const rd2 = list.find(x => x.id === id);
+        if (!rd2) { alert('该轮询域名已被删除，请刷新页面'); return; }
+        rd2.domain = domain;
+        rd2.port = port;
+        rd2.authUser = ed.authUser;
+        rd2.authPass = ed.authPass || '';
+        rd2.groups = (Array.isArray(ed.groups) && ed.groups.length) ? ed.groups : ['ALL'];
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
-        if (!save.ok) { addLog('WARN', `分组更新失败 (HTTP ${save.status})`); return; }
+        if (!save.ok) {
+            const d = await save.json().catch(() => ({}));
+            alert('保存失败: ' + ((d && d.detail) || 'HTTP ' + save.status));
+            return;
+        }
+        const data = await save.json().catch(() => ({}));
         relayState = list;
+        delete relayEditState[id];
+        relayDirty.delete(id);
         renderDashRelayStatus();
-        addLog('INFO', `轮询分组 ${group} ${checked ? '加入' : '移除'}`);
         renderRelayDomains();
+        if (data && data.configApplied) {
+            addLog('SUCCESS', `轮询域名已保存，配置已生效：${data.configMessage || ''}`);
+            alert('已保存，配置已生效');
+        } else {
+            addLog('WARN', `轮询域名已保存，但配置未生效：${(data && data.configMessage) || '请查看系统日志'}`);
+            alert('已保存，但配置未生效：' + ((data && data.configMessage) || '请查看系统日志'));
+        }
     } catch (e) {
-        addLog('ERROR', '分组更新失败: ' + e.message);
+        alert('保存失败: ' + e.message);
     }
 }
 
@@ -2447,6 +2588,8 @@ async function removeRelayDomain(id) {
         if (!save.ok) { alert('删除失败 (HTTP ' + save.status + ')'); return; }
         addLog('SUCCESS', `已删除轮询域名 ${id}`);
         relayState = list;
+        delete relayEditState[id];
+        relayDirty.delete(id);
         renderDashRelayStatus();
         renderRelayDomains();
     } catch (e) {

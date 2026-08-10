@@ -298,6 +298,26 @@ def delete_node_batch(body: models.DeleteBatchRequest):
     return {"deleted": db.delete_node_batch(body.ids)}
 
 
+@app.post("/api/nodes/batch-group", dependencies=[Depends(require_auth)])
+async def update_nodes_batch_group(body: dict):
+    """节点列表批量编辑分组：ids 全部改到 group。分组影响 relay 轮询池 → 重建配置。"""
+    ids = body.get("ids") or []
+    group = (body.get("group") or "").strip()
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    if not group:
+        raise HTTPException(status_code=400, detail="group 不能为空")
+    updated = db.update_nodes_group(ids, group)
+    # 分组变更影响 relay 域名轮询池（按 group 匹配节点）→ 重建配置
+    try:
+        applied = await config_manager.apply_config()
+    except Exception:
+        applied = {}
+    return {"ok": True, "updated": updated,
+            "configApplied": bool(applied.get("ok")),
+            "configMessage": applied.get("message", "")}
+
+
 @app.post("/api/groups/rename", dependencies=[Depends(require_auth)])
 async def rename_group(body: dict):
     """分组重命名：批量更新节点分组 + relay 域名引用，重命名后重建配置。"""
@@ -569,11 +589,16 @@ async def put_settings(body: dict):
     if isinstance(body.get("relayDomains"), list):
         db.upsert_relay_domains(body["relayDomains"])
     # 设置/域名变更后自动重生成并热重载 sing-box（新域名入口立即生效）
+    # 返回实际应用结果：前端"保存按钮"据此显示配置是否真正生效（端口冲突/校验失败可见）
     try:
-        await config_manager.apply_config()
+        applied = await config_manager.apply_config()
     except Exception:
-        pass
-    return {"ok": True}
+        applied = {}
+    return {
+        "ok": True,
+        "configApplied": bool(applied.get("ok")),
+        "configMessage": applied.get("message", ""),
+    }
 
 
 # ---------- 静态挂载（面板路径前缀 /admin） ----------
