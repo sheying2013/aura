@@ -60,6 +60,15 @@ async def lifespan(app: FastAPI):
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(STATIC_DIR, exist_ok=True)
     db.init_db()
+    # 启动前先把 settings.relayDomains（唯一真源）整表同步到 relay_domains：
+    # 历史版本遗留的脏表（旧凭据/旧域名）会在容器重启后回退生成旧 config，
+    # 造成"改过 relay 凭据但重启后失效"（akkh pu.993699.xyz 事故根因）。
+    _s = db.get_setting("system", {}) or {}
+    if isinstance(_s.get("relayDomains"), list) and _s.get("relayDomains"):
+        try:
+            db.upsert_relay_domains(_s["relayDomains"])
+        except Exception:
+            pass
     # 有配置时先按当前 DB 重建（settings 可能已改 clashPort/listenIp 等，
     # 旧 config.json 可能是过期端口生成 → sing-box 起不来）再拉起
     if os.path.exists(config_manager.CONFIG_PATH) or os.path.exists(config_manager.CONFIG_BAK_PATH):
