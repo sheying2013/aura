@@ -977,8 +977,16 @@
                     </div>
                 </div>
                 
-                <div class="striped-placeholder">
-                    [ Realtime Ink Wave Chart Area ]
+                <div class="card card-compact" style="grid-column: 1 / -1; padding: 16px 20px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <div class="card-title" style="margin: 0;">📈 实时流量曲线</div>
+                        <div style="display: flex; gap: 16px; font-size: 11px; letter-spacing: 1px;">
+                            <span><span style="color: var(--rock);">──</span> 上行 <span class="val" id="chart-up-rate" style="color: var(--rock);">0.00 MB/s</span></span>
+                            <span><span style="color: var(--success);">──</span> 下行 <span class="val" id="chart-down-rate" style="color: var(--success);">0.00 MB/s</span></span>
+                            <span style="opacity: 0.6;">近 60s</span>
+                        </div>
+                    </div>
+                    <svg id="traffic-chart-svg" viewBox="0 0 800 180" preserveAspectRatio="none" style="width: 100%; height: 160px; display: block;"></svg>
                 </div>
             </section>
 
@@ -1639,5 +1647,5 @@
         </div>
     </div>
 
-    <script src="js/main.js?v=20260810c"></script>
+    <script src="js/main.js?v=20260810d"></script>
 </body>

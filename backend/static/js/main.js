@@ -836,6 +836,7 @@ async function loadNodes() {
         renderDashRelayStatus();
         renderTrafficChart();
         renderTrafficTable();
+        drawTrafficChart(); // 初始化实时曲线（等待数据时显示提示）
         updateGroupFilterOptions();
     } catch (e) {
         console.warn('加载节点列表失败:', e);
@@ -1598,6 +1599,92 @@ async function handleConvertEntry() {
 }
 
 // Traffic Chart & SSE
+
+// ── 仪表盘实时流量曲线（黑金风格 SVG）──
+// 数据缓冲：最多 60 个采样点（60s 滚动窗口），每次 SSE 推送追加并重绘
+window.__trafficSamples = [];
+const TRAFFIC_CHART_MAX_POINTS = 60;
+const TRAFFIC_CHART_W = 800;
+const TRAFFIC_CHART_H = 180;
+
+/** 追加一个采样点（up/down bps），超过窗口长度时丢弃最旧 */
+function pushTrafficSample(up, down) {
+    const arr = window.__trafficSamples;
+    arr.push({ up: up || 0, down: down || 0, t: Date.now() });
+    if (arr.length > TRAFFIC_CHART_MAX_POINTS) arr.shift();
+}
+
+/** 绘制实时曲线：上行=金、下行=绿，双线 + 渐变填充 + 网格 + 当前值标注 */
+function drawTrafficChart() {
+    const svg = document.getElementById('traffic-chart-svg');
+    if (!svg) return;
+    const arr = window.__trafficSamples;
+    if (arr.length < 2) {
+        // 数据太少：画一条平滑的基线提示（黑金呼吸动效由 CSS 控制）
+        svg.innerHTML = `<text x="${TRAFFIC_CHART_W / 2}" y="${TRAFFIC_CHART_H / 2}" text-anchor="middle" fill="rgba(200,184,154,0.35)" font-size="12" letter-spacing="2">等待实时流量数据…</text>`;
+        return;
+    }
+
+    // 自适应 Y 轴最大值（取上下行最大值，保证曲线不裁切）
+    let max = 1;
+    arr.forEach(p => { if (p.up > max) max = p.up; if (p.down > max) max = p.down; });
+    const padTop = 8, padBottom = 8;
+    const plotH = TRAFFIC_CHART_H - padTop - padBottom;
+    const step = TRAFFIC_CHART_W / (TRAFFIC_CHART_MAX_POINTS - 1);
+    const xOf = i => i * step;
+    const yOf = v => padTop + plotH - (v / max) * plotH;
+
+    // 网格线（4 条水平参考线）
+    let grid = '';
+    for (let g = 1; g <= 4; g++) {
+        const gy = padTop + plotH * (g / 5);
+        const gv = (max * (5 - g) / 5);
+        grid += `<line x1="0" y1="${gy.toFixed(1)}" x2="${TRAFFIC_CHART_W}" y2="${gy.toFixed(1)}" stroke="rgba(200,184,154,0.08)" stroke-width="1"/>`;
+        grid += `<text x="${TRAFFIC_CHART_W - 4}" y="${(gy - 4).toFixed(1)}" text-anchor="end" fill="rgba(200,184,154,0.4)" font-size="8">${formatRate(gv).replace(' MB/s', 'M')}</text>`;
+    }
+
+    // 折线路径
+    const lineFor = key => arr.map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(p[key]).toFixed(1)}`).join(' ');
+    // 渐变填充路径（闭合到底部）
+    const areaFor = key => {
+        const pts = arr.map((p, i) => `${xOf(i).toFixed(1)},${yOf(p[key]).toFixed(1)}`).join(' ');
+        return `M${pts} L${xOf(arr.length - 1).toFixed(1)},${(padTop + plotH).toFixed(1)} L0,${(padTop + plotH).toFixed(1)} Z`;
+    };
+
+    // 当前值标注（右上角最新采样）
+    const last = arr[arr.length - 1];
+
+    svg.innerHTML = `
+        <defs>
+            <linearGradient id="chart-fill-up" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="rgba(200,184,154,0.35)"/>
+                <stop offset="100%" stop-color="rgba(200,184,154,0.02)"/>
+            </linearGradient>
+            <linearGradient id="chart-fill-down" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="rgba(163,184,154,0.30)"/>
+                <stop offset="100%" stop-color="rgba(163,184,154,0.02)"/>
+            </linearGradient>
+        </defs>
+        ${grid}
+        <path d="${areaFor('down')}" fill="url(#chart-fill-down)" opacity="0.8"/>
+        <path d="${lineFor('down')}" fill="none" stroke="#a3b89a" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" opacity="0.9"/>
+        <path d="${areaFor('up')}" fill="url(#chart-fill-up)" opacity="0.8"/>
+        <path d="${lineFor('up')}" fill="none" stroke="#c8b89a" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+        <circle cx="${xOf(arr.length - 1).toFixed(1)}" cy="${yOf(last.up).toFixed(1)}" r="2.5" fill="#c8b89a"/>
+        <circle cx="${xOf(arr.length - 1).toFixed(1)}" cy="${yOf(last.down).toFixed(1)}" r="2.5" fill="#a3b89a"/>
+    `;
+}
+
+/** SSE 推送后刷新图表数据与文字 */
+function updateTrafficChart(upRate, downRate) {
+    pushTrafficSample(upRate, downRate);
+    drawTrafficChart();
+    const upEl = document.getElementById('chart-up-rate');
+    const downEl = document.getElementById('chart-down-rate');
+    if (upEl) upEl.textContent = formatRate(upRate);
+    if (downEl) downEl.textContent = formatRate(downRate);
+}
+
 function renderTrafficChart() {
     const container = document.getElementById('traffic-chart-container');
     if (!container) return;
@@ -1722,6 +1809,9 @@ function startTrafficSSE() {
 
                     const totalSpeedEl = document.getElementById('dash-stat-total-speed');
                     if (totalSpeedEl) totalSpeedEl.innerHTML = `${formatRate(totalSpeed)}`;
+
+                    // 实时曲线：每 1s 采样一次推送
+                    updateTrafficChart(upRate, downRate);
 
                     const peakSpeedEl = document.getElementById('dash-stat-peak-speed');
                     if (peakSpeedEl) peakSpeedEl.innerHTML = `${formatRate(peakSpeedMbps)}`;
