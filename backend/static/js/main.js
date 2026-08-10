@@ -833,6 +833,7 @@ async function loadNodes() {
         renderNodeMatrix();
         renderNodesTable();
         renderQuickStats();
+        renderDashRelayStatus();
         renderTrafficChart();
         renderTrafficTable();
         updateGroupFilterOptions();
@@ -868,6 +869,21 @@ function updateGroupFilterOptions() {
         }
         select.value = groups.has(currentVal) || currentVal === '__DISABLED__' ? currentVal : 'ALL';
     });
+}
+
+/** 仪表盘 Relay Exit Status：渲染全部轮询域名入口（域名:端口 徽标） */
+function renderDashRelayStatus() {
+    const el = document.getElementById('card-relay-status');
+    if (!el) return;
+    if (!relayState || relayState.length === 0) {
+        el.innerHTML = `<span style="color: var(--dim); border: 1px solid var(--dim); padding: 2px 8px; border-radius: 4px;">暂无域名入口</span>`;
+        return;
+    }
+    el.innerHTML = relayState.map(rd => {
+        const label = `${escapeHtml(rd.domain)}:${escapeHtml(rd.port)}`;
+        const tip = `socks5://${escapeHtml(rd.authUser || '')}:***@${escapeHtml(rd.domain)}:${escapeHtml(rd.port)}`;
+        return `<span title="${tip}" style="color: var(--success); border: 1px solid var(--success); padding: 2px 8px; border-radius: 4px;">${label}</span>`;
+    }).join('');
 }
 
 function renderQuickStats() {
@@ -1737,6 +1753,7 @@ function startTrafficSSE() {
                             window.__sseRenderTimer = setTimeout(() => {
                                 window.__sseRenderTimer = null;
                                 renderQuickStats();
+                                renderDashRelayStatus();
                                 renderNodeMatrix();
                                 renderNodesTable();
                             }, 2000);
@@ -1966,6 +1983,7 @@ async function loadSettings() {
         // 轮询域名列表 → relayState + 渲染
         relayState = Array.isArray(s.relayDomains) ? s.relayDomains : [];
         renderRelayDomains();
+        renderDashRelayStatus();
 
         const setVal = (id, val) => {
             const el = document.getElementById(id);
@@ -2094,6 +2112,7 @@ async function addRelayDomain() {
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         if (!save.ok) { alert('保存失败 (HTTP ' + save.status + ')'); return; }
         relayState = list;
+        renderDashRelayStatus();
         addLog('SUCCESS', `已添加轮询域名，请在卡片上填写域名/端口/用户/密码`);
         renderRelayDomains();
     } catch (e) {
@@ -2162,6 +2181,7 @@ async function updateRelayDomainField(id, field, val) {
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         if (!save.ok) { addLog('WARN', `更新失败 (HTTP ${save.status})`); return; }
         relayState = list;
+        renderDashRelayStatus();
         addLog('INFO', `已更新 ${field} → ${val}`);
         renderRelayDomains();
     } catch (e) {
@@ -2183,6 +2203,7 @@ async function toggleRelayDomainGroup(id, group, checked) {
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         if (!save.ok) { addLog('WARN', `分组更新失败 (HTTP ${save.status})`); return; }
         relayState = list;
+        renderDashRelayStatus();
         addLog('INFO', `轮询分组 ${group} ${checked ? '加入' : '移除'}`);
         renderRelayDomains();
     } catch (e) {
@@ -2207,6 +2228,7 @@ async function removeRelayDomain(id) {
         if (!save.ok) { alert('删除失败 (HTTP ' + save.status + ')'); return; }
         addLog('SUCCESS', `已删除轮询域名 ${id}`);
         relayState = list;
+        renderDashRelayStatus();
         renderRelayDomains();
     } catch (e) {
         alert('删除失败: ' + e.message);
