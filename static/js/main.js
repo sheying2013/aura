@@ -1118,6 +1118,7 @@ async function exportSingleNode(nodeId) {
     const uriLines = exportNodeLines(node, vpsIp, protoSel, exportType);
     if (uriLines.length === 0) {
         addLog('WARN', `节点 [${node.name}] 没有可导出的原始链接`);
+        alert(`节点 [${node.name}] 没有可导出的原始链接`);
         return;
     }
     const text = `# 节点: ${node.name} | 协议: ${(node.protocol || '').toUpperCase()}${exportType === 'original' ? ' | 原始链接' : ''}\n${uriLines.join('\n')}`;
@@ -1455,7 +1456,10 @@ function exportLinkLines(node, vpsIp, protoSel) {
 function exportNodeLines(node, vpsIp, protoSel, exportType) {
     if (exportType === 'original') {
         const uri = node.rawConfig && node.rawConfig.uri;
-        return uri ? [uri] : [];
+        if (!uri) return [];
+        // 原始链接原样透出，但消毒换行符——否则节点名/URI 内嵌 \n 会截断导出行
+        // （converted 走 encodeURIComponent 天然安全；original 必须显式消毒）
+        return [uri.replace(/[\r\n]+/g, ' ')];
     }
     return exportLinkLines(node, vpsIp, protoSel);
 }
@@ -1523,11 +1527,21 @@ async function exportSelectedNodes() {
 
 // Batch Import & Convert Entry
 async function handleBatchImport() {
-    // 兼容两套表单：modal（import-modal，工具栏按钮打开）优先，回退页面内联表单
+    // 兼容两套表单：modal（import-modal，工具栏按钮打开）优先，回退页面内联表单。
+    // 关键1：modal 元素常驻 DOM（.active 控制显隐），未打开时其输入框是上次残留/默认值，
+    //   必须只在 modal 真正打开（.active）时优先取它，否则会吞掉页面内联表单的用户输入。
+    // 关键2：modal 打开时只用 modal 的值（清空即空值，不混用页面残留）——空值由下游
+    //   兜底（group→默认分组、entryProto→mixed、text 空→触发"请粘贴"校验），语义干净。
+    const modalOpen = () => {
+        const m = document.getElementById('import-modal');
+        return !!m && m.classList.contains('active');
+    };
     const pick = (modalId, pageId) => {
-        const m = document.getElementById(modalId);
+        if (modalOpen()) {
+            const m = document.getElementById(modalId);
+            if (m && m.value !== undefined) return m.value;
+        }
         const p = document.getElementById(pageId);
-        if (m && m.value !== undefined && m.value !== '') return m.value;
         return p ? p.value : '';
     };
     const text = pick('modal-import-text', 'import-text').trim();
@@ -1582,6 +1596,7 @@ async function handleBatchImport() {
         const rows = [
             ['成功导入', opts.created, 'var(--success)'],
             ['重复（已存在）', opts.duplicate, 'var(--fg)'],
+            ['跳过（端口冲突/已删）', opts.skipped, 'var(--rock)'],
             ['失败（无法解析）', opts.failed, 'var(--danger)']
         ].filter(([, v]) => v > 0);
         rl.innerHTML = `
@@ -1646,13 +1661,14 @@ async function handleBatchImport() {
         const res = await r.json();
         closeModal('import-modal');
         let msg = `成功批量导入 ${res.created || 0} 个节点`;
-        if (res.skipped) msg += `，跳过 ${res.skipped} 个（无法解析/重复）`;
+        if (res.skipped) msg += `，跳过 ${res.skipped} 个（重复/端口冲突/已删指纹）`;
         if (res.duplicate) msg += `，重复 ${res.duplicate} 个`;
+        if (res.failed) msg += `，失败 ${res.failed} 个（无法解析）`;
         addLog('SUCCESS', msg);
         await loadNodes();
     await applyConfigSilent();
-        // 明确结果弹层
-        showImportResult({ created: res.created || 0, skipped: res.skipped || 0, duplicate: res.duplicate || 0, failed: res.failed || 0 });
+        // 明确结果弹层（failed 独立计数；skipped 中减去 duplicate 即为端口冲突/已删指纹类跳过）
+        showImportResult({ created: res.created || 0, duplicate: res.duplicate || 0, failed: res.failed || 0, skipped: (res.skipped || 0) - (res.duplicate || 0) });
     } catch (e) {
         hideImporting();
         alert('导入节点失败: ' + e.message);

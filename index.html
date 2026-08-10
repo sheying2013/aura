@@ -790,13 +790,19 @@
             backdrop-filter: blur(5px);
             -webkit-backdrop-filter: blur(5px);
             z-index: 200;
-            display: none;
+            display: flex;              /* 恒 flex：display 切换是离散的，none↔flex 会让 opacity 过渡失效 */
             align-items: center;
             justify-content: center;
             opacity: 0;
-            transition: opacity 0.3s;
+            visibility: hidden;         /* 显隐用 visibility（可过渡）+ opacity，动画平滑 */
+            transition: opacity 0.3s, visibility 0.3s;
+            pointer-events: none;       /* 隐藏时不可点，不挡下层 */
         }
-        .import-overlay.active { display: flex; opacity: 1; }
+        .import-overlay.active {
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+        }
         .import-overlay .import-panel {
             background: var(--modal-bg);
             backdrop-filter: blur(25px);
