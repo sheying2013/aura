@@ -1523,6 +1523,62 @@ async function handleBatchImport() {
         return;
     }
 
+    // 导入中动画：对齐 modal 水墨黑金 UI（class 驱动）
+    const showImporting = (label) => {
+        let ov = document.getElementById('import-overlay');
+        if (!ov) {
+            ov = document.createElement('div');
+            ov.id = 'import-overlay';
+            ov.className = 'import-overlay';
+            ov.innerHTML = `
+                <div class="import-panel">
+                    <div class="import-title">正在导入节点</div>
+                    <div class="import-spinner"></div>
+                    <div class="import-sub" id="import-overlay-text">${label}</div>
+                </div>`;
+            document.body.appendChild(ov);
+        }
+        const t = document.getElementById('import-overlay-text');
+        if (t) t.textContent = label;
+        requestAnimationFrame(() => ov.classList.add('active'));
+    };
+    const hideImporting = () => {
+        const ov = document.getElementById('import-overlay');
+        if (ov) ov.classList.remove('active');
+    };
+
+    // 导入结果弹层：成功/跳过/重复/失败（对齐 modal 水墨黑金 UI）
+    const showImportResult = (opts) => {
+        hideImporting();
+        let rl = document.getElementById('import-result-overlay');
+        if (!rl) {
+            rl = document.createElement('div');
+            rl.id = 'import-result-overlay';
+            rl.className = 'import-overlay';
+            rl.addEventListener('click', e => { if (e.target === rl) rl.classList.remove('active'); });
+            document.body.appendChild(rl);
+        }
+        const rows = [
+            ['成功导入', opts.created, 'var(--success)'],
+            ['跳过（无法解析/重复）', opts.skipped, 'var(--rock)'],
+            ['重复（已存在）', opts.duplicate, 'var(--fg)'],
+            ['失败', opts.failed, 'var(--danger)']
+        ].filter(([, v]) => v > 0);
+        rl.innerHTML = `
+            <div class="import-panel">
+                <div class="import-title">批量导入完成</div>
+                <div class="import-rows">
+                    ${rows.map(([label, v, color]) => `
+                        <div class="import-row">
+                            <span class="import-row-label">${label}</span>
+                            <span class="import-row-val" style="color:${color};">${v}</span>
+                        </div>`).join('') || '<div class="import-empty">无结果返回</div>'}
+                </div>
+                <button class="btn btn-primary" style="padding: 10px 28px;" onclick="document.getElementById('import-result-overlay').classList.remove('active')">知道了</button>
+            </div>`;
+        requestAnimationFrame(() => rl.classList.add('active'));
+    };
+
     const lines = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
     let startPort = parseInt(startPortVal) || undefined;
 
@@ -1554,6 +1610,7 @@ async function handleBatchImport() {
         };
     });
 
+    showImporting(`正在导入 ${lines.length} 个节点…`);
     try {
         const r = await api('/api/nodes/batch', {
             method: 'POST',
@@ -1562,6 +1619,7 @@ async function handleBatchImport() {
         if (!r.ok) {
             let detail = '';
             try { detail = (await r.json()).detail || ''; } catch (e) { }
+            hideImporting();
             alert(`导入失败 (HTTP ${r.status}): ${detail}`);
             return;
         }
@@ -1573,7 +1631,10 @@ async function handleBatchImport() {
         addLog('SUCCESS', msg);
         await loadNodes();
     await applyConfigSilent();
+        // 明确结果弹层
+        showImportResult({ created: res.created || 0, skipped: res.skipped || 0, duplicate: res.duplicate || 0, failed: res.failed || 0 });
     } catch (e) {
+        hideImporting();
         alert('导入节点失败: ' + e.message);
     }
 }
