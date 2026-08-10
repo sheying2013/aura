@@ -922,12 +922,11 @@
                 <div class="stats-bar">
                     <div class="stat-pill">INBOUND PORTS: <span class="val" id="qs-inbound-ports">0</span></div>
                     <div class="stat-pill">TOTAL NODES: <span class="val" id="qs-total-nodes">0</span></div>
-                    <div class="stat-pill">PROXY POOL: <span class="val" id="qs-pool-count">0</span></div>
-                    <div class="stat-pill">NORMAL NODES: <span class="val" id="qs-normal-count">0</span></div>
-                    <div class="stat-pill">PREMIUM NODES: <span class="val" id="qs-premium-count">0</span></div>
                     <div class="stat-pill">ONLINE NODES: <span class="val success" id="qs-online-count">0</span></div>
                     <div class="stat-pill">AVG LATENCY: <span class="val" id="qs-avg-ping">-- ms</span></div>
                     <div class="stat-pill">TOTAL TRAFFIC: <span class="val" id="qs-total-traffic">0 MB</span></div>
+                    <div class="stat-pill" style="display: none;"></div>
+                    <div id="qs-group-stats" style="display: flex; flex-wrap: wrap; gap: 6px; align-items: center;"></div>
                 </div>
 
                 <div class="grid-layout" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
@@ -1647,5 +1646,5 @@
         </div>
     </div>
 
-    <script src="js/main.js?v=20260810d"></script>
+    <script src="js/main.js?v=20260810e"></script>
 </body>

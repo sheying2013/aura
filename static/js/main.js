@@ -891,8 +891,6 @@ function renderQuickStats() {
     const totalNodes = nodeState.length;
     const onlineNodes = nodeState.filter(n => n.status === 'online').length;
     const ports = new Set(nodeState.map(n => n.port).filter(Boolean));
-    const normalCount = nodeState.filter(n => !(n.group || '').toLowerCase().includes('vip') && !(n.group || '').includes('优质')).length;
-    const premiumCount = totalNodes - normalCount;
 
     let pingSum = 0, pingCount = 0;
     let totalUp = 0, totalDown = 0;
@@ -911,12 +909,25 @@ function renderQuickStats() {
 
     setVal('qs-inbound-ports', ports.size);
     setVal('qs-total-nodes', totalNodes);
-    setVal('qs-pool-count', totalNodes);
-    setVal('qs-normal-count', normalCount);
-    setVal('qs-premium-count', premiumCount);
     setVal('qs-online-count', onlineNodes);
     setVal('qs-avg-ping', avgPing > 0 ? `${avgPing} ms` : '-- ms');
     setVal('qs-total-traffic', formatBytes(totalTraffic));
+
+    // 分组统计：按真实分组名聚合（非质量分类），所有分组各显示一个 pill
+    const groupEl = document.getElementById('qs-group-stats');
+    if (groupEl) {
+        const byGroup = {};
+        nodeState.forEach(n => {
+            const g = (n.group || '默认分组').trim() || '默认分组';
+            byGroup[g] = (byGroup[g] || 0) + 1;
+        });
+        const entries = Object.entries(byGroup).sort((a, b) => b[1] - a[1]);
+        groupEl.innerHTML = entries.map(([g, cnt]) => {
+            const label = escapeHtml(g);
+            const online = nodeState.filter(n => (n.group || '默认分组') === g && n.status === 'online').length;
+            return `<span class="stat-pill" title="在线 ${online}/${cnt}" style="margin: 0;">${label}: <span class="val" style="color: ${online > 0 ? 'var(--success)' : 'inherit'}">${cnt}</span></span>`;
+        }).join('');
+    }
 
     const trafficDetail = document.getElementById('card-traffic-detail');
     if (trafficDetail) {
