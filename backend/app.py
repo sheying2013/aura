@@ -4,6 +4,7 @@
 """
 import asyncio
 import os
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -169,7 +170,11 @@ def create_node(body: models.NodeCreate):
         "entryProto": body.entryProto or "mixed",
         "ssPass": body.ssPass,
     }
-    return db.create_node(node)
+    try:
+        return db.create_node(node)
+    except sqlite3.IntegrityError:
+        # P2-9：并发创建同端口竞态（check-then-insert 非原子）→ 明确 409 而非 500
+        raise HTTPException(status_code=409, detail={"port": port, "reason": "端口已被占用（并发创建）"})
 
 
 @app.post("/api/nodes/batch", response_model=models.NodeBatchResponse, dependencies=[Depends(require_auth)])

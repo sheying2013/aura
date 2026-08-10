@@ -195,6 +195,9 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
             if line.startswith(f"{proto}://"):
                 body = line[len(proto) + 3:]
                 cred, hostport = body.rsplit("@", 1) if "@" in body else ("", body)
+                # P2-10：vless/trojan 无凭据（cred 为空）→ 跳过该行（垃圾 uuid 连不通只会迷惑用户）
+                if not cred or not hostport:
+                    return None
                 hp = hostport.rsplit(":", 1)
                 if len(hp) != 2:
                     return None
@@ -545,8 +548,12 @@ def parse_content(content: str) -> List[Dict[str, Any]]:
 
 # ---------- 去重导入 ----------
 
-def import_nodes(sub_id: str, group: str, sub_name: str, nodes: List[Dict[str, Any]], stale: bool = False) -> Dict[str, Any]:
-    """把解析出的节点导入 DB（对齐前端：按 server:port 去重、分组继承、随机 auth、subId 关联）。"""
+def import_nodes(sub_id: str, group: str, sub_name: str, nodes: List[Dict[str, Any]], stale: bool = False,
+                 update_existing: bool = False) -> Dict[str, Any]:
+    """把解析出的节点导入 DB（对齐前端：按 server:port 去重、分组继承、随机 auth、subId 关联）。
+
+    update_existing=True（订阅刷新路径）：同 subId 已存在节点原地更新（P1-3）。
+    """
     from db import random_auth, create_node_batch
 
     prepared: List[Dict[str, Any]] = []
@@ -577,7 +584,7 @@ def import_nodes(sub_id: str, group: str, sub_name: str, nodes: List[Dict[str, A
             "entryProto": "mixed",
             "ssPass": None,
         })
-    return create_node_batch(prepared)
+    return create_node_batch(prepared, update_existing_sub=update_existing)
 
 
 # ---------- 刷新 ----------
@@ -595,7 +602,8 @@ async def refresh_sub(sub: Dict[str, Any]) -> Dict[str, Any]:
                         "error": "订阅已被删除"}
             return {"id": sub_id, "ok": False, "count": 0, "stale": False, "imported": 0,
                     "error": "解析 0 个节点"}
-        imported = import_nodes(sub_id, sub.get("group", "订阅节点"), sub.get("name", ""), nodes, stale=False)
+        imported = import_nodes(sub_id, sub.get("group", "订阅节点"), sub.get("name", ""), nodes, stale=False,
+                                update_existing=True)
         # 订阅恢复正常：清除之前失败兜底标的 stale 警示（否则节点永久橙色"刷新失败"）
         db.unmark_nodes_stale_by_sub(sub_id)
         _sub = db.update_sub(sub_id, {

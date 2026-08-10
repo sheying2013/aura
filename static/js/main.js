@@ -1125,7 +1125,7 @@ async function exportSingleNode(nodeId) {
         alert(`节点 [${node.name}] 没有可导出的原始链接`);
         return;
     }
-    const text = `# 节点: ${node.name} | 协议: ${(node.protocol || '').toUpperCase()}${exportType === 'original' ? ' | 原始链接' : ''}\n${uriLines.join('\n')}`;
+    const text = `# 节点: ${node.name.replace(/[\r\n]+/g, ' ')} | 协议: ${(node.protocol || '').toUpperCase()}${exportType === 'original' ? ' | 原始链接' : ''}\n${uriLines.join('\n')}`;
     const area = document.getElementById('export-text-area');
     if (area) {
         area.value = text;
@@ -1481,7 +1481,7 @@ function generateExportText() {
     nodesToExport.forEach(n => {
         const uriLines = exportNodeLines(n, vpsIp, protoSel, exportType);
         if (uriLines.length === 0) return;
-        lines.push(`# 节点: ${n.name} | 协议: ${n.protocol} | 分组: ${n.group}${exportType === 'original' ? ' | 原始链接' : ''}`);
+        lines.push(`# 节点: ${n.name.replace(/[\r\n]+/g, ' ')} | 协议: ${n.protocol} | 分组: ${(n.group || '').replace(/[\r\n]+/g, ' ')}${exportType === 'original' ? ' | 原始链接' : ''}`);
         lines.push(...uriLines);
         lines.push('');
     });
@@ -1520,7 +1520,7 @@ async function exportSelectedNodes() {
     targetNodes.forEach(n => {
         const uriLines = exportNodeLines(n, vpsIp, protoSel, exportType);
         if (uriLines.length === 0) return;
-        text += `# 节点: ${n.name} | 协议: ${n.protocol} | 分组: ${n.group}${exportType === 'original' ? ' | 原始链接' : ''}\n`;
+        text += `# 节点: ${n.name.replace(/[\r\n]+/g, ' ')} | 协议: ${n.protocol} | 分组: ${(n.group || '').replace(/[\r\n]+/g, ' ')}${exportType === 'original' ? ' | 原始链接' : ''}\n`;
         text += uriLines.join('\n');
         text += '\n\n';
     });
@@ -2462,15 +2462,15 @@ function clearSystemLogs() {
 }
 
 function loadDemoNodes() {
-    alert('正在重新载入 Demo 默认示例节点...');
+    alert('正在重新载入节点列表...');
     loadNodes();
 }
 
 async function clearAllData() {
-    if (!confirm('⚠️ 警告：确定重置系统所有持久化数据？该操作不可逆！')) return;
+    if (!confirm('⚠️ 警告：确定重置所有节点流量数据？该操作不可逆！')) return;
     try {
         await resetAllTraffic();
-        addLog('SUCCESS', '所有数据已完全重置');
+        addLog('SUCCESS', '所有节点流量已清空');
     } catch (e) { }
 }
 

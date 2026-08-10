@@ -383,7 +383,11 @@ def build_config() -> Dict[str, Any]:
                 # sing-box wireguard outbound: private_key + peer_public_key + local_address
                 "private_key": cfg.get("private_key") or cfg.get("local_private_key", ""),
                 "peer_public_key": cfg.get("peer_public_key") or cfg.get("public_key", ""),
-                "local_address": cfg.get("local_address") or ["10.0.0.2/32"],
+                # P2-10：订阅给字符串（如 "10.0.0.2/32"）时归一为数组，sing-box 需要数组
+                "local_address": (cfg.get("local_address") or ["10.0.0.2/32"])
+                    if isinstance(cfg.get("local_address"), list)
+                    else [cfg.get("local_address")] if cfg.get("local_address")
+                    else ["10.0.0.2/32"],
             })
         outbounds.append(out_item)
         outbound_tag_set.add(tag_out)

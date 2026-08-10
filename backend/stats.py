@@ -95,14 +95,19 @@ async def _update_relay_now() -> None:
     """刷新 urltest 当前选中出口（relay 流量归属兜底）。"""
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
+            # P2-10：先清掉已删除 relay 的残留缓存（防泄漏），再刷新现存 relay
+            cur_tags = set()
             for rd in db.list_relay_domains():
                 tag = f"relay-auto-{rd['id']}"
+                cur_tags.add(tag)
                 r = await client.get(f"{config_manager.clash_base()}/proxies/{tag}",
                                      headers=_clash_headers())
                 if r.status_code == 200:
                     data = r.json()
                     if data.get("now"):
                         _relay_now_cache[tag] = data["now"]
+            for stale in [k for k in _relay_now_cache if k not in cur_tags]:
+                _relay_now_cache.pop(stale, None)
     except Exception:
         pass
 

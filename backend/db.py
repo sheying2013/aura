@@ -228,8 +228,11 @@ def _used_ports(c) -> set:
     return used
 
 
-def _next_available_port_locked(c, preferred_port: Optional[int], segment: Optional[int] = None) -> int:
-    """不加锁的端口分配内核（调用方需已持有 _lock）。默认从 52001 起分配。"""
+def _next_available_port_locked(c, preferred_port: Optional[int], segment: Optional[int] = None) -> Optional[int]:
+    """不加锁的端口分配内核（调用方需已持有 _lock）。默认从 52001 起分配。
+
+    P2-2：端口池 52001-65535 全占满时返回 None（不再 p+=1 越过 65535 产生非法端口）。
+    """
     used = _used_ports(c)
     if preferred_port and preferred_port not in used:
         return preferred_port
@@ -237,6 +240,8 @@ def _next_available_port_locked(c, preferred_port: Optional[int], segment: Optio
     p = base
     while p in used:
         p += 1
+        if p > 65535:
+            return None  # 端口池耗尽
     return p
 
 
@@ -342,8 +347,13 @@ def create_node(node: Dict[str, Any]) -> Dict:
     return get_node(node["id"])
 
 
-def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """批量创建 + 去重（按 server:server_port）。返回 {created, skipped, duplicate, items}。"""
+def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = False) -> Dict[str, Any]:
+    """批量创建 + 去重（按 server:server_port）。返回 {created, skipped, duplicate, items}。
+
+    update_existing_sub=True（订阅刷新）：同 subId 且 server:port 已存在的节点
+    直接 UPDATE（机场换密码/uuid 后新参数生效，P1-3），不回跳；不同 subId /
+    无 subId 的节点仍走去重跳过，防止误改他组/手动导入节点。
+    """
     created = 0
     skipped = 0
     duplicate = 0
@@ -352,13 +362,17 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
         c = connect()
         # 一次性预载：现有节点 server 指纹 + 已删指纹 + 已用端口（避免每节点循环全表扫描 O(N²)）
         existing_servers = set()
-        for r in c.execute("SELECT raw_config, id FROM nodes"):
+        existing_by_key: Dict[tuple, Dict] = {}  # (sub_id, srv, sp) → 节点行（订阅刷新更新用）
+        for r in c.execute("SELECT raw_config, id, sub_id FROM nodes"):
             try:
                 rc = json.loads(r["raw_config"] or "{}")
                 srv = rc.get("server") or rc.get("address")
                 sp = rc.get("server_port") or rc.get("port")
                 if srv and sp:
                     existing_servers.add((str(srv), int(sp)))
+                    if r["sub_id"]:
+                        existing_by_key[(r["sub_id"], str(srv), int(sp))] = {
+                            "id": r["id"], "sub_id": r["sub_id"]}
             except Exception:
                 pass
         # 已删除节点指纹（sub_id|server|port）：订阅刷新不重复导入
@@ -388,7 +402,34 @@ def create_node_batch(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
             sp = rc.get("server_port") or rc.get("port")
             if srv and sp:
                 key = (str(srv), int(sp))
-                if key in existing_servers:
+                # 订阅刷新：同 subId 已存在 → 原地 UPDATE（机场换参数后新配置生效），不重复导入
+                if update_existing_sub and nd.get("subId"):
+                    ex = existing_by_key.get((nd["subId"], str(srv), int(sp)))
+                    if ex:
+                        upd = dict(nd)
+                        upd["id"] = ex["id"]
+                        # 取该节点当前端口（更新不动端口，避免端口漂移）
+                        prow = c.execute("SELECT port FROM nodes WHERE id=?", (ex["id"],)).fetchone()
+                        upd["port"] = prow["port"] if prow else 0
+                        c.execute(
+                            """UPDATE nodes SET name=?,protocol=?,"group"=?,segment=?,auth_user=?,
+                               auth_pass=?,status=?,ping=?,exit_ip=?,raw_config=?,sub_name=?,
+                               entry_proto=?,ss_pass=?,stale=?,updated_at=? WHERE id=?""",
+                            (upd.get("name", "未命名"), upd.get("protocol", "shadowsocks"),
+                             upd.get("group", "默认分组"), upd.get("segment"),
+                             upd.get("authUser"), upd.get("authPass"),
+                             upd.get("status", "offline"), upd.get("ping", 0),
+                             upd.get("exitIp", "N/A"),
+                             json.dumps(upd.get("rawConfig", {}), ensure_ascii=False),
+                             upd.get("subName"), upd.get("entryProto", "mixed"),
+                             upd.get("ssPass"), 1 if upd.get("stale") else 0,
+                             _conn_now(), ex["id"]),
+                        )
+                        duplicate += 1  # 语义：已存在被更新（前端显示"重复（已存在）"数量不变）
+                        continue
+                # 刷新路径：不同 subId 同 server 允许导入（各自订阅独立，不互相挤占）；
+                # 非刷新路径（手动导入/订阅首次导入）保持全局 server:port 去重
+                if not update_existing_sub and key in existing_servers:
                     duplicate += 1
                     skipped += 1
                     continue
@@ -441,6 +482,16 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
         merged = {**cur}
         for k, v in patch.items():
             merged[k] = v
+        # P2-1：编辑弹窗改端口到已占用值 → 不再 IntegrityError 500，
+        # 冲突时自动重分配空闲端口（与 update_node_port 语义一致）
+        if "port" in patch and patch.get("port"):
+            used = _used_ports(c)
+            if cur["port"] in used:
+                used.discard(cur["port"])
+            if patch["port"] in used:
+                newp = _next_available_port_locked(c, None)
+                if newp is not None:
+                    merged["port"] = newp
         c.execute(
             """UPDATE nodes SET name=?,protocol=?,"group"=?,port=?,segment=?,auth_user=?,
                auth_pass=?,status=?,ping=?,exit_ip=?,up_traffic=?,down_traffic=?,raw_config=?,
@@ -647,16 +698,26 @@ def list_relay_domains() -> List[Dict]:
 
 
 def upsert_relay_domains(domains: List[Dict]) -> None:
-    """整表替换（settings 里 relayDomains 全量 PUT 时同步）。"""
+    """整表替换（settings 里 relayDomains 全量 PUT 时同步）。
+
+    P2-3：port UNIQUE 约束下 INSERT OR REPLACE 会静默删旧行（同名/同端口新域名
+    覆盖旧域名，且可能破坏其他关联）。改为：先按 id 删对应行，再 INSERT——同 id
+    更新、不同 id 同端口冲突时抛 IntegrityError（由调用方捕获提示，不静默删行）。
+    """
     with _lock:
         c = connect()
-        c.execute("DELETE FROM relay_domains")
+        ids = [d["id"] for d in domains if d.get("id")]
+        if ids:
+            c.executemany("DELETE FROM relay_domains WHERE id = ?", [(i,) for i in ids])
         for d in domains:
-            c.execute(
-                "INSERT OR REPLACE INTO relay_domains (id,domain,port,auth_user,auth_pass,groups) VALUES (?,?,?,?,?,?)",
-                (d["id"], d.get("domain", ""), d.get("port"), d.get("authUser"),
-                 d.get("authPass"), json.dumps(d.get("groups", ["ALL"]), ensure_ascii=False)),
-            )
+            try:
+                c.execute(
+                    "INSERT INTO relay_domains (id,domain,port,auth_user,auth_pass,groups) VALUES (?,?,?,?,?,?)",
+                    (d["id"], d.get("domain", ""), d.get("port"), d.get("authUser"),
+                     d.get("authPass"), json.dumps(d.get("groups", ["ALL"]), ensure_ascii=False)),
+                )
+            except sqlite3.IntegrityError:
+                continue  # 端口冲突：跳过新行，保留旧行（不静默删）
         c.commit()
 
 
