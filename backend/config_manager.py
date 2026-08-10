@@ -194,6 +194,17 @@ def outbound_tag(protocol: str, port: int) -> str:
     return f"out-{protocol}-{port}"
 
 
+def _safe_int(v: Any, default: int = 0) -> int:
+    """安全转 int：订阅里 server_port 可能是 '443abc' 等脏串，int() 会抛 ValueError
+
+    让单个坏节点瘫痪整份配置生成（P0）。失败返回 default，调用方跳过该节点。
+    """
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------- 配置生成 ----------
 
 def build_config() -> Dict[str, Any]:
@@ -237,19 +248,25 @@ def build_config() -> Dict[str, Any]:
                 "users": [{"username": node.get("authUser") or "user", "password": node.get("authPass") or "pass"}],
             })
         cfg = node.get("rawConfig") or {}
+        # 坏 server_port（脏字符串/缺失）：跳过该节点，不中断整份配置（P0 防瘫痪）
+        srv_port = _safe_int(cfg.get("server_port") or cfg.get("port") or 0)
+        if not (1 <= srv_port <= 65535):
+            errors.append({"node": node["name"],
+                           "reason": f"server_port 非法（{cfg.get('server_port') or cfg.get('port')}），已跳过"})
+            continue
         out_item = {"type": sb_type, "tag": tag_out}
         tls = _tls_enabled_dict(cfg)
         if sb_type == "shadowsocks":
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
-                "server_port": int(cfg.get("server_port") or cfg.get("port") or 0),
+                "server_port": _safe_int(cfg.get("server_port") or cfg.get("port") or 0),
                 "method": cfg.get("method") or cfg.get("cipher", "aes-256-gcm"),
                 "password": cfg.get("password", ""),
             })
         elif sb_type in ("vmess", "vless"):
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
-                "server_port": int(cfg.get("server_port") or cfg.get("port") or 0),
+                "server_port": _safe_int(cfg.get("server_port") or cfg.get("port") or 0),
                 "uuid": cfg.get("uuid", ""),
             })
             if sb_type == "vmess":
@@ -300,7 +317,7 @@ def build_config() -> Dict[str, Any]:
         elif sb_type == "trojan":
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
-                "server_port": int(cfg.get("server_port") or cfg.get("port") or 0),
+                "server_port": _safe_int(cfg.get("server_port") or cfg.get("port") or 0),
                 "password": cfg.get("password", ""),
             })
             if tls:
@@ -319,7 +336,7 @@ def build_config() -> Dict[str, Any]:
         elif sb_type in ("socks", "http"):
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
-                "server_port": int(cfg.get("server_port") or cfg.get("port") or 0),
+                "server_port": _safe_int(cfg.get("server_port") or cfg.get("port") or 0),
             })
             # sing-box 的 http outbound 要求带 password（无认证代理也必须补空串）
             out_item["username"] = cfg.get("username", "")
@@ -329,7 +346,7 @@ def build_config() -> Dict[str, Any]:
         elif sb_type == "hysteria2":
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
-                "server_port": int(cfg.get("server_port") or cfg.get("port") or 0),
+                "server_port": _safe_int(cfg.get("server_port") or cfg.get("port") or 0),
                 "password": cfg.get("password") or cfg.get("auth") or "",
             })
             tls_dict: Dict[str, Any] = {"enabled": True}
@@ -350,7 +367,7 @@ def build_config() -> Dict[str, Any]:
         elif sb_type == "tuic":
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
-                "server_port": int(cfg.get("server_port") or cfg.get("port") or 0),
+                "server_port": _safe_int(cfg.get("server_port") or cfg.get("port") or 0),
                 "uuid": cfg.get("uuid", ""),
                 "password": cfg.get("password", ""),
             })
@@ -362,7 +379,7 @@ def build_config() -> Dict[str, Any]:
         elif sb_type == "wireguard":
             out_item.update({
                 "server": cfg.get("server") or cfg.get("address", ""),
-                "server_port": int(cfg.get("server_port") or cfg.get("port") or 0),
+                "server_port": _safe_int(cfg.get("server_port") or cfg.get("port") or 0),
                 # sing-box wireguard outbound: private_key + peer_public_key + local_address
                 "private_key": cfg.get("private_key") or cfg.get("local_private_key", ""),
                 "peer_public_key": cfg.get("peer_public_key") or cfg.get("public_key", ""),
@@ -375,7 +392,7 @@ def build_config() -> Dict[str, Any]:
     # 多域名轮询入口
     for rd in relay_domains:
         rd_id = rd["id"]
-        rd_port = int(rd["port"])
+        rd_port = _safe_int(rd["port"])
         rd_in_tag = f"in-relay-{rd_id}"
         rd_out_tag = f"relay-auto-{rd_id}"
         selected_groups = rd.get("groups") or ["ALL"]
@@ -450,9 +467,9 @@ def _detect_port_conflict(ports: Set[int]) -> List[int]:
     managed = set()
     if is_running():
         for n in db.list_nodes():
-            managed.add(int(n["port"]))
+            managed.add(_safe_int(n["port"]))
         for rd in db.list_relay_domains():
-            managed.add(int(rd["port"]))
+            managed.add(_safe_int(rd["port"]))
         # sing-box 正运行时自己占着 clash API 端口，不算外部冲突
         managed.add(get_clash_port())
     conflicted = []

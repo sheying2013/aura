@@ -212,6 +212,7 @@ _guard_paused = False
 DISABLE_AFTER_FAILS = 20  # 连续失败 ≥20 次（约 20 轮×60s）→ 自动停用
 DELETE_AFTER_FAILS = 60   # 连续失败 ≥60 次 → 自动删除（保险阈值）
 PROBE_CONCURRENCY = 16    # 探活并发上限（降低对 clash API 的瞬时压力，减少超时误判）
+_probe_running = False  # 探活进行中标记（P1-2 防并发重叠）
 PROBE_DELAY_RETRY = 2     # 每轮 delay 失败重试次数（共 3 次机会，进一步吸收抖动）
 
 async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
@@ -223,7 +224,21 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
 
     include_disabled=True（手动测活停用节点）时：临时启用 disabled 节点（生成
     outbound）→ 探活 → 失败恢复 disabled，通过则保持在线。
+
+    互斥：60s 定时循环与手动触发/上一轮重叠时跳过本轮（P1-2：并发探活会让
+    失败计数交错累加——在线节点被误判连续失败提前自动停用）。
     """
+    global _probe_running
+    if _probe_running:
+        return []
+    _probe_running = True
+    try:
+        return await _probe_nodes_inner(ids, all_, include_disabled)
+    finally:
+        _probe_running = False
+
+async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
+                             include_disabled: bool = False) -> List[Dict[str, Any]]:
     import config_manager as cm
 
     if not cm.is_running():

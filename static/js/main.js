@@ -880,10 +880,14 @@ function renderDashRelayStatus() {
         el.innerHTML = `<span style="color: var(--dim); border: 1px solid var(--dim); padding: 2px 8px; border-radius: 4px;">暂无域名入口</span>`;
         return;
     }
+    // 当前出口：settings.relayExits（后端查 clash API 附加），tag → 节点名
+    const exits = (window.__relayExits || {});
     el.innerHTML = relayState.map(rd => {
         const label = `Port ${escapeHtml(rd.port)}`;
         const tip = `socks5://${escapeHtml(rd.authUser || '')}:***@${escapeHtml(rd.domain)}:${escapeHtml(rd.port)}`;
-        return `<span title="${tip}" style="color: var(--success); border: 1px solid var(--success); padding: 2px 8px; border-radius: 4px;">${label}</span>`;
+        const exit = exits[rd.id];
+        const exitTxt = exit ? ` 出口: ${escapeHtml(exit.name || exit.tag)}` : '';
+        return `<span title="${tip}" style="color: var(--success); border: 1px solid var(--success); padding: 2px 8px; border-radius: 4px;">${label}${exitTxt}</span>`;
     }).join('');
 }
 
@@ -1902,6 +1906,9 @@ async function resetAllTraffic() {
 }
 
 function startTrafficSSE() {
+    // 登出/401 后（token 清空）不建连接——否则 onerror 5s 定时器窗口内登出
+    // 会发出一次无 token 的 401 SSE 请求（纯浪费）
+    if (!authToken) return;
     if (sseSource) { sseSource.close(); sseSource = null; }
     try {
         const url = `/api/stats/stream${authToken ? '?token=' + encodeURIComponent(authToken) : ''}`;
@@ -1964,7 +1971,18 @@ function startTrafficSSE() {
             if (sseSource) sseSource.close();
             sseSource = null;
             if (!authToken) return; // 登出/401 后不再重连
-            setTimeout(startTrafficSSE, 5000);
+            // SSE 断流可能是网络抖动（重连）或 token 失效（容器重启后内存 token 清空）。
+            // EventSource onerror 拿不到状态码，用 /api/auth/check 探测：401 时 api() 会
+            // 清 token + 回登录页（authToken 变空），这里 return 停止死循环重连；
+            // 探测失败（网络错误）或 200 → 5s 后重连（网络抖动自愈）。
+            api('/api/auth/check').then(() => {
+                if (!authToken) return;
+                setTimeout(startTrafficSSE, 5000);
+            }).catch(() => {
+                // 网络错误（fetch 失败，非 401）→ 抖动自愈重连；token 仍有效则继续
+                if (!authToken) return;
+                setTimeout(startTrafficSSE, 5000);
+            });
         };
     } catch (err) { }
 }
@@ -2178,8 +2196,9 @@ async function loadSettings() {
         const r = await api('/api/settings');
         if (!r.ok) return;
         const s = await r.json();
-        // 轮询域名列表 → relayState + 渲染
+        // 轮询域名列表 → relayState + 渲染；relayExits（当前出口）供仪表盘徽标显示
         relayState = Array.isArray(s.relayDomains) ? s.relayDomains : [];
+        window.__relayExits = (s.relayExits && typeof s.relayExits === 'object') ? s.relayExits : {};
         renderRelayDomains();
         renderDashRelayStatus();
 
@@ -2228,7 +2247,9 @@ async function saveSystemSettings() {
         stickyTimeout: getVal('setting-sticky-timeout') || '5m',
         randomRotateEnabled: getChk('setting-random-rotate-enabled'),
         randomRotateInterval: parseInt(getVal('setting-random-rotate-interval')) || 30,
-        autoRefresh: getChk('sub-auto-refresh')   // 全量 PUT 不能冲掉订阅自动刷新开关
+        autoRefresh: getChk('sub-auto-refresh'),   // 全量 PUT 不能冲掉订阅自动刷新开关
+        // 全量 PUT 不能冲掉轮询域名（否则 settings 覆盖后 relay 卡片消失、后续 upsert 清表）
+        relayDomains: Array.isArray(relayState) ? relayState : []
     };
 
     try {
@@ -2334,28 +2355,28 @@ function renderRelayDomains() {
         return `<div style="border:1px solid rgba(180,165,140,.18); border-radius:8px; padding:14px 16px; background:rgba(11,15,20,.5);">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
                 <span style="font-weight:600; font-size:15px;">域名 ${idx + 1}</span>
-                <button class="btn-action danger" onclick="removeRelayDomain('${escapeHtml(rd.id)}')">删除</button>
+                <button class="btn-action danger" onclick="removeRelayDomain(decodeURIComponent('${encodeURIComponent(rd.id)}'))">删除</button>
             </div>
             <div style="display:grid; grid-template-columns: 1.5fr 0.7fr 0.7fr 0.7fr; gap:12px; margin-bottom:10px;">
                 <div><label class="form-label" style="font-size:12px;">域名 / IP</label>
-                    <input type="text" class="form-input" value="${escapeHtml(rd.domain)}" onchange="updateRelayDomainField('${escapeHtml(rd.id)}','domain',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(rd.domain)}" onchange="updateRelayDomainField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'domain',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">端口</label>
-                    <input type="number" class="form-input" value="${escapeHtml(rd.port)}" onchange="updateRelayDomainField('${escapeHtml(rd.id)}','port',this.value)"></div>
+                    <input type="number" class="form-input" value="${escapeHtml(rd.port)}" onchange="updateRelayDomainField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'port',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">用户</label>
-                    <input type="text" class="form-input" value="${escapeHtml(rd.authUser || '')}" onchange="updateRelayDomainField('${escapeHtml(rd.id)}','authUser',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(rd.authUser || '')}" onchange="updateRelayDomainField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'authUser',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">密码</label>
-                    <input type="text" class="form-input" value="${escapeHtml(rd.authPass || '')}" onchange="updateRelayDomainField('${escapeHtml(rd.id)}','authPass',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(rd.authPass || '')}" onchange="updateRelayDomainField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'authPass',this.value)"></div>
             </div>
             <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
                 <span style="font-size:12px; opacity:0.8;">轮询分组：</span>
                 ${allGroups.map(g => `
                     <label style="font-size:12px; cursor:pointer; display:flex; align-items:center; gap:4px;">
-                        <input type="checkbox" ${(rd.groups || []).includes(g) ? 'checked' : ''} onchange="toggleRelayDomainGroup('${escapeHtml(rd.id)}','${escapeHtml(g)}',this.checked)"> ${escapeHtml(g)}
+                        <input type="checkbox" ${(rd.groups || []).includes(g) ? 'checked' : ''} onchange="toggleRelayDomainGroup(decodeURIComponent('${encodeURIComponent(rd.id)}'),decodeURIComponent('${encodeURIComponent(g)}'),this.checked)"> ${escapeHtml(g)}
                     </label>`).join('')}
             </div>
             <div style="margin-top:10px; display:flex; align-items:center; gap:8px; font-family: var(--font-mono); font-size:11px; opacity:0.8;">
                 <span style="word-break:break-all;">${escapeHtml(uri)}</span>
-                <button class="btn-action" onclick="copyToClipboard('${uri.replace(/'/g, "\\'")}')">复制</button>
+                <button class="btn-action" onclick="copyToClipboard(decodeURIComponent('${encodeURIComponent(uri)}'))">复制</button>
             </div>
         </div>`;
     }).join('');

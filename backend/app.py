@@ -509,19 +509,56 @@ async def stats_connections():
 
 # ---------- 面板设置 ----------
 
+def _relay_current_exits() -> dict:
+    """查 clash API 各 relay selector 的当前出口 tag，映射为节点名（供仪表盘显示）。
+
+    失败时返回空 dict（轮询展示降级，不影响主流程）。不写库，纯响应增强。
+    """
+    try:
+        import httpx
+        r = httpx.get(f"{config_manager.clash_base()}/proxies", timeout=2.0,
+                      headers={"Authorization": f"Bearer {config_manager.get_clash_secret()}"})
+        if r.status_code != 200:
+            return {}
+        proxies = r.json().get("proxies", {})
+        # tag → 节点名（out-{proto}-{port} 反查 db）
+        nodes = {f"out-{n.get('protocol')}-{n.get('port')}": n.get("name")
+                 for n in db.list_nodes()}
+        out = {}
+        for rd in db.list_relay_domains():
+            tag = f"relay-auto-{rd['id']}"
+            p = proxies.get(tag)
+            if p and p.get("now"):
+                out[rd["id"]] = {"tag": p["now"], "name": nodes.get(p["now"]) or p["now"]}
+        return out
+    except Exception:
+        return {}
+
+
 @app.get("/api/settings", dependencies=[Depends(require_auth)])
 def get_settings():
-    return db.get_setting("system", {})
+    s = db.get_setting("system", {})
+    # 附加当前轮询出口（relayExits: {relay_id: {tag, name}}），前端仪表盘显示当前出口节点
+    s["relayExits"] = _relay_current_exits()
+    return s
 
 
 @app.put("/api/settings", dependencies=[Depends(require_auth)])
 async def put_settings(body: dict):
+    # 运行时附加键（GET 响应增强，非持久化配置）不得写回 DB（P2-6：前端全量 PUT
+    # 会把 relayExits 等每次 GET 附加的运行时数据持久化，脏数据累积）
+    body.pop("relayExits", None)
     # testUrl 校验：sing-box clash API 对 http:// url 置空并回退 gstatic，探活测的不是
     # 配置的 URL → 强制 https://（否则所有节点探活失真，曾导致大量误停用）
     if body.get("testUrl"):
         tu = str(body["testUrl"])
         if tu.startswith("http://"):
             body["testUrl"] = tu.replace("http://", "https://", 1)
+    # 全量 PUT 合并：调用方（前端设置页等）只提交表单字段，relayDomains 等
+    # 整键覆盖会清掉轮询域名（P1-1：settings 覆盖 → 后续 upsert 清 relay_domains 表）
+    cur = db.get_setting("system", {}) or {}
+    if "relayDomains" not in body and cur.get("relayDomains"):
+        body["relayDomains"] = cur["relayDomains"]
     db.set_setting("system", body)
     # 同步 relay_domains 表（供后端查询用）
     if isinstance(body.get("relayDomains"), list):
