@@ -240,6 +240,28 @@ async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
     finally:
         _probe_running = False
 
+
+async def _fail_probe_once(client: "httpx.AsyncClient", tag: str, url: str,
+                           hdrs: Dict[str, str], retries: int = 1) -> bool:
+    """单轮失败二次确认：clash delay 弱判定，一轮内瞬时 RST/限流不代表节点失效。
+
+    在探活落库失败计数前，对同一 outbound 再打 retries 次 delay；
+    只要有一次返回 delay → 视为可存活（返回 True，不累计失败）。
+    """
+    for _ in range(retries):
+        try:
+            r = await client.get(
+                f"{config_manager.clash_base()}/proxies/{tag}/delay",
+                params={"url": url, "timeout": "3000"},
+                headers=hdrs,
+            )
+            if r.status_code == 200 and r.json().get("delay") is not None:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
 async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
                              include_disabled: bool = False) -> List[Dict[str, Any]]:
     import config_manager as cm
@@ -251,6 +273,11 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
     if cm._op_lock.locked():
         return []
     nodes = db.list_nodes()
+    # 全局 testUrl + clash 头：二次确认（_fail_probe_once）用同一 URL 语义
+    _test_url = (db.get_setting("system", {}) or {}).get("testUrl", "https://www.gstatic.com/generate_204")
+    if not _test_url or not str(_test_url).startswith("https://"):
+        _test_url = "https://www.gstatic.com/generate_204"
+    _hdrs = {"Authorization": f"Bearer {cm.get_clash_secret()}"}
     if not all_ and ids:
         nodes = [n for n in nodes if n["id"] in ids]
     # 默认跳过 disabled；手动测活（include_disabled）时临时启用
@@ -274,11 +301,8 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
 
     async def _probe_one(node: Dict[str, Any]) -> Dict[str, Any]:
         tag = cm.outbound_tag(node["protocol"], node["port"])
-        url = (db.get_setting("system", {}) or {}).get("testUrl", "https://www.gstatic.com/generate_204")
-        # sing-box clash API 对 http:// 开头 url 会置空并回退测 gstatic（源码 getProxyDelay），
-        # 导致探活测的不是配置的 URL、离线判定失真——强制回退 https 语义
-        if not url or not str(url).startswith("https://"):
-            url = "https://www.gstatic.com/generate_204"
+        url = _test_url
+        hdrs = _hdrs
 
         async def _delay_once() -> Optional[Dict[str, Any]]:
             """单次 clash delay 探测。返回 JSON dict；HTTP 失败/无 delay 返回 None。"""
@@ -287,7 +311,7 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
                     r = await client.get(
                         f"{cm.clash_base()}/proxies/{tag}/delay",
                         params={"url": url, "timeout": "5000"},
-                        headers={"Authorization": f"Bearer {cm.get_clash_secret()}"},
+                        headers=hdrs,
                     )
                 if r.status_code == 200:
                     return r.json()
@@ -355,6 +379,8 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
     need_rebuild = False
     # 手动测活的 disabled 节点：失败直接恢复 disabled（不计连续失败），成功保持在线
     manual_disabled = set(target_disabled) if include_disabled else set()
+    # 手动测活/单节点测活：失败不回写失败计数（stop-the-world 已够，再叠计数会误停）
+    probe_ctx = {"is_manual": bool(include_disabled) or (ids and not all_)}
     for node, res in zip(nodes, results):
         nid = node["id"]
         if res.get("status") == "online":
@@ -376,6 +402,20 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
             db.update_node(nid, {"status": "disabled", "consecutiveFails": 0})
             need_rebuild = True
             continue
+        # 定时探活失败：单轮 delay 失败先二次确认再计败（好节点不受瞬时抖动误杀）
+        if not probe_ctx["is_manual"]:
+            try:
+                async with httpx.AsyncClient(timeout=6.0) as _c:
+                    if await _fail_probe_once(_c, res.get("tag", "") or
+                                              cm.outbound_tag(node["protocol"], node["port"]),
+                                              _test_url, _hdrs):
+                        # 二次确认通过 → 视为存活，清零并保持在线（吞掉该轮抖动）
+                        db.update_node_probe(nid, 0, "online")
+                        node["status"] = "online"
+                        print(f"[probe] 节点 [{node.get('name')}] 单轮抖动，二次确认存活")
+                        continue
+            except Exception:
+                pass
         fails = db.update_node_probe(nid, 0, "offline")  # 失败 +1 并返回累计值
         if fails >= DELETE_AFTER_FAILS:
             print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动删除")
@@ -442,25 +482,29 @@ async def _sync_relay_exits_after_probe() -> None:
     if not test_url or not str(test_url).startswith("https://"):
         test_url = "https://www.gstatic.com/generate_204"
 
-    async def _delay(tag: str) -> Optional[int]:
-        try:
-            async with httpx.AsyncClient(timeout=4.0) as client:
+    async def _delay(tag: str, client: "httpx.AsyncClient") -> Optional[int]:
+        # 时有时无根因之一：单发 3s 超时对慢候选误判不通 → 出口跳空。
+        # 同延时请求失败立即重试一次（共 2 次），超时放宽到 5s，吞掉瞬时 RST。
+        for attempt in range(2):
+            try:
                 r = await client.get(
                     f"{cm.clash_base()}/proxies/{tag}/delay",
-                    params={"url": test_url, "timeout": "3000"},
+                    params={"url": test_url, "timeout": "5000"},
                     headers=hdrs,
                 )
-            if r.status_code == 200:
-                d = r.json().get("delay")
-                return int(d) if d is not None else None
-        except Exception:
-            return None
+                if r.status_code == 200:
+                    d = r.json().get("delay")
+                    if d is not None:
+                        return int(d)
+            except Exception:
+                pass
+            if attempt == 0:
+                await asyncio.sleep(0.4)
         return None
 
-    async def _current(rd_tag: str) -> Optional[str]:
+    async def _current(rd_tag: str, client: "httpx.AsyncClient") -> Optional[str]:
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                r = await client.get(f"{cm.clash_base()}/proxies/{rd_tag}", headers=hdrs)
+            r = await client.get(f"{cm.clash_base()}/proxies/{rd_tag}", headers=hdrs)
             if r.status_code == 200:
                 now = r.json().get("now")
                 return now if now and now != rd_tag else None
@@ -468,40 +512,44 @@ async def _sync_relay_exits_after_probe() -> None:
             pass
         return None
 
-    for rd in relays:
-        rd_tag = f"relay-auto-{rd['id']}"
-        # 按 relay 的 groups 过滤可达节点（与 config 生成一致：ALL 或包含该分组）
-        sel_groups = rd.get("groups") or ["ALL"]
-        targets = [
-            t for t, n in node_by_tag.items()
-            if ("ALL" in sel_groups or n.get("group") in sel_groups)
-        ]
-        if not targets:
-            continue
-        cur = await _current(rd_tag)
-        # 粘滞期内：保持当前出口（当前出口必须仍在本组可达池，否则强制切换）
-        if sticky_enabled and cur and cur in targets:
-            last = _relay_switch_time.get(rd["id"], 0)
-            if time.time() - last < sticky_sec:
+    # 候选去重：所有 relay 的候选并集一次收集，复用单个 AsyncClient 打 delay，
+    # 避免 N×M 串行建连导致 conntrack 堆积 / 误判跳空。
+    async with httpx.AsyncClient(timeout=6.0) as client:
+        for rd in relays:
+            rd_tag = f"relay-auto-{rd['id']}"
+            sel_groups = rd.get("groups") or ["ALL"]
+            targets = [
+                t for t, n in node_by_tag.items()
+                if ("ALL" in sel_groups or n.get("group") in sel_groups)
+            ]
+            if not targets:
                 continue
-        # 挑延迟最优（当前出口也参与比较；全不通则跳过）
-        best, best_delay = None, None
-        cands = targets if cur not in targets else targets
-        for t in cands:
-            d = await _delay(t)
-            if d is not None and (best_delay is None or d < best_delay):
-                best, best_delay = t, d
-        if best is None or best == cur:
-            continue
-        try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            cur = await _current(rd_tag, client)
+            # 粘滞期内：保持当前出口（当前出口必须仍在本组可达池，否则强制切换）
+            if sticky_enabled and cur and cur in targets:
+                last = _relay_switch_time.get(rd["id"], 0)
+                if time.time() - last < sticky_sec:
+                    continue
+            # 挑延迟最优（当前出口也参与比较；全不通则维持当前不动，不静默跳过）
+            best, best_delay = None, None
+            for t in targets:
+                d = await _delay(t, client)
+                if d is not None and (best_delay is None or d < best_delay):
+                    best, best_delay = t, d
+            if best is None:
+                if cur:
+                    print(f"[relay-exit] {rd_tag} 候选全被瞬时判定不通，维持当前出口 {cur}")
+                continue
+            if best == cur:
+                continue
+            try:
                 r = await client.put(f"{cm.clash_base()}/proxies/{rd_tag}",
                                      json={"name": best}, headers=hdrs)
-            if r.status_code in (200, 204):
-                _relay_switch_time[rd["id"]] = time.time()
-                print(f"[relay-exit] {rd_tag} 出口 → {best} (delay {best_delay}ms)")
-        except Exception as e:
-            print(f"[relay-exit] PUT 切换 {rd_tag} 失败: {e}")
+                if r.status_code in (200, 204):
+                    _relay_switch_time[rd["id"]] = time.time()
+                    print(f"[relay-exit] {rd_tag} 出口 → {best} (delay {best_delay}ms)")
+            except Exception as e:
+                print(f"[relay-exit] PUT 切换 {rd_tag} 失败: {e}")
 
 
 async def _probe_loop() -> None:
