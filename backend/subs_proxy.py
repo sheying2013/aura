@@ -115,8 +115,11 @@ def _parse_link(line: str) -> Optional[Dict[str, Any]]:
         if line.startswith("ss://"):
             body = line[5:]
             if "@" in body:
-                # SIP002: method:pass@host:port
+                # SIP002: method:pass@host:port[?plugin=...]
                 cred, hostport = body.rsplit("@", 1)
+                # 剥离端口后的查询串（?plugin=...），否则 int(port) 会崩 → 节点被静默丢弃
+                if "?" in hostport:
+                    hostport = hostport.split("?", 1)[0]
                 hp = hostport.rsplit(":", 1)
                 if len(hp) != 2:
                     return None
