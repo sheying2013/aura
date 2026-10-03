@@ -600,6 +600,73 @@ function addLog(type, message) {
     }
 }
 
+/* ── 轻量 Toast 通知（替代生硬的 alert，非阻塞、自动消失）── */
+function showToast(msg, type = 'info', duration = 3400) {
+    let box = document.getElementById('aura-toast-box');
+    if (!box) {
+        box = document.createElement('div');
+        box.id = 'aura-toast-box';
+        document.body.appendChild(box);
+    }
+    const t = document.createElement('div');
+    t.className = 'aura-toast ' + type;
+    t.textContent = msg;
+    box.appendChild(t);
+    requestAnimationFrame(() => t.classList.add('show'));
+    setTimeout(() => {
+        t.classList.remove('show');
+        setTimeout(() => t.remove(), 350);
+    }, duration);
+}
+
+/* ── 自定义确认/输入模态（替代原生 confirm/prompt，风格对齐水墨黑金 modal）── */
+function auraConfirm(message) {
+    return new Promise(resolve => {
+        _auraDialog({ title: '操作确认', message, input: null, okText: '确定', cancelText: '取消', resolve });
+    });
+}
+function auraPrompt(message, defValue = '') {
+    return new Promise(resolve => {
+        _auraDialog({ title: '请输入', message, input: defValue, okText: '确定', cancelText: '取消', resolve });
+    });
+}
+function _auraDialog(opts) {
+    const ov = document.createElement('div');
+    ov.className = 'modal-overlay';
+    ov.innerHTML = `
+      <div class="modal-content" style="max-width: 430px;">
+        <div class="modal-title">${escapeHtml(opts.title)}</div>
+        <div style="font-size: 13px; line-height: 1.8; color: var(--fg); word-break: break-all;">${escapeHtml(opts.message)}</div>
+        ${opts.input !== null ? `<input type="text" class="form-input" id="aura-dialog-input" value="${escapeHtml(opts.input)}" style="width: 100%; margin-top: 18px; font-family: var(--font-mono);">` : ''}
+        <div class="modal-actions">
+          <button class="btn" data-act="cancel">${escapeHtml(opts.cancelText)}</button>
+          <button class="btn btn-primary" data-act="ok">${escapeHtml(opts.okText)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    requestAnimationFrame(() => ov.classList.add('active'));
+    const done = val => {
+        ov.classList.remove('active');
+        setTimeout(() => ov.remove(), 300);
+        opts.resolve(val);
+    };
+    ov.addEventListener('click', e => {
+        if (e.target === ov) { done(opts.input !== null ? null : false); return; }
+        const act = e.target.getAttribute && e.target.getAttribute('data-act');
+        if (act === 'ok') {
+            const inp = ov.querySelector('#aura-dialog-input');
+            done(opts.input !== null ? (inp ? inp.value : null) : true);
+        } else if (act === 'cancel') {
+            done(opts.input !== null ? null : false);
+        }
+    });
+    const inp = ov.querySelector('#aura-dialog-input');
+    if (inp) {
+        inp.focus(); inp.select();
+        inp.addEventListener('keydown', e => { if (e.key === 'Enter') done(inp.value); });
+    }
+}
+
 // Unified API Wrapper with Bearer Token & 401 Redirect Handler
 async function api(path, options = {}) {
     const headers = Object.assign({}, options.headers || {});
@@ -942,7 +1009,6 @@ function renderQuickStats() {
 function renderNodeMatrix() {
     const grid = document.getElementById('node-matrix-grid');
     if (!grid) return;
-    grid.innerHTML = '';
     const total = nodeState.length;
     const online = nodeState.filter(n => n.status === 'online').length;
 
@@ -955,6 +1021,21 @@ function renderNodeMatrix() {
     const pctEl = document.getElementById('card-online-pct');
     if (pctEl) pctEl.textContent = total > 0 ? Math.round((online / total) * 100) + '%' : '0%';
 
+    // 增量更新：点数不变时只改 className/title（SSE 每 2s 驱动，防整版重建闪烁）
+    if (grid.children.length === nodeState.length && nodeState.length > 0) {
+        nodeState.forEach((n, i) => {
+            const dot = grid.children[i];
+            if (!dot) return;
+            const cls = 'node-dot ' + (n.status || 'offline');
+            if (dot.className !== cls) {
+                dot.className = cls + ' flash';
+                setTimeout(() => dot.classList.remove('flash'), 900);
+            }
+            dot.title = `${n.name} (${n.port}) - ${n.status || 'offline'} [${n.ping || 0}ms]`;
+        });
+        return;
+    }
+    grid.innerHTML = '';
     nodeState.forEach(n => {
         const dot = document.createElement('div');
         dot.className = `node-dot ${n.status || 'offline'}`;
@@ -1059,20 +1140,21 @@ function renderNodesTable() {
         const isDisabled = node.status === 'disabled';
         const statusTitle = isDisabled ? '已停用（连续探活失败自动）' : (node.status || 'offline');
         const tr = document.createElement('tr');
+        tr.setAttribute('data-id', node.id);
         tr.innerHTML = `
             <td><input type="checkbox" class="chk-node" data-id="${esc(node.id)}" ${isSelected ? 'checked' : ''} onchange="toggleSelectNode('${esc(node.id)}')"></td>
-            <td><span class="status-indicator ${esc(node.status) || 'offline'}" title="${esc(statusTitle)}"></span></td>
+            <td data-cell="status"><span class="status-indicator ${esc(node.status) || 'offline'}" title="${esc(statusTitle)}"></span></td>
             <td style="font-family: var(--font-mono);"><input type="number" class="port-input" value="${esc(node.port)}" onchange="updateNodePort('${esc(node.id)}', this.value)" style="width:72px; background:transparent; border:1px solid var(--dim); color:inherit; border-radius:4px; padding:2px 6px; font-family:var(--font-mono); font-size:11px;"></td>
             <td><span class="group-tag">${esc(node.group) || '默认分组'}</span></td>
             <td style="font-family: var(--font-mono);">${esc(node.protocol) || 'mixed'}</td>
             <td style="font-family: var(--font-mono);">${esc(node.entryProto) || 'mixed'}</td>
-            <td><strong>${esc(node.name) || '未命名'}</strong>${renderSubBadge(node)}${isDisabled ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
-            <td style="font-size:12px;">${renderExitIp(node)}</td>
-            <td style="font-family: var(--font-mono); color: ${node.ping > 0 ? (node.ping < 200 ? 'var(--success)' : 'var(--rock)') : 'var(--danger)'}">${node.ping > 0 ? node.ping + ' ms' : '--'}</td>
-            <td style="font-family: var(--font-mono);">${formatBytes(totalNodeTraffic)}</td>
-            <td style="text-align: center;">
+            <td data-cell="name"><strong>${esc(node.name) || '未命名'}</strong>${renderSubBadge(node)}${isDisabled ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}</td>
+            <td style="font-size:12px;" data-cell="exitip">${renderExitIp(node)}</td>
+            <td data-cell="ping" style="font-family: var(--font-mono); color: ${node.ping > 0 ? (node.ping < 200 ? 'var(--success)' : 'var(--rock)') : 'var(--danger)'}">${node.ping > 0 ? node.ping + ' ms' : '--'}</td>
+            <td data-cell="traffic" style="font-family: var(--font-mono);">${formatBytes(totalNodeTraffic)}</td>
+            <td data-cell="actions" style="text-align: center;">
                 <div style="display:flex; gap:3px; justify-content:center;">
-                    <button class="btn-action" onclick="pingSingleNode('${esc(node.id)}')">${L('PING')}</button>
+                    <button class="btn-action" onclick="pingSingleNode('${esc(node.id)}', this)" ${node.__pinging ? 'disabled' : ''}>${node.__pinging ? '测活中…' : L('PING')}</button>
                     <button class="btn-action" onclick="openEditNodeModal('${esc(node.id)}')">${L('EDIT')}</button>
                     <button class="btn-action" onclick="exportSingleNode('${esc(node.id)}')">${L('EXPORT')}</button>
                     <button class="btn-action ${node.status === 'online' ? 'danger' : ''}" onclick="toggleNodeEnable('${esc(node.id)}')">${node.status === 'online' ? L('DISABLE') : L('ENABLE')}</button>
@@ -1087,6 +1169,69 @@ function renderNodesTable() {
     if (chkAll) {
         chkAll.checked = nodes.length > 0 && nodes.every(n => selectedNodeIds.has(n.id));
     }
+}
+
+/** 节点行操作按钮列 HTML（renderNodesTable / syncNodesTable 共用，状态切换时局部重建） */
+function _nodeActionsHtml(node) {
+    const esc = escapeHtml;
+    const pinging = !!node.__pinging;
+    return `
+        <div style="display:flex; gap:3px; justify-content:center;">
+            <button class="btn-action" onclick="pingSingleNode('${esc(node.id)}', this)" ${pinging ? 'disabled' : ''}>${pinging ? '测活中…' : L('PING')}</button>
+            <button class="btn-action" onclick="openEditNodeModal('${esc(node.id)}')">${L('EDIT')}</button>
+            <button class="btn-action" onclick="exportSingleNode('${esc(node.id)}')">${L('EXPORT')}</button>
+            <button class="btn-action ${node.status === 'online' ? 'danger' : ''}" onclick="toggleNodeEnable('${esc(node.id)}')">${node.status === 'online' ? L('DISABLE') : L('ENABLE')}</button>
+            <button class="btn-action danger" onclick="deleteSingleNode('${esc(node.id)}')">${L('DROP')}</button>
+        </div>`;
+}
+
+/** 增量同步节点表（SSE 每 2s 驱动）：行集合不变时只 diff 状态点/延迟/流量，
+    状态变化才重建操作列/名称列——不再全表 innerHTML 重建（端口输入框失焦+行闪烁根治） */
+function syncNodesTable() {
+    const tbody = document.getElementById('nodes-tbody');
+    if (!tbody) return;
+    const nodes = getFilteredNodes();
+    const rows = Array.from(tbody.querySelectorAll('tr[data-id]'));
+    if (nodes.length === 0 || rows.length !== nodes.length) { renderNodesTable(); return; }
+    const rowById = {};
+    rows.forEach(r => { rowById[r.getAttribute('data-id')] = r; });
+    for (const n of nodes) {
+        if (!rowById[n.id]) { renderNodesTable(); return; } // 行集合变化，整体重建
+    }
+    const esc = escapeHtml;
+    nodes.forEach(n => {
+        const tr = rowById[n.id];
+        // 状态点（变化时闪烁提示，动画由 CSS statusFlash 提供）
+        const dot = tr.querySelector('.status-indicator');
+        let statusChanged = false;
+        if (dot) {
+            const cls = 'status-indicator ' + (n.status || 'offline');
+            if (dot.className !== cls) {
+                dot.className = cls + ' flash';
+                setTimeout(() => dot.classList.remove('flash'), 900);
+                statusChanged = true;
+            }
+        }
+        const pingTd = tr.querySelector('td[data-cell="ping"]');
+        if (pingTd) {
+            pingTd.style.color = n.ping > 0 ? (n.ping < 200 ? 'var(--success)' : 'var(--rock)') : 'var(--danger)';
+            pingTd.textContent = n.ping > 0 ? n.ping + ' ms' : '--';
+        }
+        const trafficTd = tr.querySelector('td[data-cell="traffic"]');
+        if (trafficTd) trafficTd.textContent = formatBytes((n.upTraffic || 0) + (n.downTraffic || 0));
+        if (statusChanged) {
+            // 启用/停用按钮文案、停用徽标随状态重建；其余列不动
+            const actTd = tr.querySelector('td[data-cell="actions"]');
+            if (actTd) actTd.innerHTML = _nodeActionsHtml(n);
+            const isDisabled = n.status === 'disabled';
+            const nameTd = tr.querySelector('td[data-cell="name"]');
+            if (nameTd) {
+                nameTd.innerHTML = `<strong>${esc(n.name) || '未命名'}</strong>${renderSubBadge(n)}${isDisabled ? ' <span class="proto-tag" style="background:#5a5348; color:#e8e2d8;">停用</span>' : ''}`;
+            }
+        }
+    });
+    const chkAll = document.getElementById('chk-all');
+    if (chkAll) chkAll.checked = nodes.length > 0 && nodes.every(n => selectedNodeIds.has(n.id));
 }
 
 /** 行内端口编辑：PATCH 端口并重建配置；失败恢复原值 */
@@ -1121,8 +1266,8 @@ async function exportSingleNode(nodeId) {
     const vpsIp = window.location.hostname || '127.0.0.1';
     const uriLines = exportNodeLines(node, vpsIp, protoSel, exportType);
     if (uriLines.length === 0) {
+        showToast(`节点 [${node.name}] 没有可导出的原始链接`, 'warn');
         addLog('WARN', `节点 [${node.name}] 没有可导出的原始链接`);
-        alert(`节点 [${node.name}] 没有可导出的原始链接`);
         return;
     }
     const text = `# 节点: ${node.name.replace(/[\r\n]+/g, ' ')} | 协议: ${(node.protocol || '').toUpperCase()}${exportType === 'original' ? ' | 原始链接' : ''}\n${uriLines.join('\n')}`;
@@ -1162,7 +1307,10 @@ const searchKeywordEl = document.getElementById('search-keyword');
 if (searchKeywordEl) searchKeywordEl.addEventListener('input', renderNodesTable);
 
 // Ping / Probe Handlers
-async function triggerPingAll() {
+async function triggerPingAll(btn) {
+    if (window.__pingAllRunning) return;  // 防重复点击堆叠多轮全量探活
+    window.__pingAllRunning = true;
+    if (btn) { btn.disabled = true; btn.textContent = '批量探活中…'; }
     addLog('INFO', '开始批量探活所有节点...');
     try {
         const r = await api('/api/nodes/ping', {
@@ -1174,11 +1322,18 @@ async function triggerPingAll() {
         await loadNodes();
     } catch (e) {
         addLog('ERROR', '探活失败: ' + e.message);
+    } finally {
+        window.__pingAllRunning = false;
+        // loadNodes 已重建表格时按钮已随 DOM 替换；仍在 DOM 才还原（失败路径）
+        if (btn && document.body.contains(btn)) { btn.disabled = false; btn.textContent = '批量探活'; }
     }
 }
 
-async function pingSingleNode(id) {
-    addLog('INFO', `正在探活节点 [ID: ${id}]...`);
+async function pingSingleNode(id, btn) {
+    const node = nodeState.find(n => n.id === id);
+    if (node) node.__pinging = true;  // SSE 增量刷新期间按钮保持"测活中…"态
+    if (btn) { btn.disabled = true; btn.textContent = '测活中…'; }
+    addLog('INFO', `正在探活节点 [${node ? node.name : id}]...`);
     try {
         const r = await api('/api/nodes/ping', {
             method: 'POST',
@@ -1186,11 +1341,16 @@ async function pingSingleNode(id) {
         });
         const results = await r.json();
         if (results && results.length > 0) {
-            addLog('SUCCESS', `节点探活结果: ${results[0].status} (${results[0].ping}ms)`);
+            const res = results[0];
+            addLog(res.status === 'online' ? 'SUCCESS' : 'WARN',
+                   `节点探活结果: ${res.status}${res.status === 'online' ? ` (${res.ping}ms)` : ''}`);
         }
         await loadNodes();
     } catch (e) {
         addLog('ERROR', '节点探活失败: ' + e.message);
+    } finally {
+        if (node) node.__pinging = false;
+        if (btn && document.body.contains(btn)) { btn.disabled = false; btn.textContent = L('PING'); }
     }
 }
 
@@ -1322,7 +1482,7 @@ async function handleBatchGroup() {
         renderDashRelayStatus();
         if (data && data.configApplied === false) {
             addLog('WARN', `分组已修改，但配置未生效：${data.configMessage || ''}`);
-            alert(`分组已修改，但配置未生效：${data.configMessage || '请查看系统日志'}`);
+            showToast(`分组已修改，但配置未生效：${data.configMessage || '请查看系统日志'}`, 'warn', 5000);
         }
     } catch (e) {
         const errEl = document.getElementById('batch-group-error');
@@ -1369,13 +1529,14 @@ async function handleSaveNodeEdit() {
 async function toggleNodeEnable(id) {
     const node = nodeState.find(n => n.id === id);
     if (!node) return;
-    // 停用写 disabled（后端从配置/轮询池剔除的真实语义），offline 只是探活结果态
+    // 停用写 disabled（后端从配置/轮询池剔除的真实语义），offline 只是探活结果态。
+    // disabledAuto=false 标记手动停用：自动复活循环只捞探活自动停用的节点，不打扰手动停用
     const isOnline = node.status === 'online';
     const newStatus = isOnline ? 'disabled' : 'online';
     try {
         await api(`/api/nodes/${id}`, {
             method: 'PATCH',
-            body: JSON.stringify({ status: newStatus })
+            body: JSON.stringify({ status: newStatus, disabledAuto: false })
         });
         addLog('INFO', `切换节点状态: ${node.name} -> ${newStatus}`);
         await loadNodes();
@@ -1386,10 +1547,10 @@ async function toggleNodeEnable(id) {
 }
 
 async function enableSelectedNodes() {
-    if (selectedNodeIds.size === 0) return;
+    if (selectedNodeIds.size === 0) { showToast('请先勾选要启用的节点', 'warn'); return; }
     for (const id of selectedNodeIds) {
         try {
-            await api(`/api/nodes/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'online' }) });
+            await api(`/api/nodes/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'online', disabledAuto: false }) });
         } catch (e) { }
     }
     addLog('SUCCESS', `已启用选中的 ${selectedNodeIds.size} 个节点`);
@@ -1401,7 +1562,7 @@ async function enableAllDisabledNodes() {
     const offlineNodes = nodeState.filter(n => n.status !== 'online');
     for (const n of offlineNodes) {
         try {
-            await api(`/api/nodes/${n.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'online' }) });
+            await api(`/api/nodes/${n.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'online', disabledAuto: false }) });
         } catch (e) { }
     }
     addLog('SUCCESS', `已启用所有离线节点 (${offlineNodes.length} 个)`);
@@ -1410,10 +1571,10 @@ async function enableAllDisabledNodes() {
 }
 
 async function disableSelectedNodes() {
-    if (selectedNodeIds.size === 0) return;
+    if (selectedNodeIds.size === 0) { showToast('请先勾选要停用的节点', 'warn'); return; }
     for (const id of selectedNodeIds) {
         try {
-            await api(`/api/nodes/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'disabled' }) });
+            await api(`/api/nodes/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'disabled', disabledAuto: false }) });
         } catch (e) { }
     }
     addLog('SUCCESS', `已停用选中的 ${selectedNodeIds.size} 个节点`);
@@ -1422,7 +1583,7 @@ async function disableSelectedNodes() {
 }
 
 async function deleteSingleNode(id) {
-    if (!confirm('确定删除该节点？')) return;
+    if (!await auraConfirm('确定删除该节点？')) return;
     try {
         await api(`/api/nodes/${id}`, { method: 'DELETE' });
         selectedNodeIds.delete(id);
@@ -1436,10 +1597,10 @@ async function deleteSingleNode(id) {
 
 async function deleteSelectedNodes() {
     if (selectedNodeIds.size === 0) {
-        alert('请先选择要删除的节点');
+        showToast('请先选择要删除的节点', 'warn');
         return;
     }
-    if (!confirm(`确定删除选中的 ${selectedNodeIds.size} 个节点？`)) return;
+    if (!await auraConfirm(`确定删除选中的 ${selectedNodeIds.size} 个节点？`)) return;
     try {
         const idsArray = Array.from(selectedNodeIds);
         await api('/api/nodes/delete-batch', {
@@ -1456,9 +1617,9 @@ async function deleteSelectedNodes() {
 }
 
 async function renameGroup() {
-    const oldName = prompt('请输入要重命名的原分组名:');
+    const oldName = await auraPrompt('请输入要重命名的原分组名:');
     if (!oldName) return;
-    const newName = prompt(`将分组 [${oldName}] 重命名为:`);
+    const newName = await auraPrompt(`将分组 [${oldName}] 重命名为:`);
     if (!newName) return;
     try {
         const r = await api('/api/groups/rename', {
@@ -1467,19 +1628,19 @@ async function renameGroup() {
         });
         if (!r.ok) {
             const data = await r.json();
-            alert(data.detail || '重命名失败');
+            showToast(data.detail || '重命名失败', 'error');
             return;
         }
         addLog('SUCCESS', `分组重命名成功: ${oldName} -> ${newName}`);
         await loadNodes();
     await applyConfigSilent();
     } catch (e) {
-        alert('分组重命名出错: ' + e.message);
+        showToast('分组重命名出错: ' + e.message, 'error');
     }
 }
 
 async function reassignAllPorts() {
-    const startPortStr = prompt('请输入重新编排的起始端口 (默认 52001):', '52001');
+    const startPortStr = await auraPrompt('请输入重新编排的起始端口 (默认 52001):', '52001');
     if (!startPortStr) return;
     let startPort = parseInt(startPortStr) || 52001;
 
@@ -1628,7 +1789,7 @@ async function handleBatchImport() {
     const subSource = document.getElementById('sub-source') ? document.getElementById('sub-source').value : '';
 
     if (!text) {
-        alert('请粘贴节点订阅/单链接文本');
+        showToast('请粘贴节点订阅/单链接文本', 'warn');
         return;
     }
 
@@ -1729,7 +1890,7 @@ async function handleBatchImport() {
             let detail = '';
             try { detail = (await r.json()).detail || ''; } catch (e) { }
             hideImporting();
-            alert(`导入失败 (HTTP ${r.status}): ${detail}`);
+            showToast(`导入失败 (HTTP ${r.status}): ${detail}`, 'error', 5000);
             return;
         }
         const res = await r.json();
@@ -1745,7 +1906,7 @@ async function handleBatchImport() {
         showImportResult({ created: res.created || 0, duplicate: res.duplicate || 0, failed: res.failed || 0, skipped: (res.skipped || 0) - (res.duplicate || 0) });
     } catch (e) {
         hideImporting();
-        alert('导入节点失败: ' + e.message);
+        showToast('导入节点失败: ' + e.message, 'error', 5000);
     }
 }
 
@@ -1964,7 +2125,7 @@ async function resetNodeTraffic(id) {
 }
 
 async function resetAllTraffic() {
-    if (!confirm('确定重置全网所有节点的累计流量？')) return;
+    if (!await auraConfirm('确定重置全网所有节点的累计流量？')) return;
     try {
         await api('/api/traffic/reset', { method: 'POST' });
         addLog('SUCCESS', '所有节点流量数据已清空');
@@ -2023,14 +2184,16 @@ function startTrafficSSE() {
                         if (activeTrafficPage && activeTrafficPage.classList.contains('active')) {
                             renderTrafficChart();
                         }
-                        // 节流刷新节点表/矩阵/统计（SSE 每 1s 一条，2s 一次全量刷新不卡顿）
+                        // 节流刷新节点表/矩阵/统计（SSE 每 1s 一条，2s 一次刷新不卡顿）。
+                        // 节点表走增量 syncNodesTable：行不变只 diff 单元格，全表重建会
+                        // 让端口输入框失焦 + 行闪烁（生硬感主因之一）
                         if (!window.__sseRenderTimer) {
                             window.__sseRenderTimer = setTimeout(() => {
                                 window.__sseRenderTimer = null;
                                 renderQuickStats();
                                 renderDashRelayStatus();
                                 renderNodeMatrix();
-                                renderNodesTable();
+                                syncNodesTable();
                             }, 2000);
                         }
                     }
@@ -2134,7 +2297,7 @@ async function addSubscriptionFromSubsPage() {
     const url = document.getElementById('subs-url').value.trim();
     const name = document.getElementById('subs-name').value.trim();
     const group = document.getElementById('subs-group').value.trim() || '订阅节点';
-    if (!url) { alert('请输入订阅链接'); return; }
+    if (!url) { showToast('请输入订阅链接', 'warn'); return; }
     try {
         const r = await api('/api/subs', {
             method: 'POST',
@@ -2142,7 +2305,7 @@ async function addSubscriptionFromSubsPage() {
         });
         if (!r.ok) {
             const err = await r.json();
-            alert(err.detail || '添加订阅失败');
+            showToast(err.detail || '添加订阅失败', 'error');
             return;
         }
         addLog('SUCCESS', `成功添加订阅 [${name || url}]`);
@@ -2150,7 +2313,7 @@ async function addSubscriptionFromSubsPage() {
         document.getElementById('subs-name').value = '';
         await loadSubs();
     } catch (e) {
-        alert('添加订阅错误: ' + e.message);
+        showToast('添加订阅错误: ' + e.message, 'error');
     }
 }
 
@@ -2174,7 +2337,7 @@ async function addSubscription() {
     const name = document.getElementById('sub-name').value.trim();
     const group = document.getElementById('sub-group').value.trim() || '订阅节点';
 
-    if (!url) { alert('请输入订阅 URL'); return; }
+    if (!url) { showToast('请输入订阅 URL', 'warn'); return; }
 
     try {
         const r = await api('/api/subs', {
@@ -2183,7 +2346,7 @@ async function addSubscription() {
         });
         if (!r.ok) {
             const err = await r.json();
-            alert(err.detail || '添加订阅失败');
+            showToast(err.detail || '添加订阅失败', 'error');
             return;
         }
         addLog('SUCCESS', `成功添加订阅 [${name || url}]`);
@@ -2191,7 +2354,7 @@ async function addSubscription() {
         document.getElementById('sub-name').value = '';
         await loadSubs();
     } catch (e) {
-        alert('添加订阅错误: ' + e.message);
+        showToast('添加订阅错误: ' + e.message, 'error');
     }
 }
 
@@ -2212,7 +2375,7 @@ async function refreshSub(id) {
 }
 
 async function deleteSub(id) {
-    if (!confirm('确定删除该订阅？')) return;
+    if (!await auraConfirm('确定删除该订阅？')) return;
     try {
         await api(`/api/subs/${id}`, { method: 'DELETE' });
         addLog('SUCCESS', '删除订阅成功');
@@ -2331,11 +2494,21 @@ async function saveSystemSettings() {
             body: JSON.stringify(payload)
         });
         if (r.ok) {
-            addLog('SUCCESS', '系统设置保存成功，配置热重载已生效');
-            alert('系统设置已应用');
+            const data = await r.json().catch(() => ({}));
+            if (data.configApplied === false) {
+                addLog('WARN', `系统设置已保存，但配置未生效：${data.configMessage || ''}`);
+                showToast(`设置已保存，但配置未生效：${data.configMessage || '请查看系统日志'}`, 'warn', 5000);
+            } else {
+                addLog('SUCCESS', '系统设置保存成功，配置热重载已生效');
+                showToast('系统设置已应用');
+            }
+        } else {
+            addLog('WARN', `保存系统设置失败 (HTTP ${r.status})`);
+            showToast(`保存系统设置失败 (HTTP ${r.status})`, 'error');
         }
     } catch (e) {
         addLog('ERROR', '保存系统设置失败: ' + e.message);
+        showToast('保存系统设置失败: ' + e.message, 'error');
     }
 }
 
@@ -2402,13 +2575,13 @@ async function addRelayDomain() {
             groups: ['ALL']
         });
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
-        if (!save.ok) { alert('保存失败 (HTTP ' + save.status + ')'); return; }
+        if (!save.ok) { showToast('保存失败 (HTTP ' + save.status + ')', 'error'); return; }
         relayState = list;
         renderDashRelayStatus();
         addLog('SUCCESS', `已添加轮询域名，请在卡片上填写域名/端口/用户/密码`);
         renderRelayDomains();
     } catch (e) {
-        alert('添加轮询域名失败: ' + e.message);
+        showToast('添加轮询域名失败: ' + e.message, 'error');
     }
 }
 
@@ -2529,19 +2702,19 @@ async function saveRelayDomain(id) {
     const ed = relayEditState[id] || { domain: rd.domain, port: rd.port, authUser: rd.authUser, authPass: rd.authPass, groups: [...(rd.groups || [])] };
     const domain = (ed.domain || '').trim();
     const port = parseInt(ed.port, 10);
-    if (!domain) { alert('域名 / IP 不能为空'); return; }
-    if (!port || port < 1024 || port > 65535) { alert('端口无效（1024-65535）'); return; }
-    if (!ed.authUser) { alert('用户名不能为空（客户端连接需要认证）'); return; }
+    if (!domain) { showToast('域名 / IP 不能为空', 'warn'); return; }
+    if (!port || port < 1024 || port > 65535) { showToast('端口无效（1024-65535）', 'warn'); return; }
+    if (!ed.authUser) { showToast('用户名不能为空（客户端连接需要认证）', 'warn'); return; }
     // 端口冲突预检：inbounds listen_port 唯一，同端口不同域名必冲突
     const clash = relayState.find(x => x.id !== id && parseInt(x.port, 10) === port);
-    if (clash) { alert(`端口 ${port} 已被 [${clash.domain}] 占用，请先修改端口`); return; }
+    if (clash) { showToast(`端口 ${port} 已被 [${clash.domain}] 占用，请先修改端口`, 'warn', 5000); return; }
     try {
         const r = await api('/api/settings');
-        if (!r.ok) { alert('读取设置失败 (HTTP ' + r.status + ')'); return; }
+        if (!r.ok) { showToast('读取设置失败 (HTTP ' + r.status + ')', 'error'); return; }
         const s = await r.json();
         const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
         const rd2 = list.find(x => x.id === id);
-        if (!rd2) { alert('该轮询域名已被删除，请刷新页面'); return; }
+        if (!rd2) { showToast('该轮询域名已被删除，请刷新页面', 'warn'); return; }
         rd2.domain = domain;
         rd2.port = port;
         rd2.authUser = ed.authUser;
@@ -2550,7 +2723,7 @@ async function saveRelayDomain(id) {
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         if (!save.ok) {
             const d = await save.json().catch(() => ({}));
-            alert('保存失败: ' + ((d && d.detail) || 'HTTP ' + save.status));
+            showToast('保存失败: ' + ((d && d.detail) || 'HTTP ' + save.status), 'error');
             return;
         }
         const data = await save.json().catch(() => ({}));
@@ -2561,13 +2734,13 @@ async function saveRelayDomain(id) {
         renderRelayDomains();
         if (data && data.configApplied) {
             addLog('SUCCESS', `轮询域名已保存，配置已生效：${data.configMessage || ''}`);
-            alert('已保存，配置已生效');
+            showToast(`已保存，配置已生效${data.configMessage ? '：' + data.configMessage : ''}`);
         } else {
             addLog('WARN', `轮询域名已保存，但配置未生效：${(data && data.configMessage) || '请查看系统日志'}`);
-            alert('已保存，但配置未生效：' + ((data && data.configMessage) || '请查看系统日志'));
+            showToast(`已保存，但配置未生效：${(data && data.configMessage) || '请查看系统日志'}`, 'warn', 5000);
         }
     } catch (e) {
-        alert('保存失败: ' + e.message);
+        showToast('保存失败: ' + e.message, 'error');
     }
 }
 
@@ -2579,13 +2752,13 @@ function copyToClipboard(text) {
 }
 
 async function removeRelayDomain(id) {
-    if (!confirm('确定删除该轮询域名？')) return;
+    if (!await auraConfirm('确定删除该轮询域名？')) return;
     try {
         const r = await api('/api/settings');
         const s = await r.json();
         const list = (Array.isArray(s.relayDomains) ? s.relayDomains : []).filter(rd => rd.id !== id);
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
-        if (!save.ok) { alert('删除失败 (HTTP ' + save.status + ')'); return; }
+        if (!save.ok) { showToast('删除失败 (HTTP ' + save.status + ')', 'error'); return; }
         addLog('SUCCESS', `已删除轮询域名 ${id}`);
         relayState = list;
         delete relayEditState[id];
@@ -2593,7 +2766,7 @@ async function removeRelayDomain(id) {
         renderDashRelayStatus();
         renderRelayDomains();
     } catch (e) {
-        alert('删除失败: ' + e.message);
+        showToast('删除失败: ' + e.message, 'error');
     }
 }
 
@@ -2605,12 +2778,12 @@ function clearSystemLogs() {
 }
 
 function loadDemoNodes() {
-    alert('正在重新载入节点列表...');
+    showToast('正在重新载入节点列表...');
     loadNodes();
 }
 
 async function clearAllData() {
-    if (!confirm('⚠️ 警告：确定重置所有节点流量数据？该操作不可逆！')) return;
+    if (!await auraConfirm('⚠️ 警告：确定重置所有节点流量数据？该操作不可逆！')) return;
     try {
         await resetAllTraffic();
         addLog('SUCCESS', '所有节点流量已清空');

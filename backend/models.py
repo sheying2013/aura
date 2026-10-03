@@ -36,6 +36,8 @@ class NodeCreate(BaseModel):
     exitScore: Optional[int] = None
     exitRisk: Optional[int] = None
     consecutiveFails: Optional[int] = 0
+    # 停用来源：True=探活自动停用（自动复活循环会复查捞回），False=用户手动停用
+    disabledAuto: Optional[bool] = False
 
 
 class Node(NodeCreate):
@@ -99,6 +101,7 @@ class NodePatch(BaseModel):
     ssPass: Optional[str] = None
     selected: Optional[bool] = None
     consecutiveFails: Optional[int] = None
+    disabledAuto: Optional[bool] = None
 
 
 class PortUpdateRequest(BaseModel):

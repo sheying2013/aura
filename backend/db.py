@@ -124,6 +124,12 @@ def init_db() -> None:
             c.execute("ALTER TABLE nodes ADD COLUMN sub_name TEXT")
         if "consecutive_fails" not in cols:
             c.execute("ALTER TABLE nodes ADD COLUMN consecutive_fails INTEGER DEFAULT 0")
+        # 停用来源标记：1=探活自动停用（可被自动复活复查捞回），0=用户手动停用
+        if "disabled_auto" not in cols:
+            c.execute("ALTER TABLE nodes ADD COLUMN disabled_auto INTEGER DEFAULT 0")
+            # 存量 disabled 节点视为自动停用（历史版本无此标记，误停自愈优先；
+            # 探活通过才复活，真死节点不会被捞）
+            c.execute("UPDATE nodes SET disabled_auto=1 WHERE status='disabled'")
         # IP 情报列（探活成功后落库归属地/类型/评分）
         for col, ddl in (
             ("exit_country", "TEXT"),
@@ -163,6 +169,7 @@ def _row_to_node(row: sqlite3.Row) -> Dict[str, Any]:
         "entryProto": row["entry_proto"] or "mixed",
         "ssPass": row["ss_pass"],
         "consecutiveFails": row["consecutive_fails"] if "consecutive_fails" in row.keys() else 0,
+        "disabledAuto": bool(row["disabled_auto"]) if "disabled_auto" in row.keys() else False,
         "exitCountry": row["exit_country"] if "exit_country" in row.keys() else None,
         "exitFlag": row["exit_flag"] if "exit_flag" in row.keys() else None,
         "exitCity": row["exit_city"] if "exit_city" in row.keys() else None,
@@ -197,6 +204,7 @@ def _node_to_params(node: Dict[str, Any]) -> tuple:
         1 if node.get("selected") else 0,
         node.get("entryProto", "mixed"),
         node.get("ssPass"),
+        1 if node.get("disabledAuto") else 0,
         node.get("createdAt", now),
         now,
     )
@@ -339,8 +347,8 @@ def create_node(node: Dict[str, Any]) -> Dict:
         c.execute(
             """INSERT INTO nodes
                (id,name,protocol,"group",port,segment,auth_user,auth_pass,status,ping,
-                exit_ip,up_traffic,down_traffic,raw_config,sub_id,sub_name,stale,selected,entry_proto,ss_pass,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                exit_ip,up_traffic,down_traffic,raw_config,sub_id,sub_name,stale,selected,entry_proto,ss_pass,disabled_auto,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             _node_to_params(node),
         )
         c.commit()
@@ -504,7 +512,7 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
             """UPDATE nodes SET name=?,protocol=?,"group"=?,port=?,segment=?,auth_user=?,
                auth_pass=?,status=?,ping=?,exit_ip=?,up_traffic=?,down_traffic=?,raw_config=?,
                sub_id=?,sub_name=?,stale=?,selected=?,entry_proto=?,ss_pass=?,consecutive_fails=?,
-               exit_country=?,exit_flag=?,exit_city=?,exit_type=?,exit_score=?,exit_risk=?,updated_at=?
+               disabled_auto=?,exit_country=?,exit_flag=?,exit_city=?,exit_type=?,exit_score=?,exit_risk=?,updated_at=?
                WHERE id=?""",
             (
                 merged["name"], merged["protocol"], merged["group"], merged["port"],
@@ -517,6 +525,7 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
                 1 if merged.get("selected") else 0,
                 merged.get("entryProto", "mixed"), merged.get("ssPass"),
                 merged.get("consecutiveFails", 0),
+                1 if merged.get("disabledAuto") else 0,
                 merged.get("exitCountry"), merged.get("exitFlag"), merged.get("exitCity"),
                 merged.get("exitType"), merged.get("exitScore"), merged.get("exitRisk"),
                 _conn_now(), node_id,

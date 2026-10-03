@@ -2,6 +2,7 @@
 import asyncio
 import random
 import time
+from collections import deque
 from typing import Any, Dict, List, Optional
 
 import config_manager
@@ -212,11 +213,53 @@ _guard_paused = False
 # 很常见。① 每轮 delay 失败已重试 2 次（吸收 reload/抖动瞬时失败）；② 握手成功即判在线，
 # 出口 IP 查询失败不再判死（IP 只是情报，不反证转发能力）；③ 阈值抬高——误停用要人工
 # 恢复（约 20 分钟 20 轮连续失败才停），删除阈值仅在节点彻底失联后触发。
-DISABLE_AFTER_FAILS = 20  # 连续失败 ≥20 次（约 20 轮×60s）→ 自动停用
+DISABLE_AFTER_FAILS = 20  # 连续失败 ≥20 次（约 20 轮×60s）→ 结合窗口存活率判停用
 DELETE_AFTER_FAILS = 60   # 连续失败 ≥60 次 → 自动删除（保险阈值）
 PROBE_CONCURRENCY = 16    # 探活并发上限（降低对 clash API 的瞬时压力，减少超时误判）
 _probe_running = False  # 探活进行中标记（P1-2 防并发重叠）
 PROBE_DELAY_RETRY = 2     # 每轮 delay 失败重试次数（共 3 次机会，进一步吸收抖动）
+
+# ── 滑窗存活率判定（2026-10-03 根治波动节点误停）──
+# 纯"连续失败 N 次"仍会误停长时间波动的节点：高峰期连续 20 分钟全败并不罕见，但这类
+# 节点平时有 30%~70% 存活率，对 relay 轮询池仍有价值（出口选择是实时探测的，不会选到
+# 瞬时死节点）。停用改为双条件，均看最近 _PROBE_WINDOW 次探活的存活率：
+#   窗口路径：窗口满 30 且存活率 ≤20%（持续半小时 mostly-dead）→ 自动停用
+#   连续路径：连续失败 ≥20 且窗口存活率 ≤30%（真死节点加速通道，保留原阈值语义）
+# 波动节点（窗口存活率 >30%）永远不会被自动停用；纯死节点仍会在 20~30 分钟内被清理。
+_PROBE_WINDOW = 30              # 滑窗长度（≈30 轮，默认探活间隔下约 30 分钟观察期）
+_PROBE_DISABLE_RATE = 0.2       # 窗口存活率 ≤20% 视为"持续不可达" → 停
+_PROBE_DISABLE_RATE_FAST = 0.3  # 连续失败加速通道的窗口存活率上限
+_PROBE_DELETE_RATE = 0.1        # 删除通道的窗口存活率上限
+_probe_hist: Dict[str, Any] = {}  # node_id -> deque[bool]（True=该轮存活）
+
+
+def _record_probe(node_id: str, ok: bool) -> None:
+    """记录一轮探活结果到该节点滑窗（固定长度，自动淘汰最旧）。"""
+    d = _probe_hist.get(node_id)
+    if d is None:
+        d = deque(maxlen=_PROBE_WINDOW)
+        _probe_hist[node_id] = d
+    d.append(1 if ok else 0)
+
+
+def _probe_window_rate(node_id: str) -> tuple:
+    """返回 (窗口内探活次数, 存活率)。无记录返回 (0, 1.0)——没观察过的节点按不罚处理。"""
+    d = _probe_hist.get(node_id)
+    if not d:
+        return 0, 1.0
+    return len(d), sum(d) / len(d)
+
+
+def _prune_probe_hist(valid_ids: set) -> None:
+    """清理已删节点的滑窗记录（防内存随批量导入/删除无限增长）。
+
+    仅在记录数明显超过存活节点数时执行（O(1) 判断），正常轮次零开销。
+    """
+    if len(_probe_hist) <= len(valid_ids) + 500:
+        return
+    for k in list(_probe_hist.keys()):
+        if k not in valid_ids:
+            _probe_hist.pop(k, None)
 
 async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
                       include_disabled: bool = False) -> List[Dict[str, Any]]:
@@ -247,12 +290,14 @@ async def _fail_probe_once(client: "httpx.AsyncClient", tag: str, url: str,
 
     在探活落库失败计数前，对同一 outbound 再打 retries 次 delay；
     只要有一次返回 delay → 视为可存活（返回 True，不累计失败）。
+    超时用 8000ms（比主探测的 5000ms 更宽松）：慢节点/波动节点主探测卡点失败时，
+    确认环节给更充裕的窗口——原 3000ms 比主探测还严，等于变相收紧，是本末倒置。
     """
     for _ in range(retries):
         try:
             r = await client.get(
                 f"{config_manager.clash_base()}/proxies/{tag}/delay",
-                params={"url": url, "timeout": "3000"},
+                params={"url": url, "timeout": "8000"},
                 headers=hdrs,
             )
             if r.status_code == 200 and r.json().get("delay") is not None:
@@ -273,6 +318,7 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
     if cm._op_lock.locked():
         return []
     nodes = db.list_nodes()
+    _prune_probe_hist({n["id"] for n in nodes})
     # 全局 testUrl + clash 头：二次确认（_fail_probe_once）用同一 URL 语义
     _test_url = (db.get_setting("system", {}) or {}).get("testUrl", "https://www.gstatic.com/generate_204")
     if not _test_url or not str(_test_url).startswith("https://"):
@@ -299,20 +345,23 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
             nodes = [n for n in nodes if n["id"] in ids]
         nodes = [n for n in nodes if n.get("status") != "disabled"]
 
-    async def _probe_one(node: Dict[str, Any]) -> Dict[str, Any]:
+    async def _probe_one(node: Dict[str, Any], client: "httpx.AsyncClient") -> Dict[str, Any]:
         tag = cm.outbound_tag(node["protocol"], node["port"])
         url = _test_url
         hdrs = _hdrs
 
         async def _delay_once() -> Optional[Dict[str, Any]]:
-            """单次 clash delay 探测。返回 JSON dict；HTTP 失败/无 delay 返回 None。"""
+            """单次 clash delay 探测。返回 JSON dict；HTTP 失败/无 delay 返回 None。
+
+            复用外层共享 client（httpx AsyncClient 并发安全）：原每节点×每重试新建
+            连接，一轮 N 节点×3 尝试 = 3N 次本地建连 churn，reload 窗口易自锁。
+            """
             try:
-                async with httpx.AsyncClient(timeout=6.0) as client:
-                    r = await client.get(
-                        f"{cm.clash_base()}/proxies/{tag}/delay",
-                        params={"url": url, "timeout": "5000"},
-                        headers=hdrs,
-                    )
+                r = await client.get(
+                    f"{cm.clash_base()}/proxies/{tag}/delay",
+                    params={"url": url, "timeout": "5000"},
+                    headers=hdrs,
+                )
                 if r.status_code == 200:
                     return r.json()
             except Exception:
@@ -365,14 +414,17 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
     if not nodes:
         return []
     # 并发限流：176 节点全 gather 会瞬时打满网络/触发节点风控（之前无上限），
-    # 用信号量把同时在建连的探活压到 PROBE_CONCURRENCY 个
+    # 用信号量把同时在建连的探活压到 PROBE_CONCURRENCY 个。
+    # 全轮共享单个 AsyncClient（连接池复用），不再每节点每重试新建连接。
     sem = asyncio.Semaphore(PROBE_CONCURRENCY)
 
-    async def _probe_limited(n: Dict[str, Any]) -> Dict[str, Any]:
-        async with sem:
-            return await _probe_one(n)
+    async with httpx.AsyncClient(timeout=10.0) as probe_client:
 
-    results = await asyncio.gather(*(_probe_limited(n) for n in nodes))
+        async def _probe_limited(n: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                return await _probe_one(n, probe_client)
+
+        results = await asyncio.gather(*(_probe_limited(n) for n in nodes))
     # 结果落库 + 失败计数 → 自动停用/删除（_probe_one 不落库，避免双重计数）
     # 注意：只标记需要重建，循环结束后统一 apply 一次——每个节点单独 apply_config
     # 会触发大量 reload，sing-box 反复重启累积 TIME-WAIT 导致 bind 冲突（1.7.7 无 SO_REUSEADDR）
@@ -385,6 +437,7 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
         nid = node["id"]
         if res.get("status") == "online":
             db.update_node_probe(nid, res.get("ping", 0), "online")  # 成功清零
+            _record_probe(nid, True)
             # 探活真实出口验证拿到的 IP 一并落库（出口链路已验证可用）
             # 域名节点返回 exitIpTmp（临时解析 IP）——不落库，仅同步快照供情报补查
             if res.get("exitIp"):
@@ -405,25 +458,35 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
         # 定时探活失败：单轮 delay 失败先二次确认再计败（好节点不受瞬时抖动误杀）
         if not probe_ctx["is_manual"]:
             try:
-                async with httpx.AsyncClient(timeout=6.0) as _c:
+                async with httpx.AsyncClient(timeout=10.0) as _c:
                     if await _fail_probe_once(_c, res.get("tag", "") or
                                               cm.outbound_tag(node["protocol"], node["port"]),
                                               _test_url, _hdrs):
                         # 二次确认通过 → 视为存活，清零并保持在线（吞掉该轮抖动）
                         db.update_node_probe(nid, 0, "online")
+                        _record_probe(nid, True)
                         node["status"] = "online"
+                        res["status"] = "online"  # 返回值与落库一致（前端按结果显示）
                         print(f"[probe] 节点 [{node.get('name')}] 单轮抖动，二次确认存活")
                         continue
             except Exception:
                 pass
         fails = db.update_node_probe(nid, 0, "offline")  # 失败 +1 并返回累计值
-        if fails >= DELETE_AFTER_FAILS:
-            print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动删除")
+        _record_probe(nid, False)
+        tot, rate = _probe_window_rate(nid)
+        ok_cnt = sum(_probe_hist[nid]) if nid in _probe_hist else 0
+        # 滑窗存活率判定（2026-10-03）：波动节点（窗口存活率 >30%）永不自动停用——
+        # 它们对 relay 轮询池仍有价值；只有持续 mostly-dead 的节点才被清理。
+        if fails >= DELETE_AFTER_FAILS and (tot == 0 or rate <= _PROBE_DELETE_RATE):
+            print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次且窗口存活率 "
+                  f"{rate:.0%}，自动删除")
             db.delete_node(nid)
             need_rebuild = True
-        elif fails >= DISABLE_AFTER_FAILS:
-            print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次，自动停用")
-            db.update_node(nid, {"status": "disabled"})
+        elif (tot >= _PROBE_WINDOW and rate <= _PROBE_DISABLE_RATE) or \
+             (fails >= DISABLE_AFTER_FAILS and rate <= _PROBE_DISABLE_RATE_FAST):
+            print(f"[probe] 节点 [{node.get('name')}] 窗口存活率 {rate:.0%} "
+                  f"（{ok_cnt}/{tot}），自动停用")
+            db.update_node(nid, {"status": "disabled", "disabledAuto": True})
             need_rebuild = True
     if need_rebuild:
         try:
@@ -571,6 +634,40 @@ async def _probe_loop() -> None:
                         await asyncio.sleep(10)  # 等 reload 完成 + 稳定
             except Exception:
                 pass
+
+
+# ---------- 停用节点自动复活（波动节点误停自愈） ----------
+
+REVIVE_INTERVAL = 600  # 秒：停用节点自动复查周期（网络恢复后自动回池）
+
+
+async def _disabled_revive_loop() -> None:
+    """周期复查**自动停用**（disabledAuto=1）的节点：探活通过 → 自动恢复在线回池；
+    仍不通 → 恢复 disabled，不计连续失败、不触发删除。
+
+    只复查自动停用的节点：用户手动停用的（disabledAuto=0）保持停用语义，不被打扰。
+    复用 include_disabled 手动测活通路（temp enable → probe → 失败回退 disabled），
+    波动节点被误停后无需人工干预即可自愈。
+    """
+    while True:
+        await asyncio.sleep(REVIVE_INTERVAL)
+        try:
+            if not config_manager.is_running():
+                continue
+            if config_manager._op_lock.locked():
+                continue  # apply/reload 窗口 clash API 不可达，下轮再查
+            disabled = [n["id"] for n in db.list_nodes()
+                        if n.get("status") == "disabled" and n.get("disabledAuto")]
+            if not disabled:
+                continue
+            results = await probe_nodes(ids=disabled, all_=False, include_disabled=True)
+            if not results:
+                continue  # 与定时探活重叠（互斥跳过）或 sing-box 不可用
+            revived = sum(1 for r in results if r.get("status") == "online")
+            if revived:
+                print(f"[probe] 自动复查：{revived}/{len(results)} 个停用节点恢复在线，自动回池")
+        except Exception:
+            pass
 
 
 # ---------- 订阅刷新 ----------
@@ -741,3 +838,4 @@ def start_scheduler(loop: asyncio.AbstractEventLoop) -> None:
     loop.create_task(_sub_refresh_loop())
     loop.create_task(_relay_random_loop())
     loop.create_task(_guard_loop())
+    loop.create_task(_disabled_revive_loop())
