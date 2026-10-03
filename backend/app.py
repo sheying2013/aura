@@ -31,10 +31,7 @@ PANEL_PATH = panel_config.get("panel_path") or "/admin"
 
 
 def _client_ip(request: Request) -> str:
-    # 取真实客户端 IP（支持反向代理 X-Forwarded-For）
-    xff = request.headers.get("x-forwarded-for", "")
-    if xff:
-        return xff.split(",")[0].strip()
+    # Uvicorn 按可信代理列表处理转发头；应用不接受客户端自报的 XFF。
     return request.client.host if request.client else ""
 
 
@@ -53,6 +50,12 @@ def require_auth(request: Request) -> None:
         token = request.query_params.get("token", "")
     if not token or not auth.verify_token(token):
         raise HTTPException(status_code=401, detail="未登录或登录已过期")
+    setup_routes = {
+        ("GET", "/api/auth/check"), ("GET", "/api/auth/status"),
+        ("POST", "/api/auth/change-password"), ("POST", "/api/auth/logout"),
+    }
+    if auth.is_password_change_required() and (request.method, request.url.path) not in setup_routes:
+        raise HTTPException(status_code=403, detail="请先修改初始密码")
 
 
 @asynccontextmanager
@@ -64,7 +67,7 @@ async def lifespan(app: FastAPI):
     # 历史版本遗留的脏表（旧凭据/旧域名）会在容器重启后回退生成旧 config，
     # 造成"改过 relay 凭据但重启后失效"（akkh pu.993699.xyz 事故根因）。
     _s = db.get_setting("system", {}) or {}
-    if isinstance(_s.get("relayDomains"), list) and _s.get("relayDomains"):
+    if isinstance(_s.get("relayDomains"), list):
         try:
             db.upsert_relay_domains(_s["relayDomains"])
         except Exception:
@@ -80,10 +83,12 @@ async def lifespan(app: FastAPI):
     # 后台任务
     scheduler.start_scheduler(asyncio.get_event_loop())
     stats.start_tasks(asyncio.get_event_loop())
-    yield
-    # 关停
-    stats.stop_tasks()
-    await config_manager.stop()
+    try:
+        yield
+    finally:
+        await scheduler.stop_scheduler()
+        await stats.stop_tasks()
+        await config_manager.stop()
 
 
 app = FastAPI(title="SingBox 中转枢纽", lifespan=lifespan)
@@ -364,7 +369,8 @@ def reset_all_traffic():
 @app.post("/api/nodes/ping", response_model=List[models.PingResultItem], dependencies=[Depends(require_auth)])
 async def ping_nodes(body: models.PingRequest):
     return await scheduler.probe_nodes(ids=body.ids, all_=body.all,
-                                       include_disabled=body.includeDisabled)
+                                       include_disabled=body.includeDisabled,
+                                       manual=True)
 
 
 @app.get("/api/nodes/{node_id}/exit-ip", dependencies=[Depends(require_auth)])
@@ -588,11 +594,44 @@ async def put_settings(body: dict):
         tu = str(body["testUrl"])
         if tu.startswith("http://"):
             body["testUrl"] = tu.replace("http://", "https://", 1)
-    # 全量 PUT 合并：调用方（前端设置页等）只提交表单字段，relayDomains 等
-    # 整键覆盖会清掉轮询域名（P1-1：settings 覆盖 → 后续 upsert 清 relay_domains 表）
+    # 合并省略的设置键；显式 relayDomains=[] 仍表示删除全部入口。
     cur = db.get_setting("system", {}) or {}
-    if "relayDomains" not in body and cur.get("relayDomains"):
-        body["relayDomains"] = cur["relayDomains"]
+    body = {**cur, **body}
+    body.pop("relayExits", None)
+    for key in ("clashPort", "inboundPort", "probeInterval", "randomRotateInterval"):
+        if key not in body:
+            continue
+        try:
+            value = int(body[key])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail=f"{key} 必须是整数")
+        if key in ("clashPort", "inboundPort"):
+            if not (1 <= value <= 65535 or (key == "inboundPort" and value == 0)):
+                raise HTTPException(status_code=422, detail=f"{key} 端口无效")
+        elif value < (10 if key == "probeInterval" else 5):
+            raise HTTPException(status_code=422, detail=f"{key} 间隔过短")
+        body[key] = value
+    if "relayDomains" in body:
+        domains = body["relayDomains"]
+        if not isinstance(domains, list):
+            raise HTTPException(status_code=422, detail="relayDomains 必须是列表")
+        seen_ids, seen_ports = set(), set()
+        occupied = {n["port"] for n in db.list_nodes()}
+        occupied |= {body.get("clashPort", config_manager.get_clash_port())}
+        if body.get("inboundPort"):
+            occupied.add(body["inboundPort"])
+        for domain in domains:
+            try:
+                relay = models.RelayDomain.model_validate(domain)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="轮询入口格式无效")
+            if not relay.id or not relay.domain.strip() or not 1024 <= relay.port <= 65535:
+                raise HTTPException(status_code=422, detail="轮询入口域名或端口无效")
+            if relay.id in seen_ids or relay.port in seen_ports or relay.port in occupied:
+                raise HTTPException(status_code=409, detail="轮询入口 ID 重复或端口冲突")
+            seen_ids.add(relay.id)
+            seen_ports.add(relay.port)
+        body["relayDomains"] = [models.RelayDomain.model_validate(d).model_dump() for d in domains]
     db.set_setting("system", body)
     # 同步 relay_domains 表（供后端查询用）
     if isinstance(body.get("relayDomains"), list):

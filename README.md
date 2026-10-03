@@ -128,8 +128,10 @@ curl -fsSL https://raw.githubusercontent.com/sheying2013/aura/main/install.sh | 
 面板端口 [19001]:
 网页登录路径 [/admin]:
 登录账号 [admin]:
-登录密码（至少6位，留空自动生成）:
+登录密码（至少6位，留空保持当前密码）:
 ```
+
+首次安装留空密码会自动生成；重跑安装时留空会保留已有密码，只有交互输入或 `AURA_PASSWORD` 显式提供新密码才覆盖。
 
 ### 安装后
 
@@ -189,16 +191,16 @@ pip install -r requirements.txt
 ### 4. 同步前端资源
 
 ```bash
-mkdir -p static
+mkdir -p static/js
 cp ../index.html static/index.html
-cp ../subs.js    static/subs.js
+cp -R ../static/js/. static/js/
 ```
 
 ### 5. 启动
 
 ```bash
-# 推荐：start.sh 自动读取面板端口（data/panel.conf）并同步前端
-cd backend && bash start.sh
+# 当前已在 backend 目录；start.sh 读取面板端口（data/panel.conf）并同步前端
+bash start.sh
 ```
 
 或手动指定端口：
@@ -212,7 +214,7 @@ uvicorn app:app --host 0.0.0.0 --port 19001
 首次启动后默认账号 `admin` / 密码 `admin`，**登录后强制修改密码**。也可以在启动前直接设置：
 
 ```bash
-cd backend && python3 -c "import panel_config, db; from auth import hash_password; panel_config.set_many({'port': 19001, 'panel_path': '/admin', 'username': 'admin'}); db.init_db(); db.set_setting('auth', {'password_hash': hash_password('你的密码'), 'password_change_required': False, 'changed_at': 0}); print('ok')"
+python3 -c "import panel_config, db; from auth import hash_password; panel_config.set_many({'port': 19001, 'panel_path': '/admin', 'username': 'admin'}); db.init_db(); db.set_setting('auth', {'password_hash': hash_password('你的密码'), 'password_change_required': False, 'changed_at': 0}); print('ok')"
 ```
 
 ### 6. systemd 守护（可选）
@@ -249,7 +251,7 @@ sudo systemctl enable --now aura.service
 - **域名解析轮询入口**：多个独立域名入口，每个域名独立监听端口 + 独立分组，自动 urltest 轮询出口；入口保存后即时生效（自动热重载）
 - **真实探活**：通过 sing-box clash_api 对每个节点做真实延迟探测，离线节点自动标记
 - **实时流量统计**：全局速率 + 每节点归属流量，SSE 推送前端
-- **订阅管理**：URL 拉取、多格式解析（Base64 / Clash YAML / JSON / 明文）、6 小时自动刷新、last-good 快照兜底
+- **订阅管理**：URL 拉取、多格式解析（Base64 / Clash YAML / JSON / 明文）、3 小时自动刷新、last-good 快照兜底
 - **自动去重**：所有导入路径（批量导入 / 订阅导入 / 订阅刷新）按 server:port 自动去重，重复节点跳过并计数，不产生重复条目
 - **批量导入**：订阅一键导入，自动按名称判定高质量/普通分组，去重 + 分组继承
 - **三组分组**：高质量（ISP IP）/ 普通 / 代理池（独立分组名），一键重新分配端口
@@ -282,6 +284,40 @@ sudo systemctl enable --now aura.service
 
 **Q: sing-box 内核装不上怎么办？**
 确认架构（`uname -m`，arm64 需选 aarch64 包）与版本号，可手动下载后放到 `PATH`，用 `SINGBOX_BIN` 环境变量指定路径。
+
+---
+
+## 项目结构与本地开发
+
+```text
+index.html                 页面编辑源
+static/js/main.js          前端逻辑编辑源（含订阅界面）
+backend/static/            后端托管副本
+backend/app.py             API 与静态文件入口
+backend/auth.py            登录认证
+backend/db.py              SQLite 存储
+backend/config_manager.py  sing-box 配置与进程管理
+backend/scheduler.py       探活、自动复活与每 3 小时订阅刷新
+backend/subs_proxy.py      服务端订阅解析与导入
+backend/subscription_fetch.py 订阅下载与目标地址检查
+backend/stats.py           流量采集
+backend/start.sh           统一启动入口
+install.sh                 Linux/macOS 安装入口
+Dockerfile                 镜像打包入口
+tests/                     离线回归测试
+```
+
+前端以仓库根的 `index.html` 与 `static/js/` 为权威源，修改这两处即可。`install.sh` 和 `backend/start.sh` 会刷新 `backend/static/` 副本；Dockerfile 直接复制根目录前端资源到镜像里的 `backend/static/`，容器无需保留根目录前端源文件。
+
+在仓库根执行离线检查（Python 依赖需已安装）：
+
+```bash
+bash -n install.sh
+bash -n backend/start.sh
+python3 -m unittest discover -s tests -v
+```
+
+本地开发启动使用 `bash backend/start.sh`；直接运行 uvicorn 时，需要先按手动安装步骤同步前端资源。
 
 ---
 

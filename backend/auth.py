@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 
 import db
@@ -17,7 +18,12 @@ import panel_config
 
 TOKEN_TTL = 7 * 24 * 60 * 60  # 7 天
 FAIL_LOCKOUT_SECONDS = 5  # 失败后延迟
+FAILURE_WINDOW_SECONDS = 60
+MAX_FAILURES_PER_KEY = 10
+MAX_FAILURE_KEYS = 1000
 
+# 认证快照、密码更新和 token 状态必须跨事件循环/同步路由线程原子处理。
+_auth_lock = threading.RLock()
 # 内存 token 缓存: token_hash -> {created_at, exp_at}
 _tokens: dict = {}
 # 失败计数: ip -> [timestamps]
@@ -46,111 +52,126 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def _get_auth() -> dict:
-    auth = db.get_setting("auth", {}) or {}
-    if not auth.get("password_hash"):
-        # 默认密码 admin，首次使用需改密
-        auth = {
-            "password_hash": hash_password("admin"),
-            "password_change_required": True,
-            "created_at": int(time.time() * 1000),
-        }
-        db.set_setting("auth", auth)
-    return auth
+    with _auth_lock:
+        auth = db.get_setting("auth", {}) or {}
+        if not auth.get("password_hash"):
+            # 默认密码 admin，首次使用需改密
+            auth = {
+                "password_hash": hash_password("admin"),
+                "password_change_required": True,
+                "created_at": int(time.time() * 1000),
+            }
+            db.set_setting("auth", auth)
+        return auth
+
+
+def _prune_failures(now: float) -> None:
+    """仅在持锁时调用；淘汰过期记录，不丢弃仍有效的限流桶。"""
+    for key, timestamps in list(_failures.items()):
+        recent = [t for t in timestamps if now - t < FAILURE_WINDOW_SECONDS]
+        if recent:
+            _failures[key] = recent[-MAX_FAILURES_PER_KEY:]
+        else:
+            del _failures[key]
 
 
 def _record_failure(key: str) -> None:
-    now = time.time()
-    _failures.setdefault(key, []).append(now)
-    _failures[key] = [t for t in _failures[key] if now - t < 60]
-    # 防内存无限增长
-    if len(_failures) > 1000:
-        _failures.clear()
+    with _auth_lock:
+        now = time.time()
+        _prune_failures(now)
+        if key not in _failures and len(_failures) >= MAX_FAILURE_KEYS:
+            return
+        _failures[key] = (_failures.get(key, []) + [now])[-MAX_FAILURES_PER_KEY:]
 
 
 def is_rate_limited(key: str) -> bool:
-    """60 秒内 >10 次失败则限流（返回 True 表示需等待）。"""
-    now = time.time()
-    recent = [t for t in _failures.get(key, []) if now - t < 60]
-    if len(recent) >= 10:
-        return True
-    # 最近失败后强制延迟
-    if recent:
-        return now - recent[-1] < FAIL_LOCKOUT_SECONDS
-    return False
+    """60 秒内 >=10 次失败或最近失败后 5 秒内限流。"""
+    with _auth_lock:
+        now = time.time()
+        _prune_failures(now)
+        recent = _failures.get(key, [])
+        # 桶已满时拒绝新 key，不能通过轮换 key 清空已有失败记录。
+        if not recent and len(_failures) >= MAX_FAILURE_KEYS:
+            return True
+        if len(recent) >= MAX_FAILURES_PER_KEY:
+            return True
+        return bool(recent and now - recent[-1] < FAIL_LOCKOUT_SECONDS)
 
 
-async def login(username: str, password: str, client_ip: str = "") -> dict:
-    """验证登录。成功返回 token + 是否需改密；失败返回错误。"""
-    key = client_ip or "unknown"
-    if is_rate_limited(key):
-        return {"ok": False, "error": "尝试过于频繁，请稍后再试"}
-
-    auth = _get_auth()
-    # 用户名可从面板配置修改（默认 admin，单用户面板）
-    if username != get_username():
-        _record_failure(key)
-        await asyncio.sleep(FAIL_LOCKOUT_SECONDS)
-        return {"ok": False, "error": "用户名或密码错误"}
-
-    if not verify_password(password, auth.get("password_hash", "")):
-        _record_failure(key)
-        await asyncio.sleep(FAIL_LOCKOUT_SECONDS)
-        return {"ok": False, "error": "用户名或密码错误"}
-
-    # 成功：签发 token
+def _issue_token() -> str:
+    """在认证锁内签发并清理过期 token。"""
     token = secrets.token_hex(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     now = time.time()
     _tokens[token_hash] = {"created_at": now, "exp_at": now + TOKEN_TTL}
-    # 清理过期 token
     for th in [k for k, v in _tokens.items() if v["exp_at"] < now]:
         del _tokens[th]
-    return {
-        "ok": True,
-        "token": token,
-        "passwordChangeRequired": bool(auth.get("password_change_required", False)),
-    }
+    return token
+
+
+def _login(username: str, password: str, key: str) -> tuple[dict, bool]:
+    # 检查失败计数、校验当前密码和签发 token 是一个原子认证操作。
+    with _auth_lock:
+        if is_rate_limited(key):
+            return {"ok": False, "error": "尝试过于频繁，请稍后再试"}, False
+        auth = _get_auth()
+        if username != get_username() or not verify_password(password, auth.get("password_hash", "")):
+            _record_failure(key)
+            return {"ok": False, "error": "用户名或密码错误"}, True
+        return {
+            "ok": True,
+            "token": _issue_token(),
+            "passwordChangeRequired": bool(auth.get("password_change_required", False)),
+        }, False
+
+
+async def login(username: str, password: str, client_ip: str = "") -> dict:
+    """验证登录。同步认证在线程中执行，失败延迟不持认证锁。"""
+    result, delay = await asyncio.to_thread(_login, username, password, client_ip or "unknown")
+    if delay:
+        await asyncio.sleep(FAIL_LOCKOUT_SECONDS)
+    return result
 
 
 def verify_token(token: str) -> bool:
     if not token:
         return False
     token_hash = hashlib.sha256(token.encode()).hexdigest()
-    entry = _tokens.get(token_hash)
-    if not entry:
-        return False
-    if entry["exp_at"] < time.time():
-        del _tokens[token_hash]
-        return False
-    return True
+    with _auth_lock:
+        entry = _tokens.get(token_hash)
+        if not entry:
+            return False
+        if entry["exp_at"] < time.time():
+            del _tokens[token_hash]
+            return False
+        return True
 
 
 def change_password(old_password: str, new_password: str) -> dict:
     """修改密码。校验旧密码 + 新密码强度。成功清首次改密标记，签发新 token。"""
-    auth = _get_auth()
-    if not verify_password(old_password, auth.get("password_hash", "")):
-        return {"ok": False, "error": "旧密码错误"}
-    if len(new_password) < 6:
-        return {"ok": False, "error": "新密码至少 6 位"}
-    if new_password == old_password:
-        return {"ok": False, "error": "新密码不能与旧密码相同"}
-    auth["password_hash"] = hash_password(new_password)
-    auth["password_change_required"] = False
-    auth["changed_at"] = int(time.time() * 1000)
-    db.set_setting("auth", auth)
-    # 改密后旧 token 全部失效，签发新 token 保持当前会话
-    _tokens.clear()
-    token = secrets.token_hex(32)
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-    now = time.time()
-    _tokens[token_hash] = {"created_at": now, "exp_at": now + TOKEN_TTL}
-    return {"ok": True, "message": "密码修改成功", "token": token}
+    with _auth_lock:
+        auth = _get_auth()
+        if not verify_password(old_password, auth.get("password_hash", "")):
+            return {"ok": False, "error": "旧密码错误"}
+        if len(new_password) < 6:
+            return {"ok": False, "error": "新密码至少 6 位"}
+        if new_password == old_password:
+            return {"ok": False, "error": "新密码不能与旧密码相同"}
+        auth["password_hash"] = hash_password(new_password)
+        auth["password_change_required"] = False
+        auth["changed_at"] = int(time.time() * 1000)
+        db.set_setting("auth", auth)
+        # 改密后旧 token 全部失效，签发新 token 保持当前会话
+        _tokens.clear()
+        return {"ok": True, "message": "密码修改成功", "token": _issue_token()}
 
 
 def is_password_change_required() -> bool:
-    return bool((db.get_setting("auth", {}) or {}).get("password_change_required", False))
+    with _auth_lock:
+        return bool((db.get_setting("auth", {}) or {}).get("password_change_required", False))
 
 
 def logout_token(token: str) -> None:
     token_hash = hashlib.sha256(token.encode()).hexdigest()
-    _tokens.pop(token_hash, None)
+    with _auth_lock:
+        _tokens.pop(token_hash, None)

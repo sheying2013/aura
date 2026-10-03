@@ -170,11 +170,6 @@ def lookup(ip: str) -> Dict[str, Any]:
     return result
 
 
-def lookup_batch(ips) -> Dict[str, Dict[str, Any]]:
-    """批量查 IP 情报（逐 IP，独立降级）。"""
-    return {ip: lookup(ip) for ip in ips}
-
-
 # ---------- ping0.cc 增强（风控值/原生IP，经节点代理） ----------
 
 _PING0_TTL = 7 * 24 * 3600  # ping0 数据变化慢，7 天缓存

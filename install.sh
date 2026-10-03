@@ -46,11 +46,11 @@ fail()  { color "31" "[✘] $1\n"; exit 1; }
 prompt_input() {
   local p="$1" default="$2"
   local val=""
-  printf "%s" "$p"
+  printf "%s" "$p" >&2
   if [ -n "$default" ]; then
-    printf " [%s]" "$default"
+    printf " [%s]" "$default" >&2
   fi
-  printf ": "
+  printf ": " >&2
   read -r val
   if [ -z "$val" ]; then
     val="$default"
@@ -201,7 +201,7 @@ configure_panel() {
   # 密码：用户显式提供（交互输入或 AURA_PASSWORD）才算"想改密码"；
   # 自动生成的随机密码只在首次安装时用，重跑/更新时不得覆盖已有密码
   PASSWORD_EXPLICIT="0"
-  if [ -n "$AURA_PASSWORD" ]; then
+  if [ -n "${AURA_PASSWORD:-}" ]; then
     PASSWORD="$AURA_PASSWORD"
     PASSWORD_EXPLICIT="1"
   fi
@@ -262,9 +262,13 @@ configure_panel
 
 # ---------- 同步前端 ----------
 sync_frontend() {
-  mkdir -p "$SRC_DIR/backend/static"
-  [ -f "$SRC_DIR/index.html" ] && cp -f "$SRC_DIR/index.html" "$SRC_DIR/backend/static/index.html"
-  [ -f "$SRC_DIR/subs.js" ]    && cp -f "$SRC_DIR/subs.js"    "$SRC_DIR/backend/static/subs.js"
+  mkdir -p "$SRC_DIR/backend/static/js"
+  if [ -f "$SRC_DIR/index.html" ]; then
+    cp -f "$SRC_DIR/index.html" "$SRC_DIR/backend/static/index.html"
+  fi
+  if [ -d "$SRC_DIR/static/js" ]; then
+    cp -R "$SRC_DIR/static/js/." "$SRC_DIR/backend/static/js/"
+  fi
   ok "前端资源已同步"
 }
 
@@ -317,7 +321,7 @@ EOF
 
 start_mac() {
   # 询问是否注册 launchd 后台服务（开机自启）
-  if [ "${AURA_SKIP_INPUT}" != "1" ]; then
+  if [ "${AURA_SKIP_INPUT:-0}" != "1" ]; then
     local ans
     printf "注册 macOS 后台服务（launchd，开机自启）？[y/N] "
     read -r ans

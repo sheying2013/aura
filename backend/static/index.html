@@ -878,40 +878,10 @@
             background: rgba(0, 0, 0, 0.03);
         }
 
-        /* 占位区条纹 */
-        .striped-placeholder {
-            height: 240px;
-            background: var(--input-bg);
-            border: 1px solid var(--dim);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: var(--fg);
-            opacity: 0.5;
-            font-size: 11px;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            position: relative;
-            overflow: hidden;
-            margin-bottom: 30px;
-        }
-        .striped-placeholder::after {
-            content: '';
-            position: absolute;
-            top: 0; left: 0; right: 0; height: 100%;
-            background: linear-gradient(180deg, transparent, rgba(var(--particle-color),0.05) 50%, transparent);
-            background-size: 100% 200%;
-            animation: scan 4s linear infinite;
-        }
-
         /* 动画 */
         @keyframes slideUpFade {
             from { opacity: 0; transform: translateY(30px); }
             to { opacity: 1; transform: translateY(0); }
-        }
-        @keyframes scan {
-            0% { background-position: 0 -100%; }
-            100% { background-position: 0 100%; }
         }
 
         /* ── Toast 通知（showToast：替代原生 alert，右上角滑入自动消失）── */
@@ -1001,7 +971,7 @@
             <div style="display: flex; gap: 20px; align-items: center;">
                 <button class="btn btn-action" onclick="doLogout()">退出登录</button>
                 <div style="font-size: 10px; color: var(--fg); opacity:0.5; letter-spacing: 2px; text-transform: uppercase;">
-                    UPTIME: <span id="sys-uptime" style="color: var(--rock); opacity:1;">00:00:00</span>
+                    UPTIME: <span id="sys-uptime" style="color: var(--rock); opacity:1;">--:--:--</span>
                 </div>
             </div>
         </header>
@@ -1054,17 +1024,17 @@
                 <div class="grid-layout" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
                     <div class="card card-compact">
                         <div class="card-title">Downlink Volume</div>
-                        <div class="card-value count-up" data-val="124.50">0.00 <span>MB/s</span></div>
+                        <div class="card-value" id="dash-stat-down-rate">-- <span>MB/s</span></div>
                         <div class="card-sub">Realtime Downward Throughput</div>
                     </div>
                     <div class="card card-compact">
                         <div class="card-title">Uplink Volume</div>
-                        <div class="card-value count-up" data-val="38.20">0.00 <span>MB/s</span></div>
+                        <div class="card-value" id="dash-stat-up-rate">-- <span>MB/s</span></div>
                         <div class="card-sub">Realtime Upward Throughput</div>
                     </div>
                     <div class="card card-compact">
                         <div class="card-title">Active Conns</div>
-                        <div class="card-value count-up" data-val="4892" data-int="true">0</div>
+                        <div class="card-value" id="dash-stat-active-connections">--</div>
                         <div class="card-sub">Established Outbound Sessions</div>
                     </div>
                 </div>
@@ -1093,8 +1063,8 @@
                         <div class="card-value" id="dash-stat-total-speed">0.00 <span>MB/s</span></div>
                     </div>
                     <div class="card card-compact">
-                        <div class="card-title">Today Traffic</div>
-                        <div class="card-value" id="card-traffic-today">0.00 <span>MB</span></div>
+                        <div class="card-title">Cumulative Traffic</div>
+                        <div class="card-value" id="card-traffic-total">0 B</div>
                     </div>
                 </div>
                 
@@ -1138,7 +1108,7 @@
                             <button class="btn" onclick="enableAllDisabledNodes()">全部启用</button>
                             <button class="btn" onclick="disableSelectedNodes()">全选停用</button>
                             <button class="btn btn-danger" onclick="deleteSelectedNodes()">批量删除</button>
-                            <button class="btn" onclick="triggerPingAll(this)">批量探活</button>
+                            <button class="btn" data-probe-all onclick="triggerPingAll()">批量探活</button>
                             <button class="btn btn-primary" onclick="openModal('import-modal')">导入新节点</button>
                         </div>
                     </div>
@@ -1279,7 +1249,7 @@
                     <label class="checkbox-wrapper" style="font-size:10px; text-transform:uppercase; letter-spacing:2px; color:var(--fg); opacity:0.7;">
                         <input type="checkbox" id="sub-auto-refresh" onchange="saveSubAutoRefresh()">
                         <div class="checkbox-box"></div>
-                        每 6 小时自动刷新
+                        每 3 小时自动刷新
                     </label>
                 </div>
 
@@ -1766,25 +1736,9 @@
                 <label class="form-label">订阅链接</label>
                 <input type="text" id="edit-sub-url" class="form-input" value="https://api.example.com/sub">
             </div>
-            <div style="display:flex; gap: 16px;">
-                <div class="form-group" style="flex:1;">
-                    <label class="form-label">分组</label>
-                    <input type="text" id="edit-sub-group" class="form-input" value="VIP Group">
-                </div>
-                <div class="form-group" style="flex:1;">
-                    <label class="form-label">起始端口</label>
-                    <input type="number" id="edit-sub-port-start" class="form-input" placeholder="例如 53000">
-                </div>
-            </div>
-            <div style="display:flex; gap: 16px;">
-                <div class="form-group" style="flex:1;">
-                    <label class="form-label">认证用户名</label>
-                    <input type="text" id="edit-sub-auth-user" class="form-input" placeholder="用户名">
-                </div>
-                <div class="form-group" style="flex:1;">
-                    <label class="form-label">认证密码</label>
-                    <input type="text" id="edit-sub-auth-pass" class="form-input" placeholder="密码">
-                </div>
+            <div class="form-group">
+                <label class="form-label">分组</label>
+                <input type="text" id="edit-sub-group" class="form-input" value="VIP Group">
             </div>
             <div id="edit-sub-error" style="color: var(--danger); font-size: 11px; margin-bottom: 14px; min-height: 16px;"></div>
             <div class="modal-actions">
@@ -1794,5 +1748,5 @@
         </div>
     </div>
 
-    <script src="js/main.js?v=20261003a"></script>
+    <script src="js/main.js?v=20261003b"></script>
 </body>

@@ -70,6 +70,7 @@ class NodeBatchRequest(BaseModel):
 
 class NodeBatchResponse(BaseModel):
     created: int = 0
+    updated: int = 0
     skipped: int = 0
     duplicate: int = 0
     failed: int = 0
@@ -112,6 +113,7 @@ class PingRequest(BaseModel):
     ids: Optional[List[str]] = None
     all: bool = True
     includeDisabled: bool = False
+    manual: bool = True
 
 
 class PingResultItem(BaseModel):
@@ -159,6 +161,9 @@ class Subscription(BaseModel):
     lastRefresh: Optional[int] = None
     nodeCount: int = 0
     lastError: Optional[str] = None
+    stale: bool = False
+    degraded: bool = False
+    pendingApply: bool = False
 
 
 class SubToggleRequest(BaseModel):
@@ -200,7 +205,9 @@ class SubRefreshResult(BaseModel):
     ok: bool
     count: int = 0
     stale: bool = False
+    degraded: bool = False
     imported: int = 0
+    updated: int = 0
     error: Optional[str] = None
 
 
@@ -256,6 +263,7 @@ class RelayStats(BaseModel):
 
 class StatsResponse(BaseModel):
     global_: GlobalStats = Field(default_factory=GlobalStats, alias="global")
+    activeConnections: int = 0
     nodes: List[NodeStats] = []
     relayDomains: List[RelayStats] = []
 

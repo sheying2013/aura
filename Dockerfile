@@ -43,7 +43,8 @@ WORKDIR /app
 # 后端源码
 COPY backend/ /app/backend/
 # 前端（编辑源在仓库根，同步副本进 static 供后端托管）
-COPY index.html subs.js /app/backend/static/
+COPY index.html /app/backend/static/
+COPY static/js/ /app/backend/static/js/
 COPY backend/requirements.txt /app/backend/requirements.txt
 
 WORKDIR /app/backend

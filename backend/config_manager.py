@@ -143,6 +143,17 @@ _proc: Optional[asyncio.subprocess.Process] = None
 _started_at: Optional[float] = None
 _last_good_config: Optional[Dict] = None  # 最近一次成功 apply 的配置（回滚参考）
 _op_lock = asyncio.Lock()  # 串行化 apply/start/stop，避免 SIGHUP/SIGTERM 竞态
+_operation_generation = 0
+
+
+def operation_generation() -> int:
+    """探活快照版本：配置操作开始即失效，操作完成后也不能使用旧结果。"""
+    return _operation_generation
+
+
+def _begin_operation() -> None:
+    global _operation_generation
+    _operation_generation += 1
 _logf = None  # sing-box 日志文件句柄，避免 fd 泄漏
 _wait_task: Optional[asyncio.Task] = None  # 收割子进程的 wait() 任务
 
@@ -235,8 +246,9 @@ def build_config() -> Dict[str, Any]:
     used_inbound_ports: Set[int] = set()  # 已占用的入站端口（节点 + relay），防总入口冲突
 
     for node in nodes:
-        # 已停用节点（连续探活失败自动停用）：不生成 inbound/outbound，不参与轮询
-        if node.get("status") == "disabled":
+        # 自动停用保留 outbound 供健康复查；无 inbound，也不进入业务 selector。
+        probe_only = node.get("status") == "disabled"
+        if probe_only and not node.get("disabledAuto"):
             continue
         sb_type = PROTOCOL_TYPE_MAP.get(node["protocol"])
         if sb_type is None:
@@ -245,8 +257,9 @@ def build_config() -> Dict[str, Any]:
         tag_in = f"in-mixed-{node['port']}"
         tag_out = outbound_tag(node["protocol"], node["port"])
         entry_proto = node.get("entryProto") or "mixed"
-        used_inbound_ports.add(int(node["port"]))
-        if entry_proto == "ss":
+        if not probe_only:
+            used_inbound_ports.add(int(node["port"]))
+        if not probe_only and entry_proto == "ss":
             # Shadowsocks 单协议入站：aes-256-gcm + 节点 ss 密码
             ss_pass = node.get("ssPass") or node.get("authPass") or "relaypass"
             inbounds.append({
@@ -255,7 +268,7 @@ def build_config() -> Dict[str, Any]:
                 "method": "aes-256-gcm",
                 "password": ss_pass,
             })
-        else:
+        elif not probe_only:
             inbounds.append({
                 "type": "mixed", "tag": tag_in, "listen": listen_ip,
                 "listen_port": node["port"],
@@ -405,7 +418,8 @@ def build_config() -> Dict[str, Any]:
             })
         outbounds.append(out_item)
         outbound_tag_set.add(tag_out)
-        route_rules.append({"inbound": [tag_in], "outbound": tag_out})
+        if not probe_only:
+            route_rules.append({"inbound": [tag_in], "outbound": tag_out})
 
     # 多域名轮询入口
     for rd in relay_domains:
@@ -611,6 +625,7 @@ async def _reap_proc() -> None:
 async def start() -> bool:
     """用 config.json 启动（缺失时尝试 .bak）。返回是否成功启动。"""
     async with _op_lock:
+        _begin_operation()
         return await _start_unlocked()
 
 
@@ -659,6 +674,7 @@ async def _start_unlocked() -> bool:
 
 async def stop() -> None:
     async with _op_lock:
+        _begin_operation()
         await _stop_unlocked()
 
 
@@ -697,7 +713,7 @@ async def _stop_unlocked() -> None:
         _signal_singbox(signal.SIGTERM)
 
 
-async def reload_config() -> bool:
+async def reload_config(config: Dict) -> bool:
     """SIGHUP 热重载（sing-box 收到后内部 check() 重读磁盘配置，失败保留旧实例）。
 
     send_signal 只证明信号已发出，不代表重载成功——sing-box 收到 SIGHUP 后
@@ -708,6 +724,7 @@ async def reload_config() -> bool:
     已 reaped/失效），统一用 /proc 扫描真实运行的 sing-box 进程发信号。
     """
     global _proc
+    _begin_operation()
     if not is_running():
         return False
     # 优先 _proc（正常路径）；逃逸场景 /proc 扫描兜底，命中才认为信号发出
@@ -725,36 +742,33 @@ async def reload_config() -> bool:
     # 此时 /version 依然 200，仅靠可达性会误报重载成功（曾致配置更新不生效）。
     # 判据：socket 探测新配置的 inbound 端口是否已监听（reload 成功 = 新端口已起）。
     # sing-box /configs 不返回 inbounds（Clash 兼容字段），不能用它比对。
-    disk_cfg = _last_good_config or {}
-    # 探测地址：inbound 的 listen（可能是 0.0.0.0 → 用 127.0.0.1 探测）
-    probe_ports = []
-    listen_ip = "127.0.0.1"
-    for ib in disk_cfg.get("inbounds", []):
+    # 候选配置显式传入；last-good 必须留到 apply 确认成功后才更新。
+    probe_endpoints = []
+    for ib in config.get("inbounds", []):
         if ib.get("listen_port"):
-            probe_ports.append(int(ib["listen_port"]))
-            lip = str(ib.get("listen") or "127.0.0.1")
-            if lip in ("0.0.0.0", "::"):
+            listen_ip = str(ib.get("listen") or "127.0.0.1")
+            if listen_ip == "0.0.0.0":
                 listen_ip = "127.0.0.1"
-            else:
-                listen_ip = lip
+            elif listen_ip == "::":
+                listen_ip = "::1"
+            probe_endpoints.append((listen_ip, int(ib["listen_port"])))
     hdrs = {"Authorization": f"Bearer {get_clash_secret()}"}
 
     async def _probe_ok() -> bool:
-        """探测新配置全部 inbound 端口是否已监听。
-        open_connection 成功即端口可连；只关 writer（StreamReader 无 close）。"""
-        ok = True
-        for p in probe_ports:
+        """逐一确认候选入站，避免旧端口及最后一个 listen 地址干扰判断。"""
+        for listen_ip, port in probe_endpoints:
             try:
-                _, ww = await asyncio.open_connection(listen_ip, p)
-                ww.close()
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(listen_ip, port), timeout=1.0
+                )
+                writer.close()
                 try:
-                    await ww.wait_closed()
+                    await writer.wait_closed()
                 except Exception:
                     pass
             except Exception:
-                ok = False
-                break
-        return ok
+                return False
+        return True
 
     try:
         # 信号发出后立即探测一次（reload 可能 <0.5s 完成，轮询首拍可能漏）
@@ -777,7 +791,7 @@ async def reload_config() -> bool:
                     continue
                 if await _probe_ok():
                     return True
-                print(f"[reload] 等待端口监听中: {probe_ports}")
+                print(f"[reload] 等待端口监听中: {probe_endpoints}")
     except Exception:
         pass
     # 6s 内新端口未全部监听——热重载未生效，返回 False 由调用方冷重启兜底
@@ -821,6 +835,7 @@ def _get_singbox_version() -> Optional[str]:
 async def apply_config(provided: Optional[Dict] = None) -> Dict[str, Any]:
     """生成→校验→原子写→热重载→验证 clash API。失败回滚。全程加锁防并发竞态。"""
     async with _op_lock:
+        _begin_operation()
         return await _apply_config_impl(provided)
 
 
@@ -859,80 +874,99 @@ async def _apply_config_impl(provided: Optional[Dict] = None) -> Dict[str, Any]:
             "errors": errors,
         }
 
-    # 3. 原子写 + 留档（先存旧好配置，再更新 _last_good_config，避免回滚自回滚）
+    # 3. 原子写候选配置；只有运行确认成功后才提交 _last_good_config。
     prev_good = _last_good_config
-    _atomic_write_config(config)
-    _last_good_config = config
 
-    # 4. 运行中则热重载，未运行则启动（_apply_config_impl 已持锁，用无锁内核版）
-    if is_running():
-        reloaded = await reload_config()
-        if not reloaded:
-            # 热重载未生效（信号没发出 / sing-box check 失败保留旧实例）：
-            # 冷重启兜底，保证新配置真正运行（否则界面报成功但配置一直是旧的）
-            print("[apply] SIGHUP 热重载未生效，降级冷重启")
-            await _stop_unlocked()
-            started = await _start_unlocked()
-            if not started:
-                return {
-                    "ok": False,
-                    "message": "sing-box 重启失败（热重载未生效，请查看 singbox.log）",
-                    "running": False,
-                    "clashApiOk": False,
-                    "errors": errors,
-                }
-    else:
-        started = await _start_unlocked()
-        if not started:
+    async def _rollback(message: str) -> Dict[str, Any]:
+        """恢复旧配置并尽力重启；失败时绝不把候选配置留作 last-good。"""
+        global _last_good_config
+        if prev_good is None:
+            _last_good_config = None
+            try:
+                await _stop_unlocked()
+            except Exception as exc:
+                message = f"{message}；清理失败实例异常: {exc}"
             return {
                 "ok": False,
-                "message": "sing-box 启动失败（请查看 singbox.log）",
-                "running": False,
+                "message": f"{message}；无可用旧配置可回滚",
+                "running": is_running(),
                 "clashApiOk": False,
                 "errors": errors,
             }
 
-    # 5. 验证 clash API 可达（5s 内轮询，async httpx 不阻塞，带 Bearer secret）
-    clash_ok = False
-    clash_hdrs = {"Authorization": f"Bearer {get_clash_secret()}"}
-    async with httpx.AsyncClient(timeout=1.5) as client:
-        for _ in range(10):
-            try:
-                r = await client.get(f"{clash_base()}/version", headers=clash_hdrs)
-                if r.status_code == 200:
-                    clash_ok = True
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-
-    if not clash_ok:
-        # 回滚：用 prev_good（更新前的上一份好配置）重载
-        if prev_good:
+        _last_good_config = prev_good
+        try:
             _atomic_write_config(prev_good)
-            if is_running():
-                await reload_config()
-            else:
-                await _start_unlocked()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "message": f"{message}；旧配置文件回滚失败: {exc}",
+                "running": is_running(),
+                "clashApiOk": False,
+                "errors": errors,
+            }
+        try:
+            await _stop_unlocked()
+            restored = await _start_unlocked()
+            recovery = "已恢复运行" if restored else "恢复启动失败"
+        except Exception as exc:
+            recovery = f"恢复启动异常: {exc}"
         return {
-            "ok": True,
-            "message": "配置已应用但 clash API 未就绪，已回滚到上一份配置",
+            "ok": False,
+            "message": f"{message}；已回滚上一份配置，{recovery}",
             "running": is_running(),
             "clashApiOk": False,
             "errors": errors,
         }
 
+    try:
+        _atomic_write_config(config)
+        # 4. 运行中则热重载，未运行则启动（调用方已持锁，用无锁内核版）
+        if is_running():
+            reloaded = await reload_config(config)
+            if not reloaded:
+                # 热重载未生效，冷重启兜底，保证候选配置真正运行。
+                print("[apply] SIGHUP 热重载未生效，降级冷重启")
+                await _stop_unlocked()
+                if not await _start_unlocked():
+                    return await _rollback(
+                        "sing-box 重启失败（热重载未生效，请查看 singbox.log）"
+                    )
+        elif not await _start_unlocked():
+            return await _rollback("sing-box 启动失败（请查看 singbox.log）")
+
+        # 5. 验证 clash API 可达（5s 内轮询，async httpx 不阻塞，带 Bearer secret）
+        clash_ok = False
+        clash_hdrs = {"Authorization": f"Bearer {get_clash_secret()}"}
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            for _ in range(10):
+                try:
+                    r = await client.get(f"{clash_base()}/version", headers=clash_hdrs)
+                    if r.status_code == 200:
+                        clash_ok = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+    except Exception as exc:
+        return await _rollback(f"配置应用异常: {exc}")
+
+    if not clash_ok:
+        return await _rollback("配置已启动但 clash API 未就绪")
+
+    running = is_running()
+    if not running:
+        return await _rollback("配置验证后 sing-box 已退出")
+
+    # 候选配置已经启动且 API 已确认可达，现在才允许成为回滚基线。
+    _last_good_config = config
     return {
         "ok": True,
         "message": "配置应用成功，sing-box 已热重载",
-        "running": is_running(),
+        "running": running,
         "clashApiOk": True,
         "errors": errors,
     }
-
-
-def get_last_good_config() -> Optional[Dict]:
-    return _last_good_config
 
 
 def get_proc() -> Optional[asyncio.subprocess.Process]:

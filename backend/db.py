@@ -100,6 +100,7 @@ def init_db() -> None:
               node_count    INTEGER DEFAULT 0,
               last_error    TEXT,
               snapshot      TEXT,
+              pending_apply INTEGER DEFAULT 0,
               created_at    INTEGER
             );
 
@@ -127,9 +128,10 @@ def init_db() -> None:
         # 停用来源标记：1=探活自动停用（可被自动复活复查捞回），0=用户手动停用
         if "disabled_auto" not in cols:
             c.execute("ALTER TABLE nodes ADD COLUMN disabled_auto INTEGER DEFAULT 0")
-            # 存量 disabled 节点视为自动停用（历史版本无此标记，误停自愈优先；
-            # 探活通过才复活，真死节点不会被捞）
-            c.execute("UPDATE nodes SET disabled_auto=1 WHERE status='disabled'")
+            # 历史停用来源无法可靠判定：保守保留为手动停用，禁止自动复活。
+        sub_cols = {r[1] for r in c.execute("PRAGMA table_info(subscriptions)")}
+        if "pending_apply" not in sub_cols:
+            c.execute("ALTER TABLE subscriptions ADD COLUMN pending_apply INTEGER DEFAULT 0")
         # IP 情报列（探活成功后落库归属地/类型/评分）
         for col, ddl in (
             ("exit_country", "TEXT"),
@@ -212,10 +214,19 @@ def _node_to_params(node: Dict[str, Any]) -> tuple:
 
 # ---------- 端口分配 ----------
 
-def get_reserved_ports() -> set:
-    s = get_setting("system", {})
-    reserved = s.get("reservedPorts", []) if isinstance(s, dict) else []
-    return set(int(p) for p in (reserved or []))
+def _parse_port(value: Any, allow_auto: bool = False) -> Optional[int]:
+    """规范化端口；None/0 可表示自动分配，非法值不进入 SQLite。"""
+    if value is None:
+        return 0 if allow_auto else None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    if allow_auto and port == 0:
+        return 0
+    return port if 1 <= port <= 65535 else None
 
 
 def _used_ports(c) -> set:
@@ -230,7 +241,7 @@ def _used_ports(c) -> set:
         try:
             s = json.loads(row[0])
             reserved = s.get("reservedPorts", []) if isinstance(s, dict) else []
-            used |= set(int(p) for p in (reserved or []))
+            used |= {port for p in (reserved or []) if (port := _parse_port(p)) is not None}
         except Exception:
             pass
     return used
@@ -242,8 +253,11 @@ def _next_available_port_locked(c, preferred_port: Optional[int], segment: Optio
     P2-2：端口池 52001-65535 全占满时返回 None（不再 p+=1 越过 65535 产生非法端口）。
     """
     used = _used_ports(c)
-    if preferred_port and preferred_port not in used:
-        return preferred_port
+    preferred = _parse_port(preferred_port, allow_auto=True)
+    if preferred is None:
+        return None
+    if preferred and preferred not in used:
+        return preferred
     base = 52001
     p = base
     while p in used:
@@ -253,7 +267,7 @@ def _next_available_port_locked(c, preferred_port: Optional[int], segment: Optio
     return p
 
 
-def get_next_available_port(preferred_port: Optional[int], segment: Optional[int] = None) -> int:
+def get_next_available_port(preferred_port: Optional[int], segment: Optional[int] = None) -> Optional[int]:
     """端口分配：preferred_port 生效则用之，否则从 52001 起；冲突自动向上跳过。"""
     with _lock:
         c = connect()
@@ -356,13 +370,13 @@ def create_node(node: Dict[str, Any]) -> Dict:
 
 
 def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = False) -> Dict[str, Any]:
-    """批量创建 + 去重（按 server:server_port）。返回 {created, skipped, duplicate, items}。
+    """批量创建 + 去重（按 server:server_port）。返回 {created, updated, skipped, duplicate, items}。
 
     update_existing_sub=True（订阅刷新）：同 subId 且 server:port 已存在的节点
-    直接 UPDATE（机场换密码/uuid 后新参数生效，P1-3），不回跳；不同 subId /
-    无 subId 的节点仍走去重跳过，防止误改他组/手动导入节点。
+    只更新上游字段，保留本地端口、认证、管理状态、入口设置、累计流量和 IP 情报。
     """
     created = 0
+    updated = 0
     skipped = 0
     duplicate = 0
     items: List[Dict] = []
@@ -375,11 +389,11 @@ def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = F
             try:
                 rc = json.loads(r["raw_config"] or "{}")
                 srv = rc.get("server") or rc.get("address")
-                sp = rc.get("server_port") or rc.get("port")
+                sp = _parse_port(rc.get("server_port") or rc.get("port"))
                 if srv and sp:
-                    existing_servers.add((str(srv), int(sp)))
+                    existing_servers.add((str(srv), sp))
                     if r["sub_id"]:
-                        existing_by_key[(r["sub_id"], str(srv), int(sp))] = {
+                        existing_by_key[(r["sub_id"], str(srv), sp)] = {
                             "id": r["id"], "sub_id": r["sub_id"]}
             except Exception:
                 pass
@@ -394,10 +408,9 @@ def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = F
             try:
                 _s = json.loads(_rp_row[0] or "{}")
                 for p in (_s.get("reservedPorts", []) or []):
-                    try:
-                        db_used.add(int(p))
-                    except (TypeError, ValueError):
-                        pass
+                    parsed = _parse_port(p)
+                    if parsed is not None:
+                        db_used.add(parsed)
             except Exception:
                 pass
         batch_ports = set()
@@ -407,33 +420,38 @@ def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = F
                 nd["id"] = new_node_id()
             rc = nd.get("rawConfig") or {}
             srv = rc.get("server") or rc.get("address")
-            sp = rc.get("server_port") or rc.get("port")
+            sp = _parse_port(rc.get("server_port") or rc.get("port"))
+            if srv and sp is None:
+                skipped += 1
+                continue
             if srv and sp:
-                key = (str(srv), int(sp))
-                # 订阅刷新：同 subId 已存在 → 原地 UPDATE（机场换参数后新配置生效），不重复导入
+                key = (str(srv), sp)
+                # 订阅刷新：同 subId 已存在 → 只更新上游来源字段；本地运维字段不可被机场覆盖
                 if update_existing_sub and nd.get("subId"):
-                    ex = existing_by_key.get((nd["subId"], str(srv), int(sp)))
+                    ex = existing_by_key.get((nd["subId"], str(srv), sp))
                     if ex:
-                        upd = dict(nd)
-                        upd["id"] = ex["id"]
-                        # 取该节点当前端口（更新不动端口，避免端口漂移）
-                        prow = c.execute("SELECT port FROM nodes WHERE id=?", (ex["id"],)).fetchone()
-                        upd["port"] = prow["port"] if prow else 0
-                        c.execute(
-                            """UPDATE nodes SET name=?,protocol=?,"group"=?,segment=?,auth_user=?,
-                               auth_pass=?,status=?,ping=?,exit_ip=?,raw_config=?,sub_name=?,
-                               entry_proto=?,ss_pass=?,stale=?,updated_at=? WHERE id=?""",
-                            (upd.get("name", "未命名"), upd.get("protocol", "shadowsocks"),
-                             upd.get("group", "默认分组"), upd.get("segment"),
-                             upd.get("authUser"), upd.get("authPass"),
-                             upd.get("status", "offline"), upd.get("ping", 0),
-                             upd.get("exitIp", "N/A"),
-                             json.dumps(upd.get("rawConfig", {}), ensure_ascii=False),
-                             upd.get("subName"), upd.get("entryProto", "mixed"),
-                             upd.get("ssPass"), 1 if upd.get("stale") else 0,
-                             _conn_now(), ex["id"]),
+                        current = c.execute("SELECT * FROM nodes WHERE id=?", (ex["id"],)).fetchone()
+                        incoming_raw = json.dumps(rc, ensure_ascii=False)
+                        current_raw = json.loads(current["raw_config"] or "{}") if current else {}
+                        changed = (
+                            not current or current["name"] != nd.get("name", "未命名") or
+                            current["protocol"] != nd.get("protocol", "shadowsocks") or
+                            current["sub_name"] != nd.get("subName") or
+                            current["stale"] != (1 if nd.get("stale") else 0) or
+                            current_raw != rc
                         )
-                        duplicate += 1  # 语义：已存在被更新（前端显示"重复（已存在）"数量不变）
+                        if changed:
+                            c.execute(
+                                """UPDATE nodes SET name=?,protocol=?,raw_config=?,sub_name=?,stale=?,updated_at=?
+                                   WHERE id=?""",
+                                (nd.get("name", "未命名"), nd.get("protocol", "shadowsocks"),
+                                 incoming_raw, nd.get("subName"), 1 if nd.get("stale") else 0,
+                                 _conn_now(), ex["id"]),
+                            )
+                            updated += 1
+                            items.append(_row_to_node(c.execute("SELECT * FROM nodes WHERE id=?", (ex["id"],)).fetchone()))
+                        else:
+                            duplicate += 1
                         continue
                 # 刷新路径：不同 subId 同 server 允许导入（各自订阅独立，不互相挤占）；
                 # 非刷新路径（手动导入/订阅首次导入）保持全局 server:port 去重
@@ -442,30 +460,32 @@ def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = F
                     skipped += 1
                     continue
                 # 已删除节点指纹：订阅刷新时不重复导入（仅跳过，不占 duplicate 计数）。
-                # 注意：先检查指纹再 add existing_servers——已删节点不占位，同 host 不同订阅仍可导入
                 if nd.get("subId") and f"{nd['subId']}|{srv}|{sp}" in deleted_fps:
                     skipped += 1
                     continue
                 existing_servers.add(key)
-            # 端口冲突则顺位分配（不入库会跳过整个节点，回归修复：指定端口被占
-            # 时顺位到下一个空闲端口，而不是整批 skipped）
-            port = nd.get("port")
+            # 端口冲突则顺位分配；非法显式端口直接跳过，防止写入 SQLite/生成非法配置
+            requested_port = _parse_port(nd.get("port"), allow_auto=True)
+            if requested_port is None:
+                skipped += 1
+                continue
+            port = requested_port
             if not port:
-                # 自动分配：从 52001 起找既不在 DB 也不在批内已用端口的空闲端口
-                base = 52001
-                port = base
-                while port in db_used or port in batch_ports:
-                    port += 1
-            elif port in db_used or port in batch_ports:
-                # 指定端口被占用 → 顺位找下一个空闲端口（保持批内连续递增语义）
+                port = 52001
                 while port in db_used or port in batch_ports:
                     port += 1
                     if port > 65535:
                         port = 0
                         break
-                if port == 0:
-                    skipped += 1
-                    continue
+            elif port in db_used or port in batch_ports:
+                while port in db_used or port in batch_ports:
+                    port += 1
+                    if port > 65535:
+                        port = 0
+                        break
+            if port == 0:
+                skipped += 1
+                continue
             batch_ports.add(port)
             db_used.add(port)
             nd["port"] = port
@@ -473,18 +493,17 @@ def create_node_batch(nodes: List[Dict[str, Any]], update_existing_sub: bool = F
                 c.execute(
                     """INSERT INTO nodes
                        (id,name,protocol,"group",port,segment,auth_user,auth_pass,status,ping,
-                        exit_ip,up_traffic,down_traffic,raw_config,sub_id,sub_name,stale,selected,entry_proto,ss_pass,created_at,updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        exit_ip,up_traffic,down_traffic,raw_config,sub_id,sub_name,stale,selected,entry_proto,ss_pass,disabled_auto,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     _node_to_params(nd),
                 )
             except sqlite3.IntegrityError:
                 skipped += 1
                 continue
-            # 不再逐条回查（200 节点 = 200 次全字段 SELECT），输入字段齐全直接用
             items.append(nd)
             created += 1
         c.commit()
-    return {"created": created, "skipped": skipped, "duplicate": duplicate, "items": items}
+    return {"created": created, "updated": updated, "skipped": skipped, "duplicate": duplicate, "items": items}
 
 
 def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
@@ -498,16 +517,22 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
         merged = {**cur}
         for k, v in patch.items():
             merged[k] = v
-        # P2-1：编辑弹窗改端口到已占用值 → 不再 IntegrityError 500，
-        # 冲突时自动重分配空闲端口（与 update_node_port 语义一致）
-        if "port" in patch and patch.get("port"):
+        if "status" in patch:
+            # 显式 status 变更是管理动作；自动停用调用必须显式传 disabledAuto=True。
+            merged["consecutiveFails"] = 0
+            merged["disabledAuto"] = bool(patch.get("disabledAuto")) if patch["status"] == "disabled" else False
+        # 端口冲突自动重分配；非法输入或池耗尽返回 None，不写入非法端口。
+        if "port" in patch:
+            target = _parse_port(patch["port"], allow_auto=True)
+            if target is None:
+                return None
             used = _used_ports(c)
-            if cur["port"] in used:
-                used.discard(cur["port"])
-            if patch["port"] in used:
-                newp = _next_available_port_locked(c, None)
-                if newp is not None:
-                    merged["port"] = newp
+            used.discard(cur["port"])
+            if not target or target in used:
+                target = _next_available_port_locked(c, None)
+            if target is None:
+                return None
+            merged["port"] = target
         c.execute(
             """UPDATE nodes SET name=?,protocol=?,"group"=?,port=?,segment=?,auth_user=?,
                auth_pass=?,status=?,ping=?,exit_ip=?,up_traffic=?,down_traffic=?,raw_config=?,
@@ -572,9 +597,13 @@ def update_node_port(node_id: str, port: Optional[int]) -> Optional[Dict]:
         # 排除自己当前端口
         if cur["port"] in used:
             used.discard(cur["port"])
-        target = port
+        target = _parse_port(port, allow_auto=True)
+        if target is None:
+            return None
         if not target or target in used:
-            target = _next_available_port_locked(c, port if port else None)
+            target = _next_available_port_locked(c, target or None)
+        if target is None:
+            return None
         c.execute("UPDATE nodes SET port=?, updated_at=? WHERE id=?", (target, _conn_now(), node_id))
         c.commit()
     return get_node(node_id)
@@ -635,18 +664,6 @@ def _record_deleted(c: sqlite3.Connection, node_row) -> None:
               (fp, _conn_now()))
 
 
-def deleted_fingerprints(sub_id: Optional[str] = None) -> set:
-    """订阅指纹集合（sub_id 过滤可选）。"""
-    with _lock:
-        c = connect()
-        if sub_id:
-            rows = c.execute("SELECT fingerprint FROM deleted_fingerprints WHERE fingerprint LIKE ?",
-                             (f"{sub_id}|%",)).fetchall()
-        else:
-            rows = c.execute("SELECT fingerprint FROM deleted_fingerprints").fetchall()
-        return {r["fingerprint"] for r in rows}
-
-
 def add_traffic(node_id: str, up_delta: int, down_delta: int) -> None:
     """累计流量（增量）。"""
     with _lock:
@@ -654,6 +671,22 @@ def add_traffic(node_id: str, up_delta: int, down_delta: int) -> None:
         c.execute(
             "UPDATE nodes SET up_traffic = up_traffic + ?, down_traffic = down_traffic + ?, updated_at = ? WHERE id = ?",
             (max(0, int(up_delta)), max(0, int(down_delta)), _conn_now(), node_id),
+        )
+        c.commit()
+
+
+def add_traffic_batch(deltas: Dict[str, tuple[int, int]]) -> None:
+    """按节点增量累计流量；整批只持锁和提交一次。"""
+    if not deltas:
+        return
+    now = _conn_now()
+    values = [(max(0, int(up)), max(0, int(down)), now, nid)
+              for nid, (up, down) in deltas.items()]
+    with _lock:
+        c = connect()
+        c.executemany(
+            "UPDATE nodes SET up_traffic=up_traffic+?, down_traffic=down_traffic+?, updated_at=? WHERE id=?",
+            values,
         )
         c.commit()
 
@@ -691,28 +724,66 @@ def reset_all_traffic() -> None:
         c.commit()
 
 
-def update_node_probe(node_id: str, ping: int, status: str, error: Optional[str] = None) -> Optional[int]:
-    """探活结果落库（status/exitIp/ping 由后端覆盖，不经前端回写）。
+def update_node_probe(node_id: str, ping: int, status: str, error: Optional[str] = None, *,
+                      count_failure: bool = True, expected_port: Optional[int] = None,
+                      expected_protocol: Optional[str] = None) -> Optional[int]:
+    """原子落库探活结果；手动失败不计数，成功清零。
 
-    失败计数：status=online 清零；其他状态（offline/error/disabled）累加。
-    返回累计失败次数（供调度器判断自动停用/删除），成功返回 0。
+    当前节点已停用、删除或 tag 已变化时返回 None，调用方必须丢弃过期结果。
     """
+    where = "id=? AND status!='disabled'"
+    expected: list = [node_id]
+    if expected_port is not None:
+        where += " AND port=?"
+        expected.append(expected_port)
+    if expected_protocol is not None:
+        where += " AND protocol=?"
+        expected.append(expected_protocol)
+    if status == "online":
+        counter = "0"
+    else:
+        counter = "consecutive_fails+1" if count_failure else "consecutive_fails"
     with _lock:
         c = connect()
-        if status == "online":
-            c.execute(
-                "UPDATE nodes SET ping=?, status=?, consecutive_fails=0, updated_at=? WHERE id=?",
-                (int(ping), status, _conn_now(), node_id),
-            )
-            c.commit()
-            return 0
-        c.execute(
-            "UPDATE nodes SET ping=?, status=?, consecutive_fails=consecutive_fails+1, updated_at=? WHERE id=?",
-            (int(ping), status, _conn_now(), node_id),
+        cur = c.execute(
+            f"UPDATE nodes SET ping=?, status=?, consecutive_fails={counter}, updated_at=? WHERE {where}",
+            (int(ping), status, _conn_now(), *expected),
         )
         c.commit()
+        if cur.rowcount == 0:
+            return None
         row = c.execute("SELECT consecutive_fails FROM nodes WHERE id=?", (node_id,)).fetchone()
-        return row["consecutive_fails"] if row else 0
+        return row["consecutive_fails"] if row else None
+
+
+def revive_node_probe(node_id: str, ping: int, *, expected_port: int,
+                      expected_protocol: str) -> Optional[int]:
+    """仅复活 tag 未变的自动停用节点；手动停用/过期探活不得改状态。"""
+    with _lock:
+        c = connect()
+        cur = c.execute(
+            """UPDATE nodes SET ping=?,status='online',consecutive_fails=0,disabled_auto=0,updated_at=?
+               WHERE id=? AND status='disabled' AND disabled_auto=1 AND port=? AND protocol=?""",
+            (int(ping), _conn_now(), node_id, expected_port, expected_protocol),
+        )
+        c.commit()
+        return 0 if cur.rowcount else None
+
+
+def disable_node_after_probe(node_id: str, *, expected_port: int, expected_protocol: str,
+                             expected_fails: int) -> bool:
+    """失败阈值达到且当前 tag/计数仍匹配时，原子标记自动停用。"""
+    if expected_fails < 20:
+        return False
+    with _lock:
+        c = connect()
+        cur = c.execute(
+            """UPDATE nodes SET status='disabled',disabled_auto=1,updated_at=?
+               WHERE id=? AND status!='disabled' AND port=? AND protocol=? AND consecutive_fails=?""",
+            (_conn_now(), node_id, expected_port, expected_protocol, expected_fails),
+        )
+        c.commit()
+        return bool(cur.rowcount)
 
 
 # ---------- 多域名轮询 ----------
@@ -765,6 +836,7 @@ def list_subs() -> List[Dict]:
                 "group": r["group"], "enabled": bool(r["enabled"]),
                 "lastRefresh": r["last_refresh"], "nodeCount": r["node_count"],
                 "lastError": r["last_error"],
+                "pendingApply": bool(r["pending_apply"]),
                 # stale：上次刷新失败且无 last-good 快照 → 失效；有快照 → 降级
                 "stale": bool(r["last_error"] and not r["snapshot"]),
                 "degraded": bool(r["last_error"] and r["snapshot"]),
@@ -783,6 +855,9 @@ def get_sub(sub_id: str) -> Optional[Dict]:
             "group": r["group"], "enabled": bool(r["enabled"]),
             "lastRefresh": r["last_refresh"], "nodeCount": r["node_count"],
             "lastError": r["last_error"], "snapshot": r["snapshot"],
+            "pendingApply": bool(r["pending_apply"]),
+            "stale": bool(r["last_error"] and not r["snapshot"]),
+            "degraded": bool(r["last_error"] and r["snapshot"]),
         }
 
 
@@ -810,7 +885,7 @@ def update_sub(sub_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
         allowed = {
             "name": "name", "group": '"group"', "enabled": "enabled",
             "url": "url", "last_refresh": "last_refresh", "node_count": "node_count",
-            "last_error": "last_error", "snapshot": "snapshot",
+            "last_error": "last_error", "snapshot": "snapshot", "pending_apply": "pending_apply",
         }
         sets = []
         params = []
@@ -822,7 +897,7 @@ def update_sub(sub_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
                     if v is None:
                         continue
                     sets.append(f"{allowed[k]} = ?")
-                    params.append(int(v) if k in ("enabled", "last_refresh", "node_count") else v)
+                    params.append(int(v) if k in ("enabled", "last_refresh", "node_count", "pending_apply") else v)
         if sets:
             c.execute(f"UPDATE subscriptions SET {', '.join(sets)} WHERE id = ?", (*params, sub_id))
             c.commit()

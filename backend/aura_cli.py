@@ -326,6 +326,7 @@ MENU = """
 
 
 def main():
+    db.init_db()
     while True:
         print(MENU)
         choice = input("  请选择 > ").strip()

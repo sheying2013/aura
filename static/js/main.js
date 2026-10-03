@@ -70,7 +70,7 @@ const I18N_DICT = {
     "Avg Speed": "平均速率",
     "Peak Speed": "峰值速率",
     "Total Throughput": "当前总速率",
-    "Today Traffic": "今日消耗流量",
+    "Cumulative Traffic": "累计节点流量",
     "Node Status Matrix & Ratio": "节点在线矩阵",
     "ONLINE RATE": "在线率",
     "[ Realtime Ink Wave Chart Area ]": "📈 实时流量曲线",
@@ -387,11 +387,6 @@ function drawCanvas() {
         p.progress += p.speed;
         if (p.progress >= 1) {
             p.target.pulse = 1;
-            if (Math.random() > 0.8) {
-                const latency = Math.floor(10 + Math.random() * 120);
-                bgLogs.unshift(`[SYS] PROBE NODE_${Math.floor(p.target.x).toString(16).toUpperCase()} | STATUS: OK | LATENCY: ${latency}ms`);
-                if (bgLogs.length > 5) bgLogs.pop();
-            }
             packets.splice(i, 1);
             continue;
         }
@@ -474,27 +469,6 @@ class TextScramble {
     randomChar() { return this.chars[Math.floor(Math.random() * this.chars.length)]; }
 }
 
-function animateNumbers(container) {
-    if (!container) return;
-    const els = container.querySelectorAll('.count-up');
-    els.forEach(el => {
-        const target = parseFloat(el.getAttribute('data-val') || '0');
-        const isInt = el.getAttribute('data-int') === 'true';
-        const duration = 1500;
-        const start = performance.now();
-        const unit = isInt ? '' : ' <span>MB/s</span>';
-        function update(time) {
-            let progress = (time - start) / duration;
-            if (progress > 1) progress = 1;
-            let easeProgress = progress === 1 ? 1 : 1 - Math.pow(2, -10 * progress);
-            let current = easeProgress * target;
-            el.innerHTML = (isInt ? Math.floor(current) : current.toFixed(2)) + unit;
-            if (progress < 1) requestAnimationFrame(update);
-        }
-        requestAnimationFrame(update);
-    });
-}
-
 // Navigation Routing
 document.querySelectorAll('.nav-item').forEach(item => {
     item.addEventListener('click', () => {
@@ -512,7 +486,6 @@ document.querySelectorAll('.nav-item').forEach(item => {
             targetPage.style.animation = null;
             targetPage.classList.add('active');
 
-            animateNumbers(targetPage);
             targetPage.querySelectorAll('.scramble-text').forEach(el => {
                 new TextScramble(el).setText(el.getAttribute('data-text'));
             });
@@ -535,13 +508,16 @@ let authToken = localStorage.getItem(AUTH_TOKEN_KEY) || '';
 
 let nodeState = [];
 let selectedNodeIds = new Set();
+const pendingProbeIds = new Set(); // 独立于 loadNodes 替换的节点对象
+let bulkProbeRunning = false;
+let settingsDirty = false;
+let settingsRevision = 0;
 let subState = [];
 let relayState = [];
 let editingNodeId = null;
 let editingSubId = null;
 let sseSource = null;
 let peakSpeedMbps = 0;
-let uptimeSeconds = 0;
 let uptimeTimer = null;
 
 // Format Helpers
@@ -570,6 +546,11 @@ function escapeHtml(str) {
         .replace(/'/g, '&#39;');
 }
 
+// 内联事件同时跨 HTML 属性与 JavaScript 两种语境，不能只转义 HTML。
+function inlineJsArg(value) {
+    return escapeHtml(JSON.stringify(String(value)));
+}
+
 function formatRate(bps) {
     if (!bps || isNaN(bps) || bps <= 0) return '0.00 MB/s';
     const mbps = bps / (1024 * 1024);
@@ -596,6 +577,7 @@ function addLog(type, message) {
         item.style.color = type === 'ERROR' ? 'var(--danger)' : (type === 'SUCCESS' ? 'var(--success)' : 'var(--rock)');
         item.textContent = logLine;
         terminalEl.appendChild(item);
+        while (terminalEl.children.length > 200) terminalEl.firstElementChild.remove();
         terminalEl.scrollTop = terminalEl.scrollHeight;
     }
 }
@@ -631,40 +613,66 @@ function auraPrompt(message, defValue = '') {
     });
 }
 function _auraDialog(opts) {
+    const previousFocus = document.activeElement;
+    const dialogId = 'aura-dialog-' + (_auraDialog.sequence = (_auraDialog.sequence || 0) + 1);
     const ov = document.createElement('div');
     ov.className = 'modal-overlay';
     ov.innerHTML = `
-      <div class="modal-content" style="max-width: 430px;">
-        <div class="modal-title">${escapeHtml(opts.title)}</div>
-        <div style="font-size: 13px; line-height: 1.8; color: var(--fg); word-break: break-all;">${escapeHtml(opts.message)}</div>
-        ${opts.input !== null ? `<input type="text" class="form-input" id="aura-dialog-input" value="${escapeHtml(opts.input)}" style="width: 100%; margin-top: 18px; font-family: var(--font-mono);">` : ''}
+      <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="${dialogId}-title" aria-describedby="${dialogId}-message" tabindex="-1" style="max-width: 430px;">
+        <div class="modal-title" id="${dialogId}-title">${escapeHtml(opts.title)}</div>
+        <div id="${dialogId}-message" style="font-size: 13px; line-height: 1.8; color: var(--fg); word-break: break-all;">${escapeHtml(opts.message)}</div>
+        ${opts.input !== null ? `<input type="text" class="form-input" aria-label="${escapeHtml(opts.message)}" value="${escapeHtml(opts.input)}" style="width: 100%; margin-top: 18px; font-family: var(--font-mono);">` : ''}
         <div class="modal-actions">
           <button class="btn" data-act="cancel">${escapeHtml(opts.cancelText)}</button>
           <button class="btn btn-primary" data-act="ok">${escapeHtml(opts.okText)}</button>
         </div>
       </div>`;
     document.body.appendChild(ov);
-    requestAnimationFrame(() => ov.classList.add('active'));
+    const inp = ov.querySelector('input');
+    const cancelValue = opts.input !== null ? null : false;
+    let settled = false;
     const done = val => {
+        if (settled) return;
+        settled = true;
         ov.classList.remove('active');
+        ov.setAttribute('aria-hidden', 'true');
+        if (previousFocus && previousFocus.isConnected) previousFocus.focus();
         setTimeout(() => ov.remove(), 300);
         opts.resolve(val);
     };
+    const accept = () => done(opts.input !== null ? inp.value : true);
     ov.addEventListener('click', e => {
-        if (e.target === ov) { done(opts.input !== null ? null : false); return; }
-        const act = e.target.getAttribute && e.target.getAttribute('data-act');
-        if (act === 'ok') {
-            const inp = ov.querySelector('#aura-dialog-input');
-            done(opts.input !== null ? (inp ? inp.value : null) : true);
-        } else if (act === 'cancel') {
-            done(opts.input !== null ? null : false);
+        if (e.target === ov) { done(cancelValue); return; }
+        const button = e.target.closest('button[data-act]');
+        if (!button) return;
+        if (button.dataset.act === 'ok') accept();
+        else done(cancelValue);
+    });
+    ov.addEventListener('keydown', e => {
+        if (settled) return;
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            done(cancelValue);
+        } else if (e.key === 'Enter' && !e.isComposing) {
+            e.preventDefault();
+            if (e.target.dataset.act === 'cancel') done(cancelValue);
+            else accept();
+        } else if (e.key === 'Tab') {
+            const controls = Array.from(ov.querySelectorAll('input, button:not(:disabled)'));
+            const first = controls[0], last = controls[controls.length - 1];
+            if (e.shiftKey && (document.activeElement === first || !controls.includes(document.activeElement))) {
+                e.preventDefault(); last.focus();
+            } else if (!e.shiftKey && (document.activeElement === last || !controls.includes(document.activeElement))) {
+                e.preventDefault(); first.focus();
+            }
         }
     });
-    const inp = ov.querySelector('#aura-dialog-input');
-    if (inp) {
-        inp.focus(); inp.select();
-        inp.addEventListener('keydown', e => { if (e.key === 'Enter') done(inp.value); });
-    }
+    requestAnimationFrame(() => {
+        if (settled) return;
+        ov.classList.add('active');
+        (inp || ov.querySelector('[data-act="ok"]')).focus();
+        if (inp) inp.select();
+    });
 }
 
 // Unified API Wrapper with Bearer Token & 401 Redirect Handler
@@ -673,38 +681,39 @@ async function api(path, options = {}) {
     if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
     if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
 
-    try {
-        const resp = await fetch(path, Object.assign({}, options, { headers }));
-        if (resp.status === 401) {
-            authToken = '';
-            localStorage.removeItem(AUTH_TOKEN_KEY);
-            showLoginScreen(true);
-            throw new Error('401 Authorization Expired');
-        }
-        return resp;
-    } catch (err) {
-        if (err.message.includes('401')) {
-            authToken = '';
-            localStorage.removeItem(AUTH_TOKEN_KEY);
-            showLoginScreen(true);
-        }
-        throw err;
+    const resp = await fetch(path, Object.assign({}, options, { headers }));
+    if (resp.status === 401) {
+        authToken = '';
+        localStorage.removeItem(AUTH_TOKEN_KEY);
+        showLoginScreen(true);
+        throw new Error('401 Authorization Expired');
     }
+    if (!resp.ok) {
+        const body = await resp.clone().json().catch(() => ({}));
+        const detail = body.detail || body.message;
+        throw new Error(detail ? (typeof detail === 'string' ? detail : JSON.stringify(detail)) : `请求失败 (HTTP ${resp.status})`);
+    }
+    return resp;
 }
 
 /** 操作后端数据后重建 sing-box 配置（节点增删改/导入/停用等必须生效） */
 async function applyConfigSilent() {
     try {
         const r = await api('/api/config/apply', { method: 'POST', body: '{}' });
-        if (!r.ok) addLog('WARN', `配置重建失败 (HTTP ${r.status})`);
+        const result = await r.json();
+        if (result.ok !== true) throw new Error(result.message || '后端未确认配置生效');
+        return true;
     } catch (e) {
         addLog('WARN', '配置重建失败: ' + e.message);
+        return false;
     }
 }
 
 function showLoginScreen(show) {
     const loginScreen = document.getElementById('login-screen');
     if (show) {
+        if (uptimeTimer) { clearInterval(uptimeTimer); uptimeTimer = null; }
+        if (sseSource) { sseSource.close(); sseSource = null; }
         document.body.classList.add('locked');
         if (loginScreen) loginScreen.classList.remove('hidden');
     } else {
@@ -723,6 +732,7 @@ async function checkAuth() {
                 showLoginScreen(false);
                 const pwdOverlay = document.getElementById('pwd-modal');
                 if (pwdOverlay) pwdOverlay.classList.add('active');
+                return true; // 初次改密门禁：不提前加载受保护数据或连接 SSE
             } else {
                 showLoginScreen(false);
                 const pwdOverlay = document.getElementById('pwd-modal');
@@ -847,10 +857,6 @@ async function doChangePassword(isFirst) {
             body: JSON.stringify({ oldPassword: oldPwd, newPassword: newPwd })
         });
         const data = await r.json();
-        if (!r.ok) {
-            if (errEl) errEl.textContent = data.detail || '修改密码失败';
-            return;
-        }
         if (data.token) {
             authToken = data.token;
             localStorage.setItem(AUTH_TOKEN_KEY, authToken);
@@ -875,13 +881,23 @@ async function doChangePassword(isFirst) {
     }
 }
 
+async function loadEngineStatus() {
+    if (!authToken) return;
+    const uptimeEl = document.getElementById('sys-uptime');
+    try {
+        const r = await api('/api/config/status');
+        const data = await r.json();
+        if (uptimeEl) uptimeEl.textContent = data.running && Number.isFinite(data.uptime)
+            ? formatUptime(Math.max(0, Math.floor(data.uptime))) : '--:--:--';
+    } catch (e) {
+        if (uptimeEl) uptimeEl.textContent = '--:--:--';
+    }
+}
+
 function startUptimeTimer() {
     if (uptimeTimer) clearInterval(uptimeTimer);
-    uptimeTimer = setInterval(() => {
-        uptimeSeconds++;
-        const uptimeEl = document.getElementById('sys-uptime');
-        if (uptimeEl) uptimeEl.textContent = formatUptime(uptimeSeconds);
-    }, 1000);
+    loadEngineStatus();
+    uptimeTimer = setInterval(loadEngineStatus, 10000);
 }
 
 // Data Loaders
@@ -983,6 +999,7 @@ function renderQuickStats() {
     setVal('qs-online-count', onlineNodes);
     setVal('qs-avg-ping', avgPing > 0 ? `${avgPing} ms` : '-- ms');
     setVal('qs-total-traffic', formatBytes(totalTraffic));
+    setVal('card-traffic-total', formatBytes(totalTraffic));
 
     // 分组统计：按真实分组名聚合（非质量分类），所有分组各显示一个 pill
     const groupEl = document.getElementById('qs-group-stats');
@@ -1052,9 +1069,12 @@ function getFilteredNodes() {
 
     return nodeState.filter(node => {
         // 停用节点独立视图：__DISABLED__ 只看停用；普通列表排除 disabled
-        if (selectedGroup === '__DISABLED__') return node.status === 'disabled';
-        if (node.status === 'disabled') return false;
-        if (selectedGroup !== 'ALL' && node.group !== selectedGroup) return false;
+        if (selectedGroup === '__DISABLED__') {
+            if (node.status !== 'disabled') return false;
+        } else {
+            if (node.status === 'disabled') return false;
+            if (selectedGroup !== 'ALL' && node.group !== selectedGroup) return false;
+        }
         if (keyword) {
             const nameMatch = (node.name || '').toLowerCase().includes(keyword);
             const ipMatch = (node.exitIp || '').toLowerCase().includes(keyword);
@@ -1130,6 +1150,8 @@ function renderNodesTable() {
     const nodes = getFilteredNodes();
     if (nodes.length === 0) {
         tbody.innerHTML = `<tr><td colspan="11" style="text-align: center; color: var(--rock); padding: 24px;">暂无节点数据</td></tr>`;
+        syncNodeSelection();
+        syncProbeButtons();
         return;
     }
 
@@ -1142,9 +1164,9 @@ function renderNodesTable() {
         const tr = document.createElement('tr');
         tr.setAttribute('data-id', node.id);
         tr.innerHTML = `
-            <td><input type="checkbox" class="chk-node" data-id="${esc(node.id)}" ${isSelected ? 'checked' : ''} onchange="toggleSelectNode('${esc(node.id)}')"></td>
+            <td><input type="checkbox" class="chk-node" data-id="${esc(node.id)}" ${isSelected ? 'checked' : ''} onchange="toggleSelectNode(${inlineJsArg(node.id)})"></td>
             <td data-cell="status"><span class="status-indicator ${esc(node.status) || 'offline'}" title="${esc(statusTitle)}"></span></td>
-            <td style="font-family: var(--font-mono);"><input type="number" class="port-input" value="${esc(node.port)}" onchange="updateNodePort('${esc(node.id)}', this.value)" style="width:72px; background:transparent; border:1px solid var(--dim); color:inherit; border-radius:4px; padding:2px 6px; font-family:var(--font-mono); font-size:11px;"></td>
+            <td style="font-family: var(--font-mono);"><input type="number" class="port-input" value="${esc(node.port)}" onchange="updateNodePort(${inlineJsArg(node.id)}, this.value)" style="width:72px; background:transparent; border:1px solid var(--dim); color:inherit; border-radius:4px; padding:2px 6px; font-family:var(--font-mono); font-size:11px;"></td>
             <td><span class="group-tag">${esc(node.group) || '默认分组'}</span></td>
             <td style="font-family: var(--font-mono);">${esc(node.protocol) || 'mixed'}</td>
             <td style="font-family: var(--font-mono);">${esc(node.entryProto) || 'mixed'}</td>
@@ -1152,36 +1174,26 @@ function renderNodesTable() {
             <td style="font-size:12px;" data-cell="exitip">${renderExitIp(node)}</td>
             <td data-cell="ping" style="font-family: var(--font-mono); color: ${node.ping > 0 ? (node.ping < 200 ? 'var(--success)' : 'var(--rock)') : 'var(--danger)'}">${node.ping > 0 ? node.ping + ' ms' : '--'}</td>
             <td data-cell="traffic" style="font-family: var(--font-mono);">${formatBytes(totalNodeTraffic)}</td>
-            <td data-cell="actions" style="text-align: center;">
-                <div style="display:flex; gap:3px; justify-content:center;">
-                    <button class="btn-action" onclick="pingSingleNode('${esc(node.id)}', this)" ${node.__pinging ? 'disabled' : ''}>${node.__pinging ? '测活中…' : L('PING')}</button>
-                    <button class="btn-action" onclick="openEditNodeModal('${esc(node.id)}')">${L('EDIT')}</button>
-                    <button class="btn-action" onclick="exportSingleNode('${esc(node.id)}')">${L('EXPORT')}</button>
-                    <button class="btn-action ${node.status === 'online' ? 'danger' : ''}" onclick="toggleNodeEnable('${esc(node.id)}')">${node.status === 'online' ? L('DISABLE') : L('ENABLE')}</button>
-                    <button class="btn-action danger" onclick="deleteSingleNode('${esc(node.id)}')">${L('DROP')}</button>
-                </div>
-            </td>
+            <td data-cell="actions" style="text-align: center;">${_nodeActionsHtml(node)}</td>
         `;
         tbody.appendChild(tr);
     });
 
-    const chkAll = document.getElementById('chk-all');
-    if (chkAll) {
-        chkAll.checked = nodes.length > 0 && nodes.every(n => selectedNodeIds.has(n.id));
-    }
+    syncNodeSelection();
+    syncProbeButtons();
 }
 
 /** 节点行操作按钮列 HTML（renderNodesTable / syncNodesTable 共用，状态切换时局部重建） */
 function _nodeActionsHtml(node) {
     const esc = escapeHtml;
-    const pinging = !!node.__pinging;
+    const pinging = bulkProbeRunning || pendingProbeIds.has(node.id);
     return `
         <div style="display:flex; gap:3px; justify-content:center;">
-            <button class="btn-action" onclick="pingSingleNode('${esc(node.id)}', this)" ${pinging ? 'disabled' : ''}>${pinging ? '测活中…' : L('PING')}</button>
-            <button class="btn-action" onclick="openEditNodeModal('${esc(node.id)}')">${L('EDIT')}</button>
-            <button class="btn-action" onclick="exportSingleNode('${esc(node.id)}')">${L('EXPORT')}</button>
-            <button class="btn-action ${node.status === 'online' ? 'danger' : ''}" onclick="toggleNodeEnable('${esc(node.id)}')">${node.status === 'online' ? L('DISABLE') : L('ENABLE')}</button>
-            <button class="btn-action danger" onclick="deleteSingleNode('${esc(node.id)}')">${L('DROP')}</button>
+            <button class="btn-action" onclick="pingSingleNode(${inlineJsArg(node.id)})" data-probe-id="${esc(node.id)}" ${pinging ? 'disabled' : ''}>${pinging ? '测活中…' : L('PING')}</button>
+            <button class="btn-action" onclick="openEditNodeModal(${inlineJsArg(node.id)})">${L('EDIT')}</button>
+            <button class="btn-action" onclick="exportSingleNode(${inlineJsArg(node.id)})">${L('EXPORT')}</button>
+            <button class="btn-action ${node.status !== 'disabled' ? 'danger' : ''}" onclick="toggleNodeEnable(${inlineJsArg(node.id)})">${node.status !== 'disabled' ? L('DISABLE') : L('ENABLE')}</button>
+            <button class="btn-action danger" onclick="deleteSingleNode(${inlineJsArg(node.id)})">${L('DROP')}</button>
         </div>`;
 }
 
@@ -1193,7 +1205,7 @@ function syncNodesTable() {
     const nodes = getFilteredNodes();
     const rows = Array.from(tbody.querySelectorAll('tr[data-id]'));
     if (nodes.length === 0 || rows.length !== nodes.length) { renderNodesTable(); return; }
-    const rowById = {};
+    const rowById = Object.create(null);
     rows.forEach(r => { rowById[r.getAttribute('data-id')] = r; });
     for (const n of nodes) {
         if (!rowById[n.id]) { renderNodesTable(); return; } // 行集合变化，整体重建
@@ -1230,8 +1242,8 @@ function syncNodesTable() {
             }
         }
     });
-    const chkAll = document.getElementById('chk-all');
-    if (chkAll) chkAll.checked = nodes.length > 0 && nodes.every(n => selectedNodeIds.has(n.id));
+    syncNodeSelection();
+    syncProbeButtons();
 }
 
 /** 行内端口编辑：PATCH 端口并重建配置；失败恢复原值 */
@@ -1239,15 +1251,10 @@ async function updateNodePort(id, val) {
     const port = parseInt(val, 10);
     if (!port || port < 1024 || port > 65535) { addLog('WARN', '端口无效（1024-65535）'); renderNodesTable(); return; }
     try {
-        const r = await api(`/api/nodes/${id}/port`, {
+        await api(`/api/nodes/${id}/port`, {
             method: 'PUT',
             body: JSON.stringify({ port: port })
         });
-        if (!r.ok) {
-            addLog('WARN', `端口更新失败 (HTTP ${r.status})`);
-            renderNodesTable();
-            return;
-        }
         addLog('INFO', `节点端口已改为 ${port}`);
         await applyConfigSilent();
         await loadNodes();
@@ -1282,6 +1289,19 @@ async function exportSingleNode(nodeId) {
 }
 
 // Checkbox and Toolbar Handlers
+function syncNodeSelection() {
+    document.querySelectorAll('#nodes-tbody .chk-node').forEach(chk => {
+        chk.checked = selectedNodeIds.has(chk.dataset.id);
+    });
+    const nodes = getFilteredNodes();
+    const count = nodes.filter(n => selectedNodeIds.has(n.id)).length;
+    const master = document.getElementById('chk-all');
+    if (master) {
+        master.checked = nodes.length > 0 && count === nodes.length;
+        master.indeterminate = count > 0 && count < nodes.length;
+    }
+}
+
 function toggleSelectAll(master) {
     const nodes = getFilteredNodes();
     if (master.checked) {
@@ -1289,7 +1309,7 @@ function toggleSelectAll(master) {
     } else {
         nodes.forEach(n => selectedNodeIds.delete(n.id));
     }
-    renderNodesTable();
+    syncNodeSelection();
 }
 
 function toggleSelectNode(id) {
@@ -1298,7 +1318,7 @@ function toggleSelectNode(id) {
     } else {
         selectedNodeIds.add(id);
     }
-    renderNodesTable();
+    syncNodeSelection();
 }
 
 const filterGroupEl = document.getElementById('filter-group');
@@ -1307,50 +1327,72 @@ const searchKeywordEl = document.getElementById('search-keyword');
 if (searchKeywordEl) searchKeywordEl.addEventListener('input', renderNodesTable);
 
 // Ping / Probe Handlers
-async function triggerPingAll(btn) {
-    if (window.__pingAllRunning) return;  // 防重复点击堆叠多轮全量探活
-    window.__pingAllRunning = true;
-    if (btn) { btn.disabled = true; btn.textContent = '批量探活中…'; }
+function syncProbeButtons() {
+    document.querySelectorAll('[data-probe-id]').forEach(btn => {
+        const busy = bulkProbeRunning || pendingProbeIds.has(btn.dataset.probeId);
+        btn.disabled = busy;
+        btn.textContent = busy ? '测活中…' : L('PING');
+    });
+    document.querySelectorAll('[data-probe-all]').forEach(btn => {
+        btn.disabled = bulkProbeRunning || pendingProbeIds.size > 0;
+        btn.textContent = bulkProbeRunning ? '批量探活中…' : L('Probe All');
+    });
+}
+
+function reportProbeResults(results) {
+    if (!Array.isArray(results)) throw new Error('探活响应格式错误');
+    if (results.length === 0) {
+        addLog('WARN', '探活未返回结果，后台可能正在测活，请稍后重试');
+        showToast('后台测活繁忙或无可测节点，请稍后重试', 'warn');
+        return;
+    }
+    results.forEach(res => {
+        if (res.error) {
+            addLog('WARN', `节点 ${res.id || ''}: ${res.error}`);
+            showToast(res.error, 'warn');
+        }
+    });
+    addLog('INFO', `探活完成，返回 ${results.length} 个结果（在线 ${results.filter(r => r.status === 'online').length} 个）`);
+}
+
+async function triggerPingAll() {
+    if (bulkProbeRunning || pendingProbeIds.size > 0) return;
+    bulkProbeRunning = true;
+    syncProbeButtons();
     addLog('INFO', '开始批量探活所有节点...');
     try {
         const r = await api('/api/nodes/ping', {
             method: 'POST',
-            body: JSON.stringify({ all: true, includeDisabled: true })
+            body: JSON.stringify({ all: true, includeDisabled: true, manual: true })
         });
-        const results = await r.json();
-        addLog('SUCCESS', `探活完成，共测试 ${results.length} 个节点`);
+        reportProbeResults(await r.json());
         await loadNodes();
     } catch (e) {
         addLog('ERROR', '探活失败: ' + e.message);
     } finally {
-        window.__pingAllRunning = false;
-        // loadNodes 已重建表格时按钮已随 DOM 替换；仍在 DOM 才还原（失败路径）
-        if (btn && document.body.contains(btn)) { btn.disabled = false; btn.textContent = '批量探活'; }
+        bulkProbeRunning = false;
+        syncProbeButtons(); // 恢复 loadNodes / SSE 重建后的当前按钮，不依赖旧 DOM 引用
     }
 }
 
-async function pingSingleNode(id, btn) {
+async function pingSingleNode(id) {
+    if (bulkProbeRunning || pendingProbeIds.has(id)) return;
+    pendingProbeIds.add(id);
+    syncProbeButtons();
     const node = nodeState.find(n => n.id === id);
-    if (node) node.__pinging = true;  // SSE 增量刷新期间按钮保持"测活中…"态
-    if (btn) { btn.disabled = true; btn.textContent = '测活中…'; }
     addLog('INFO', `正在探活节点 [${node ? node.name : id}]...`);
     try {
         const r = await api('/api/nodes/ping', {
             method: 'POST',
-            body: JSON.stringify({ ids: [id], all: false, includeDisabled: true })
+            body: JSON.stringify({ ids: [id], all: false, includeDisabled: true, manual: true })
         });
-        const results = await r.json();
-        if (results && results.length > 0) {
-            const res = results[0];
-            addLog(res.status === 'online' ? 'SUCCESS' : 'WARN',
-                   `节点探活结果: ${res.status}${res.status === 'online' ? ` (${res.ping}ms)` : ''}`);
-        }
+        reportProbeResults(await r.json());
         await loadNodes();
     } catch (e) {
         addLog('ERROR', '节点探活失败: ' + e.message);
     } finally {
-        if (node) node.__pinging = false;
-        if (btn && document.body.contains(btn)) { btn.disabled = false; btn.textContent = L('PING'); }
+        pendingProbeIds.delete(id);
+        syncProbeButtons();
     }
 }
 
@@ -1467,11 +1509,6 @@ async function handleBatchGroup() {
             body: JSON.stringify({ ids, group })
         });
         const data = await r.json().catch(() => ({}));
-        if (!r.ok) {
-            const errEl = document.getElementById('batch-group-error');
-            if (errEl) errEl.textContent = (data && data.detail) || `请求失败 (HTTP ${r.status})`;
-            return;
-        }
         const updated = (data && data.updated) || 0;
         addLog('SUCCESS', `已将 ${updated} 个节点分组改为 [${group}]`);
         // 分组是节点属性：本地重载节点（分组影响 relay 轮询池，后端已重建配置）
@@ -1503,23 +1540,17 @@ async function handleSaveNodeEdit() {
     const ssPass = document.getElementById('edit-node-sspass').value.trim();
 
     try {
-        const r = await api(`/api/nodes/${editingNodeId}`, {
+        await api(`/api/nodes/${editingNodeId}`, {
             method: 'PATCH',
             body: JSON.stringify({
                 name, group, port, authUser, authPass, entryProto,
                 ...(ssPass ? { ssPass } : {})
             })
         });
-        if (!r.ok) {
-            const err = await r.json();
-            const errEl = document.getElementById('edit-node-error');
-            if (errEl) errEl.textContent = err.detail || '保存失败';
-            return;
-        }
         closeModal('edit-modal');
         addLog('SUCCESS', `修改节点 [${name}] 成功`);
         await loadNodes();
-    await applyConfigSilent();
+        await applyConfigSilent();
     } catch (e) {
         const errEl = document.getElementById('edit-node-error');
         if (errEl) errEl.textContent = e.message;
@@ -1531,55 +1562,62 @@ async function toggleNodeEnable(id) {
     if (!node) return;
     // 停用写 disabled（后端从配置/轮询池剔除的真实语义），offline 只是探活结果态。
     // disabledAuto=false 标记手动停用：自动复活循环只捞探活自动停用的节点，不打扰手动停用
-    const isOnline = node.status === 'online';
-    const newStatus = isOnline ? 'disabled' : 'online';
+    const enabling = node.status === 'disabled';
+    const newStatus = enabling ? 'offline' : 'disabled';
     try {
         await api(`/api/nodes/${id}`, {
             method: 'PATCH',
-            body: JSON.stringify({ status: newStatus, disabledAuto: false })
+            body: JSON.stringify({ status: newStatus, disabledAuto: false, ...(enabling ? { consecutiveFails: 0 } : {}) })
         });
         addLog('INFO', `切换节点状态: ${node.name} -> ${newStatus}`);
         await loadNodes();
-    await applyConfigSilent();
+        await applyConfigSilent();
     } catch (e) {
         addLog('ERROR', '更新节点状态失败: ' + e.message);
     }
 }
 
+let batchStatusRunning = false;
+async function setNodesEnabled(ids, enabled) {
+    if (batchStatusRunning || ids.length === 0) return;
+    batchStatusRunning = true;
+    let succeeded = 0, failed = 0;
+    try {
+        for (const id of ids) {
+            try {
+                await api(`/api/nodes/${id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ status: enabled ? 'offline' : 'disabled', disabledAuto: false,
+                        ...(enabled ? { consecutiveFails: 0 } : {}) })
+                });
+                succeeded++;
+            } catch (e) {
+                failed++;
+                addLog('ERROR', `节点 ${id} ${enabled ? '启用' : '停用'}失败: ${e.message}`);
+            }
+        }
+        addLog(failed ? 'WARN' : 'SUCCESS', `${enabled ? '启用' : '停用'}完成：成功 ${succeeded} 个，失败 ${failed} 个`);
+        if (succeeded > 0) await applyConfigSilent();
+        await loadNodes();
+    } finally {
+        batchStatusRunning = false;
+    }
+}
+
 async function enableSelectedNodes() {
     if (selectedNodeIds.size === 0) { showToast('请先勾选要启用的节点', 'warn'); return; }
-    for (const id of selectedNodeIds) {
-        try {
-            await api(`/api/nodes/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'online', disabledAuto: false }) });
-        } catch (e) { }
-    }
-    addLog('SUCCESS', `已启用选中的 ${selectedNodeIds.size} 个节点`);
-    await loadNodes();
-    await applyConfigSilent();
+    await setNodesEnabled(Array.from(selectedNodeIds), true);
 }
 
 async function enableAllDisabledNodes() {
-    const offlineNodes = nodeState.filter(n => n.status !== 'online');
-    for (const n of offlineNodes) {
-        try {
-            await api(`/api/nodes/${n.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'online', disabledAuto: false }) });
-        } catch (e) { }
-    }
-    addLog('SUCCESS', `已启用所有离线节点 (${offlineNodes.length} 个)`);
-    await loadNodes();
-    await applyConfigSilent();
+    const ids = nodeState.filter(n => n.status === 'disabled').map(n => n.id);
+    if (!ids.length) { showToast('没有待启用的停用节点'); return; }
+    await setNodesEnabled(ids, true);
 }
 
 async function disableSelectedNodes() {
     if (selectedNodeIds.size === 0) { showToast('请先勾选要停用的节点', 'warn'); return; }
-    for (const id of selectedNodeIds) {
-        try {
-            await api(`/api/nodes/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'disabled', disabledAuto: false }) });
-        } catch (e) { }
-    }
-    addLog('SUCCESS', `已停用选中的 ${selectedNodeIds.size} 个节点`);
-    await loadNodes();
-    await applyConfigSilent();
+    await setNodesEnabled(Array.from(selectedNodeIds), false);
 }
 
 async function deleteSingleNode(id) {
@@ -1589,7 +1627,7 @@ async function deleteSingleNode(id) {
         selectedNodeIds.delete(id);
         addLog('SUCCESS', '节点删除成功');
         await loadNodes();
-    await applyConfigSilent();
+        await applyConfigSilent();
     } catch (e) {
         addLog('ERROR', '删除节点失败: ' + e.message);
     }
@@ -1610,7 +1648,7 @@ async function deleteSelectedNodes() {
         selectedNodeIds.clear();
         addLog('SUCCESS', `批量删除 ${idsArray.length} 个节点成功`);
         await loadNodes();
-    await applyConfigSilent();
+        await applyConfigSilent();
     } catch (e) {
         addLog('ERROR', '批量删除节点失败: ' + e.message);
     }
@@ -1622,18 +1660,12 @@ async function renameGroup() {
     const newName = await auraPrompt(`将分组 [${oldName}] 重命名为:`);
     if (!newName) return;
     try {
-        const r = await api('/api/groups/rename', {
+        await api('/api/groups/rename', {
             method: 'POST',
             body: JSON.stringify({ oldName, newName })
         });
-        if (!r.ok) {
-            const data = await r.json();
-            showToast(data.detail || '重命名失败', 'error');
-            return;
-        }
         addLog('SUCCESS', `分组重命名成功: ${oldName} -> ${newName}`);
         await loadNodes();
-    await applyConfigSilent();
     } catch (e) {
         showToast('分组重命名出错: ' + e.message, 'error');
     }
@@ -1654,11 +1686,10 @@ async function reassignAllPorts() {
         while (usedPorts.has(port) || port < 1024) port++;
         usedPorts.add(port);
         try {
-            const r = await api(`/api/nodes/${n.id}/port`, {
+            await api(`/api/nodes/${n.id}/port`, {
                 method: 'PUT',
                 body: JSON.stringify({ port: port })
             });
-            if (!r.ok) failed++;
         } catch (e) { failed++; }
     }
     addLog(failed ? 'WARN' : 'SUCCESS', failed ? `端口编排完成，${failed} 个节点失败` : '端口编排完成');
@@ -1727,12 +1758,7 @@ async function copyExportText() {
     if (!exportArea || !exportArea.value) {
         generateExportText();
     }
-    if (exportArea && exportArea.value) {
-        const text = exportArea.value;
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).then(() => addLog('SUCCESS', '导出链接已复制')).catch(() => fallbackCopy(text));
-        } else fallbackCopy(text);
-    }
+    if (exportArea && exportArea.value) return copyToClipboard(exportArea.value);
 }
 
 async function exportSelectedNodes() {
@@ -1886,13 +1912,6 @@ async function handleBatchImport() {
             method: 'POST',
             body: JSON.stringify({ nodes: preparedNodes })
         });
-        if (!r.ok) {
-            let detail = '';
-            try { detail = (await r.json()).detail || ''; } catch (e) { }
-            hideImporting();
-            showToast(`导入失败 (HTTP ${r.status}): ${detail}`, 'error', 5000);
-            return;
-        }
         const res = await r.json();
         closeModal('import-modal');
         let msg = `成功批量导入 ${res.created || 0} 个节点`;
@@ -1901,7 +1920,7 @@ async function handleBatchImport() {
         if (res.failed) msg += `，失败 ${res.failed} 个（无法解析）`;
         addLog('SUCCESS', msg);
         await loadNodes();
-    await applyConfigSilent();
+        await applyConfigSilent();
         // 明确结果弹层（failed 独立计数；skipped 中减去 duplicate 即为端口冲突/已删指纹类跳过）
         showImportResult({ created: res.created || 0, duplicate: res.duplicate || 0, failed: res.failed || 0, skipped: (res.skipped || 0) - (res.duplicate || 0) });
     } catch (e) {
@@ -1926,15 +1945,9 @@ async function handleConvertEntry() {
             })
         });
         const data = await r.json();
-        if (!r.ok) {
-            const errEl = document.getElementById('convert-error');
-            if (errEl) errEl.textContent = data.detail || '转换失败';
-            return;
-        }
         closeModal('convert-entry-modal');
         addLog('SUCCESS', `已批量转换 ${data.converted} 个节点入口协议为 ${direction}`);
         await loadNodes();
-    await applyConfigSilent();
     } catch (e) {
         const errEl = document.getElementById('convert-error');
         if (errEl) errEl.textContent = e.message;
@@ -2031,55 +2044,39 @@ function updateTrafficChart(upRate, downRate) {
 function renderTrafficChart() {
     const container = document.getElementById('traffic-chart-container');
     if (!container) return;
-    container.innerHTML = '';
-
     const filterSelect = document.getElementById('traffic-filter');
     const selectedGroup = filterSelect ? filterSelect.value : 'ALL';
-
-    const targetNodes = selectedGroup === 'ALL'
-        ? nodeState
-        : nodeState.filter(n => n.group === selectedGroup);
-
+    const targetNodes = selectedGroup === 'ALL' ? nodeState : nodeState.filter(n => n.group === selectedGroup);
     if (targetNodes.length === 0) {
         container.innerHTML = `<div style="color: var(--rock); font-size: 11px; text-align: center; padding: 20px;">暂无节点流量数据</div>`;
         return;
     }
-
-    let maxTotal = 0;
-    targetNodes.forEach(node => {
-        const upMB = (node.upTraffic || 0) / (1024 * 1024);
-        const downMB = (node.downTraffic || 0) / (1024 * 1024);
-        if (upMB + downMB > maxTotal) maxTotal = upMB + downMB;
-    });
-    if (maxTotal === 0) maxTotal = 1;
-
-    targetNodes.forEach((node, idx) => {
-        const upMB = (node.upTraffic || 0) / (1024 * 1024);
-        const downMB = (node.downTraffic || 0) / (1024 * 1024);
-        const upPct = Math.min(100, (upMB / maxTotal) * 100);
-        const downPct = Math.min(100, (downMB / maxTotal) * 100);
-
-        const row = document.createElement('div');
-        row.className = 'traffic-bar-row';
-        row.innerHTML = `
-            <div class="tb-label">${escapeHtml(node.name || 'Port ' + node.port)}</div>
-            <div class="tb-track">
-                <div class="tb-fill-up" style="width: 0%; z-index: 2;" data-target="${upPct}"></div>
-                <div class="tb-fill-down" style="width: 0%; z-index: 1;" data-target="${upPct + downPct}"></div>
-            </div>
-            <div class="tb-value">
-                <span style="color: var(--rock)">↑ ${upMB.toFixed(2)} MB</span>
-                <span style="color: var(--success)">↓ ${downMB.toFixed(2)} MB</span>
-            </div>
-        `;
-        container.appendChild(row);
-
-        setTimeout(() => {
-            const upFill = row.querySelector('.tb-fill-up');
-            const downFill = row.querySelector('.tb-fill-down');
-            if (upFill) upFill.style.width = upFill.getAttribute('data-target') + '%';
-            if (downFill) downFill.style.width = downFill.getAttribute('data-target') + '%';
-        }, 80 + (idx * 60));
+    let rows = Array.from(container.querySelectorAll('.traffic-bar-row'));
+    if (rows.length !== targetNodes.length || rows.some((row, i) => row.dataset.id !== targetNodes[i].id)) {
+        container.innerHTML = targetNodes.map(node => `
+            <div class="traffic-bar-row" data-id="${escapeHtml(node.id)}">
+                <div class="tb-label"></div>
+                <div class="tb-track">
+                    <div class="tb-fill-up" style="width: 0%; z-index: 2;"></div>
+                    <div class="tb-fill-down" style="width: 0%; z-index: 1;"></div>
+                </div>
+                <div class="tb-value">
+                    <span style="color: var(--rock)"></span>
+                    <span style="color: var(--success)"></span>
+                </div>
+            </div>`).join('');
+        rows = Array.from(container.querySelectorAll('.traffic-bar-row'));
+    }
+    const maxTotal = targetNodes.reduce((max, n) => Math.max(max, (n.upTraffic || 0) + (n.downTraffic || 0)), 1);
+    targetNodes.forEach((node, i) => {
+        const row = rows[i];
+        const up = node.upTraffic || 0, down = node.downTraffic || 0;
+        row.querySelector('.tb-label').textContent = node.name || 'Port ' + node.port;
+        row.querySelector('.tb-fill-up').style.width = Math.min(100, up / maxTotal * 100) + '%';
+        row.querySelector('.tb-fill-down').style.width = Math.min(100, (up + down) / maxTotal * 100) + '%';
+        const values = row.querySelectorAll('.tb-value span');
+        values[0].textContent = `↑ ${(up / (1024 * 1024)).toFixed(2)} MB`;
+        values[1].textContent = `↓ ${(down / (1024 * 1024)).toFixed(2)} MB`;
     });
 }
 
@@ -2107,7 +2104,7 @@ function renderTrafficTable() {
             <td>${formatBytes(node.upTraffic || 0)}</td>
             <td>${formatBytes(node.downTraffic || 0)}</td>
             <td style="color: var(--rock); font-family: var(--font-mono);">${formatBytes(totalBytes)}</td>
-            <td><button class="btn-action danger" onclick="resetNodeTraffic('${escapeHtml(node.id)}')">${L('RESET')}</button></td>
+            <td><button class="btn-action danger" onclick="resetNodeTraffic(${inlineJsArg(node.id)})">${L('RESET')}</button></td>
         `;
         tbody.appendChild(tr);
     });
@@ -2118,7 +2115,6 @@ async function resetNodeTraffic(id) {
         await api(`/api/nodes/${id}/traffic/reset`, { method: 'POST' });
         addLog('INFO', `复位节点 [ID: ${id}] 流量统计`);
         await loadNodes();
-    await applyConfigSilent();
     } catch (e) {
         addLog('ERROR', '重置节点流量失败: ' + e.message);
     }
@@ -2130,7 +2126,6 @@ async function resetAllTraffic() {
         await api('/api/traffic/reset', { method: 'POST' });
         addLog('SUCCESS', '所有节点流量数据已清空');
         await loadNodes();
-    await applyConfigSilent();
     } catch (e) {
         addLog('ERROR', '重置全网流量失败: ' + e.message);
     }
@@ -2148,8 +2143,15 @@ function startTrafficSSE() {
             try {
                 const data = JSON.parse(e.data);
                 if (data.type === 'traffic') {
-                    const upRate = data.upRate || data.up || 0;
-                    const downRate = data.downRate || data.down || 0;
+                    const upRate = data.upRate ?? data.up ?? 0;
+                    const downRate = data.downRate ?? data.down ?? 0;
+                    const upEl = document.getElementById('dash-stat-up-rate');
+                    const downEl = document.getElementById('dash-stat-down-rate');
+                    const connectionsEl = document.getElementById('dash-stat-active-connections');
+                    if (upEl) upEl.textContent = formatRate(upRate);
+                    if (downEl) downEl.textContent = formatRate(downRate);
+                    if (connectionsEl) connectionsEl.textContent = Number.isFinite(data.activeConnections)
+                        ? String(Math.max(0, Math.floor(data.activeConnections))) : '--';
                     const totalSpeed = upRate + downRate;
                     if (totalSpeed > peakSpeedMbps) peakSpeedMbps = totalSpeed;
 
@@ -2171,8 +2173,9 @@ function startTrafficSSE() {
                     if (avgSpeedEl) avgSpeedEl.innerHTML = `${formatRate(avgSpeed)}`;
 
                     if (data.nodes && Array.isArray(data.nodes)) {
+                        const nodesById = new Map(nodeState.map(node => [node.id, node]));
                         data.nodes.forEach(ns => {
-                            const node = nodeState.find(n => n.id === ns.id);
+                            const node = nodesById.get(ns.id);
                             if (node) {
                                 node.upTraffic = ns.upTraffic;
                                 node.downTraffic = ns.downTraffic;
@@ -2256,9 +2259,9 @@ function renderSubsList() {
                 <div style="font-size: 10px; opacity:0.6;">${escapeHtml(s.url)}</div>
             </div>
             <div style="display:flex; gap:6px;">
-                <button class="btn-action" onclick="openEditSubModal('${escapeHtml(s.id)}')">${L('EDIT')}</button>
-                <button class="btn-action" onclick="refreshSub('${escapeHtml(s.id)}')">${L('SYNC')}</button>
-                <button class="btn-action danger" onclick="deleteSub('${escapeHtml(s.id)}')">${L('DROP')}</button>
+                <button class="btn-action" onclick="openEditSubModal(${inlineJsArg(s.id)})">${L('EDIT')}</button>
+                <button class="btn-action" onclick="refreshSub(${inlineJsArg(s.id)})">${L('SYNC')}</button>
+                <button class="btn-action danger" onclick="deleteSub(${inlineJsArg(s.id)})">${L('DROP')}</button>
             </div>
         </div>
     `).join('');
@@ -2282,9 +2285,9 @@ function renderSubsList() {
                 <td>${badge}</td>
                 <td>
                     <div style="display:flex; gap:6px;">
-                        <button class="btn-action" onclick="openEditSubModal('${escapeHtml(s.id)}')">${L('EDIT')}</button>
-                        <button class="btn-action" onclick="refreshSub('${escapeHtml(s.id)}')">${L('SYNC')}</button>
-                        <button class="btn-action danger" onclick="deleteSub('${escapeHtml(s.id)}')">${L('DROP')}</button>
+                        <button class="btn-action" onclick="openEditSubModal(${inlineJsArg(s.id)})">${L('EDIT')}</button>
+                        <button class="btn-action" onclick="refreshSub(${inlineJsArg(s.id)})">${L('SYNC')}</button>
+                        <button class="btn-action danger" onclick="deleteSub(${inlineJsArg(s.id)})">${L('DROP')}</button>
                     </div>
                 </td>
             </tr>`;
@@ -2299,15 +2302,10 @@ async function addSubscriptionFromSubsPage() {
     const group = document.getElementById('subs-group').value.trim() || '订阅节点';
     if (!url) { showToast('请输入订阅链接', 'warn'); return; }
     try {
-        const r = await api('/api/subs', {
+        await api('/api/subs', {
             method: 'POST',
             body: JSON.stringify({ url, name: name || url, group })
         });
-        if (!r.ok) {
-            const err = await r.json();
-            showToast(err.detail || '添加订阅失败', 'error');
-            return;
-        }
         addLog('SUCCESS', `成功添加订阅 [${name || url}]`);
         document.getElementById('subs-url').value = '';
         document.getElementById('subs-name').value = '';
@@ -2317,16 +2315,15 @@ async function addSubscriptionFromSubsPage() {
     }
 }
 
-/** 每 6 小时自动刷新开关 → settings.autoRefresh（后端 scheduler 读该字段调度） */
+/** 每 3 小时自动刷新开关 → settings.autoRefresh（后端 scheduler 读该字段调度） */
 async function saveSubAutoRefresh() {
     const chk = document.getElementById('sub-auto-refresh');
     const autoRefresh = !!(chk && chk.checked);
     try {
         const r = await api('/api/settings');
         const s = await r.json();
-        const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, autoRefresh }) });
-        if (!save.ok) addLog('WARN', `保存自动刷新设置失败 (HTTP ${save.status})`);
-        else addLog('INFO', `订阅自动刷新已${autoRefresh ? '开启' : '关闭'}`);
+        await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, autoRefresh }) });
+        addLog('INFO', `订阅自动刷新已${autoRefresh ? '开启' : '关闭'}`);
     } catch (e) {
         addLog('ERROR', '保存自动刷新设置失败: ' + e.message);
     }
@@ -2340,15 +2337,10 @@ async function addSubscription() {
     if (!url) { showToast('请输入订阅 URL', 'warn'); return; }
 
     try {
-        const r = await api('/api/subs', {
+        await api('/api/subs', {
             method: 'POST',
             body: JSON.stringify({ url, name: name || url, group })
         });
-        if (!r.ok) {
-            const err = await r.json();
-            showToast(err.detail || '添加订阅失败', 'error');
-            return;
-        }
         addLog('SUCCESS', `成功添加订阅 [${name || url}]`);
         document.getElementById('sub-url').value = '';
         document.getElementById('sub-name').value = '';
@@ -2365,10 +2357,16 @@ async function refreshSub(id) {
             method: 'POST',
             body: JSON.stringify({ ids: [id], all: false })
         });
-        addLog('SUCCESS', '订阅刷新成功');
+        const data = await r.json();
+        const results = Array.isArray(data.results) ? data.results : [];
+        const failed = results.filter(result => !result.ok);
+        if (failed.length || !results.length) {
+            const message = failed.map(result => result.error || '订阅刷新失败').join('；') || '未返回刷新结果';
+            addLog('WARN', message);
+            showToast(message, 'warn');
+        } else addLog('SUCCESS', '订阅刷新成功');
         await loadSubs();
         await loadNodes();
-    await applyConfigSilent();
     } catch (e) {
         addLog('ERROR', '刷新订阅失败: ' + e.message);
     }
@@ -2406,14 +2404,10 @@ async function handleSaveSubEdit() {
     const group = document.getElementById('edit-sub-group').value.trim();
     const errEl = document.getElementById('edit-sub-error');
     try {
-        const r = await api(`/api/subs/${editingSubId}`, {
+        await api(`/api/subs/${editingSubId}`, {
             method: 'PATCH',
             body: JSON.stringify({ name, url, group })
         });
-        if (!r.ok) {
-            if (errEl) errEl.textContent = (await r.json()).detail || '保存失败';
-            return;
-        }
         closeModal('edit-sub-modal');
         editingSubId = null;
         addLog('SUCCESS', `订阅 [${name}] 已保存`);
@@ -2424,19 +2418,33 @@ async function handleSaveSubEdit() {
 }
 
 // System Settings & Config
+function markSettingsDirty(e) {
+    const id = e.target.id || '';
+    if (id.startsWith('setting-')) {
+        settingsDirty = true;
+        settingsRevision++;
+    }
+}
+document.addEventListener('input', markSettingsDirty);
+document.addEventListener('change', markSettingsDirty);
+
 async function loadSettings() {
     try {
         const r = await api('/api/settings');
-        if (!r.ok) return;
         const s = await r.json();
-        // 轮询域名列表 → relayState + 渲染；relayExits（当前出口）供仪表盘徽标显示。
-        // 有未保存编辑（relayDirty 非空）时不覆盖 relayState，避免周期刷新冲掉本地修改
-        if (relayDirty.size === 0) {
+        // 周期加载不得销毁编辑中的卡片（包括尚未触发有效字段更新的输入）。
+        const relayList = document.getElementById('relay-domain-list');
+        const relayFocused = relayList && relayList.contains(document.activeElement);
+        if (relayDirty.size === 0 && !relayFocused) {
             relayState = Array.isArray(s.relayDomains) ? s.relayDomains : [];
+            Object.keys(relayEditState).forEach(id => delete relayEditState[id]);
+            renderRelayDomains();
         }
         window.__relayExits = (s.relayExits && typeof s.relayExits === 'object') ? s.relayExits : {};
-        renderRelayDomains();
         renderDashRelayStatus();
+        const autoRefreshChk = document.getElementById('sub-auto-refresh');
+        if (autoRefreshChk && document.activeElement !== autoRefreshChk) autoRefreshChk.checked = s.autoRefresh !== false;
+        if (settingsDirty || (document.activeElement && document.activeElement.id.startsWith('setting-'))) return;
 
         const setVal = (id, val) => {
             const el = document.getElementById(id);
@@ -2459,12 +2467,11 @@ async function loadSettings() {
         setVal('setting-sticky-timeout', s.stickyTimeout || '5m');
         setChk('setting-random-rotate-enabled', s.randomRotateEnabled);
         setVal('setting-random-rotate-interval', s.randomRotateInterval || 30);
-        const autoRefreshChk = document.getElementById('sub-auto-refresh');
-        if (autoRefreshChk) autoRefreshChk.checked = s.autoRefresh !== false;
     } catch (e) { }
 }
 
 async function saveSystemSettings() {
+    const revision = settingsRevision;
     const getVal = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
     const getChk = (id) => { const el = document.getElementById(id); return el ? el.checked : false; };
 
@@ -2493,18 +2500,14 @@ async function saveSystemSettings() {
             method: 'PUT',
             body: JSON.stringify(payload)
         });
-        if (r.ok) {
-            const data = await r.json().catch(() => ({}));
-            if (data.configApplied === false) {
-                addLog('WARN', `系统设置已保存，但配置未生效：${data.configMessage || ''}`);
-                showToast(`设置已保存，但配置未生效：${data.configMessage || '请查看系统日志'}`, 'warn', 5000);
-            } else {
-                addLog('SUCCESS', '系统设置保存成功，配置热重载已生效');
-                showToast('系统设置已应用');
-            }
+        const data = await r.json().catch(() => ({}));
+        if (revision === settingsRevision) settingsDirty = false;
+        if (data.configApplied === false) {
+            addLog('WARN', `系统设置已保存，但配置未生效：${data.configMessage || ''}`);
+            showToast(`设置已保存，但配置未生效：${data.configMessage || '请查看系统日志'}`, 'warn', 5000);
         } else {
-            addLog('WARN', `保存系统设置失败 (HTTP ${r.status})`);
-            showToast(`保存系统设置失败 (HTTP ${r.status})`, 'error');
+            addLog('SUCCESS', '系统设置保存成功，配置热重载已生效');
+            showToast('系统设置已应用');
         }
     } catch (e) {
         addLog('ERROR', '保存系统设置失败: ' + e.message);
@@ -2527,10 +2530,7 @@ async function loadConfig() {
 function copyConfigJson() {
     const codeEl = document.getElementById('config-json-code');
     if (!codeEl || !codeEl.textContent) return;
-    const text = codeEl.textContent;
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(() => addLog('SUCCESS', '配置 JSON 已复制')).catch(() => fallbackCopy(text));
-    } else fallbackCopy(text);
+    return copyToClipboard(codeEl.textContent);
 }
 
 /** 下载 config.json */
@@ -2550,13 +2550,17 @@ function downloadConfigFile() {
 }
 
 function fallbackCopy(text) {
+    const previousFocus = document.activeElement;
     const ta = document.createElement('textarea');
     ta.value = text;
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0;';
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); addLog('SUCCESS', '已复制到剪贴板'); }
-    catch (e) { addLog('ERROR', '复制失败: ' + e.message); }
-    document.body.removeChild(ta);
+    try { return document.execCommand('copy') === true; }
+    finally {
+        ta.remove();
+        if (previousFocus && previousFocus.isConnected) previousFocus.focus();
+    }
 }
 
 async function addRelayDomain() {
@@ -2574,8 +2578,7 @@ async function addRelayDomain() {
             authPass: 'relaypass',
             groups: ['ALL']
         });
-        const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
-        if (!save.ok) { showToast('保存失败 (HTTP ' + save.status + ')', 'error'); return; }
+        await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         relayState = list;
         renderDashRelayStatus();
         addLog('SUCCESS', `已添加轮询域名，请在卡片上填写域名/端口/用户/密码`);
@@ -2586,7 +2589,7 @@ async function addRelayDomain() {
 }
 
 /** relay 卡片本地编辑缓冲：字段改动只记内存（不落库），点"保存并生效"才全量 PUT */
-const relayEditState = {};   // rd.id -> {domain, port, authUser, authPass, groups}
+const relayEditState = Object.create(null);   // rd.id -> {domain, port, authUser, authPass, groups}
 const relayDirty = new Set(); // 有未保存修改的 rd.id
 
 /** 渲染轮询域名卡片（本地编辑 + 保存按钮；保存时才 PUT /api/settings 并显示配置生效结果） */
@@ -2608,30 +2611,30 @@ function renderRelayDomains() {
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
                 <span class="relay-card-title" style="font-weight:600; font-size:15px;">域名 ${idx + 1}${dirty ? '<span class="relay-dirty-tag" style="color:#e0b84f; font-size:11px;"> (未保存)</span>' : ''}</span>
                 <div style="display:flex; gap:8px;">
-                    <button class="btn-action relay-save-btn ${dirty ? 'primary' : ''}" ${dirty ? '' : 'disabled style="opacity:.45; cursor:not-allowed;"'} onclick="saveRelayDomain(decodeURIComponent('${encodeURIComponent(rd.id)}'))">${dirty ? '保存并生效' : '已保存 ✓'}</button>
-                    <button class="btn-action danger" onclick="removeRelayDomain(decodeURIComponent('${encodeURIComponent(rd.id)}'))">删除</button>
+                    <button class="btn-action relay-save-btn ${dirty ? 'primary' : ''}" ${dirty ? '' : 'disabled style="opacity:.45; cursor:not-allowed;"'} onclick="saveRelayDomain(${inlineJsArg(rd.id)})">${dirty ? '保存并生效' : '已保存 ✓'}</button>
+                    <button class="btn-action danger" onclick="removeRelayDomain(${inlineJsArg(rd.id)})">删除</button>
                 </div>
             </div>
             <div style="display:grid; grid-template-columns: 1.5fr 0.7fr 0.7fr 0.7fr; gap:12px; margin-bottom:10px;">
                 <div><label class="form-label" style="font-size:12px;">域名 / IP</label>
-                    <input type="text" class="form-input" value="${escapeHtml(ed.domain || '')}" oninput="relayEditField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'domain',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(ed.domain || '')}" oninput="relayEditField(${inlineJsArg(rd.id)},'domain',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">端口</label>
-                    <input type="number" class="form-input" value="${escapeHtml(ed.port)}" oninput="relayEditField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'port',this.value)"></div>
+                    <input type="number" class="form-input" value="${escapeHtml(ed.port)}" oninput="relayEditField(${inlineJsArg(rd.id)},'port',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">用户</label>
-                    <input type="text" class="form-input" value="${escapeHtml(ed.authUser || '')}" oninput="relayEditField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'authUser',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(ed.authUser || '')}" oninput="relayEditField(${inlineJsArg(rd.id)},'authUser',this.value)"></div>
                 <div><label class="form-label" style="font-size:12px;">密码</label>
-                    <input type="text" class="form-input" value="${escapeHtml(ed.authPass || '')}" oninput="relayEditField(decodeURIComponent('${encodeURIComponent(rd.id)}'),'authPass',this.value)"></div>
+                    <input type="text" class="form-input" value="${escapeHtml(ed.authPass || '')}" oninput="relayEditField(${inlineJsArg(rd.id)},'authPass',this.value)"></div>
             </div>
             <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
                 <span style="font-size:12px; opacity:0.8;">轮询分组：</span>
                 ${allGroups.map(g => `
                     <label style="font-size:12px; cursor:pointer; display:flex; align-items:center; gap:4px;">
-                        <input type="checkbox" ${(ed.groups || []).includes(g) ? 'checked' : ''} onchange="relayEditGroup(decodeURIComponent('${encodeURIComponent(rd.id)}'),decodeURIComponent('${encodeURIComponent(g)}'),this.checked)"> ${escapeHtml(g)}
+                        <input type="checkbox" ${(ed.groups || []).includes(g) ? 'checked' : ''} onchange="relayEditGroup(${inlineJsArg(rd.id)},${inlineJsArg(g)},this.checked)"> ${escapeHtml(g)}
                     </label>`).join('')}
             </div>
             <div style="margin-top:10px; display:flex; align-items:center; gap:8px; font-family: var(--font-mono); font-size:11px; opacity:0.8;">
                 <span class="relay-uri-text" style="word-break:break-all;">${escapeHtml(uri)}</span>
-                <button class="btn-action" onclick="copyToClipboard(decodeURIComponent('${encodeURIComponent(uri)}'))">复制</button>
+                <button class="btn-action" onclick="copyToClipboard(this.previousElementSibling.textContent)">复制</button>
             </div>
         </div>`;
     }).join('');
@@ -2710,7 +2713,6 @@ async function saveRelayDomain(id) {
     if (clash) { showToast(`端口 ${port} 已被 [${clash.domain}] 占用，请先修改端口`, 'warn', 5000); return; }
     try {
         const r = await api('/api/settings');
-        if (!r.ok) { showToast('读取设置失败 (HTTP ' + r.status + ')', 'error'); return; }
         const s = await r.json();
         const list = Array.isArray(s.relayDomains) ? s.relayDomains : [];
         const rd2 = list.find(x => x.id === id);
@@ -2721,11 +2723,6 @@ async function saveRelayDomain(id) {
         rd2.authPass = ed.authPass || '';
         rd2.groups = (Array.isArray(ed.groups) && ed.groups.length) ? ed.groups : ['ALL'];
         const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
-        if (!save.ok) {
-            const d = await save.json().catch(() => ({}));
-            showToast('保存失败: ' + ((d && d.detail) || 'HTTP ' + save.status), 'error');
-            return;
-        }
         const data = await save.json().catch(() => ({}));
         relayState = list;
         delete relayEditState[id];
@@ -2745,10 +2742,22 @@ async function saveRelayDomain(id) {
 }
 
 /** 复制文本到剪贴板（通用） */
-function copyToClipboard(text) {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(() => addLog('SUCCESS', '已复制到剪贴板')).catch(() => fallbackCopy(text));
-    } else fallbackCopy(text);
+async function copyToClipboard(text) {
+    try {
+        let copied = false;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            try { await navigator.clipboard.writeText(text); copied = true; }
+            catch (e) { /* HTTP / 权限拒绝时尝试旧版复制通道 */ }
+        }
+        if (!copied) copied = fallbackCopy(text);
+        if (!copied) throw new Error('浏览器拒绝复制，请手动选择文本');
+        addLog('SUCCESS', '已复制到剪贴板');
+        return true;
+    } catch (e) {
+        addLog('ERROR', '复制失败: ' + e.message);
+        showToast('复制失败，请手动选择文本', 'warn');
+        return false;
+    }
 }
 
 async function removeRelayDomain(id) {
@@ -2757,8 +2766,7 @@ async function removeRelayDomain(id) {
         const r = await api('/api/settings');
         const s = await r.json();
         const list = (Array.isArray(s.relayDomains) ? s.relayDomains : []).filter(rd => rd.id !== id);
-        const save = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
-        if (!save.ok) { showToast('删除失败 (HTTP ' + save.status + ')', 'error'); return; }
+        await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ...s, relayDomains: list }) });
         addLog('SUCCESS', `已删除轮询域名 ${id}`);
         relayState = list;
         delete relayEditState[id];
@@ -2782,12 +2790,8 @@ function loadDemoNodes() {
     loadNodes();
 }
 
-async function clearAllData() {
-    if (!await auraConfirm('⚠️ 警告：确定重置所有节点流量数据？该操作不可逆！')) return;
-    try {
-        await resetAllTraffic();
-        addLog('SUCCESS', '所有节点流量已清空');
-    } catch (e) { }
+function clearAllData() {
+    return resetAllTraffic();
 }
 
 // Initial Page Lifecycle Hook

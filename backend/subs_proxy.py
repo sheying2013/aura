@@ -1,77 +1,23 @@
-"""订阅后端代理：httpx 拉取（解决前端 CORS）、内容解析（移植 subs.js）、last-good 快照、去重导入。
+"""订阅后端代理：安全拉取、服务端内容解析、last-good 快照、去重导入。
 
 解析格式：Base64 列表 / Clash YAML(proxies:) / JSON(outbounds|proxies|数组) / 明文链接
 协议：ss/vmess/vless/trojan/ssr/hysteria2/tuic
 """
 import base64
-import ipaddress
 import json
 import re
-import socket
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote, urlparse
-
-import httpx
+from urllib.parse import unquote
 
 import db
-
-_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-REFRESH_INTERVAL = 6 * 60 * 60 * 1000  # 6h
+from subscription_fetch import fetch_public_subscription
 
 
 # ---------- 拉取 ----------
 
-def _is_public_url(url: str) -> bool:
-    """SSRF 防护：仅允许公网 http/https。对域名也做 DNS 解析检查。"""
-    try:
-        p = urlparse(url)
-        if p.scheme not in ("http", "https"):
-            return False
-        host = p.hostname or ""
-        if host in ("localhost", "127.0.0.1", "::1"):
-            return False
-        # 字面 IP 直接检查
-        try:
-            ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False
-            return True
-        except ValueError:
-            pass  # 不是字面 IP，走域名解析
-        # 域名：DNS 解析后逐个 IP 检查
-        try:
-            for res in socket.getaddrinfo(host, None):
-                resolved_ip = ipaddress.ip_address(res[4][0])
-                if resolved_ip.is_private or resolved_ip.is_loopback or resolved_ip.is_link_local or resolved_ip.is_reserved:
-                    return False
-        except (socket.gaierror, OSError):
-            return False  # 解析失败视为不安全
-        return True
-    except Exception:
-        return False
-
-
 async def fetch_subscription(url: str) -> Dict[str, Any]:
-    if not _is_public_url(url):
-        return {"ok": False, "error": "仅允许公网 http/https 订阅 URL"}
-    try:
-        async with httpx.AsyncClient(follow_redirects=False, timeout=15.0) as client:
-            resp = await client.get(url, headers={"User-Agent": _UA})
-            # 手动处理重定向，逐次校验目标 URL 的安全性
-            for _ in range(5):
-                if 300 <= resp.status_code < 400:
-                    loc = resp.headers.get("location", "")
-                    if not loc or not _is_public_url(loc):
-                        return {"ok": False, "error": "重定向目标 URL 不安全（内网地址）"}
-                    resp = await client.get(loc, headers={"User-Agent": _UA})
-                else:
-                    break
-            if resp.status_code >= 400:
-                return {"ok": False, "status": resp.status_code, "error": f"HTTP {resp.status_code}"}
-            return {"ok": True, "status": resp.status_code, "content": resp.text}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return await fetch_public_subscription(url)
 
 
 # ---------- 基础工具 ----------
@@ -609,41 +555,56 @@ async def refresh_sub(sub: Dict[str, Any]) -> Dict[str, Any]:
                                 update_existing=True)
         # 订阅恢复正常：清除之前失败兜底标的 stale 警示（否则节点永久橙色"刷新失败"）
         db.unmark_nodes_stale_by_sub(sub_id)
+        current_sub = db.get_sub(sub_id) or sub
+        needs_apply = (imported["created"] > 0 or imported["updated"] > 0 or
+                       bool(current_sub.get("pendingApply")))
+        # 新增/上游变更先持久化 pending_apply；配置应用成功后才清除，防止失败后相同内容被跳过。
         _sub = db.update_sub(sub_id, {
             "last_refresh": int(time.time() * 1000),
             "node_count": len(nodes),
-            "last_error": None,
             "snapshot": json.dumps(nodes, ensure_ascii=False),
+            "pending_apply": 1 if needs_apply else 0,
         })
         if not _sub:
-            return {"id": sub_id, "ok": True, "count": len(nodes), "stale": False,
-                    "imported": imported, "warning": "订阅元数据更新失败（已删除）"}
-        # 有新增节点 → 重建 sing-box 配置使新节点立即生效（无新增则跳过热重载）
-        if imported["created"] > 0:
+            return {"id": sub_id, "ok": False, "count": len(nodes), "stale": False,
+                    "imported": imported["created"], "updated": imported["updated"],
+                    "error": "订阅元数据更新失败（已删除）"}
+        if needs_apply:
+            apply_error = None
             try:
                 import config_manager
-                await config_manager.apply_config()
-            except Exception:
-                pass
-        return {"id": sub["id"], "ok": True, "count": len(nodes), "stale": False,
-                "imported": imported["created"], "error": None}
+                applied = await config_manager.apply_config()
+                if not isinstance(applied, dict) or not applied.get("ok"):
+                    apply_error = (applied or {}).get("message", "配置应用失败") if isinstance(applied, dict) else "配置应用失败"
+            except Exception as exc:
+                apply_error = str(exc) or "配置应用异常"
+            if apply_error:
+                db.update_sub(sub_id, {"pending_apply": 1, "last_error": f"配置应用失败: {apply_error}"})
+                return {"id": sub_id, "ok": False, "count": len(nodes), "stale": False,
+                        "degraded": True, "imported": imported["created"],
+                        "updated": imported["updated"], "error": f"配置应用失败: {apply_error}"}
+            db.update_sub(sub_id, {"pending_apply": 0, "last_error": None})
+        else:
+            db.update_sub(sub_id, {"last_error": None})
+        return {"id": sub_id, "ok": True, "count": len(nodes), "stale": False,
+                "imported": imported["created"], "updated": imported["updated"], "error": None}
 
-    # 失败：last-good 兜底
-    snap = sub.get("snapshot")
+    # list_subs 不暴露快照；失败时补读持久化 last-good，避免批量/定时刷新丢失降级状态。
+    current_sub = db.get_sub(sub_id)
+    snap = current_sub.get("snapshot") if current_sub else None
     if snap:
         try:
             nodes = json.loads(snap)
-            if nodes:
-                imported = import_nodes(sub["id"], sub.get("group", "订阅节点"), sub.get("name", ""), nodes, stale=True)
-                # 兜底：已有节点也标 stale（快照是过期数据）
-                db.mark_nodes_stale_by_sub(sub["id"])
-                db.update_sub(sub["id"], {"last_error": res.get("error")})
-                return {"id": sub["id"], "ok": False, "count": len(nodes), "stale": True,
-                        "imported": imported["created"], "error": res.get("error")}
-        except Exception:
+            if isinstance(nodes, list) and nodes:
+                # 已有节点继续使用 last-good，不重导入、更不覆盖本地配置。
+                db.mark_nodes_stale_by_sub(sub_id)
+                db.update_sub(sub_id, {"last_error": res.get("error")})
+                return {"id": sub_id, "ok": False, "count": len(nodes), "stale": True,
+                        "degraded": True, "imported": 0, "error": res.get("error")}
+        except (TypeError, ValueError):
             pass
-    db.update_sub(sub["id"], {"last_error": res.get("error")})
-    return {"id": sub["id"], "ok": False, "count": 0, "stale": False, "imported": 0, "error": res.get("error")}
+    db.update_sub(sub_id, {"last_error": res.get("error")})
+    return {"id": sub_id, "ok": False, "count": 0, "stale": False, "imported": 0, "error": res.get("error")}
 
 
 async def refresh_subs(ids: Optional[List[str]] = None, all_: bool = True) -> List[Dict[str, Any]]:

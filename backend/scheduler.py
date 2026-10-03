@@ -153,7 +153,8 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
             domain_server = bool(server) and not _is_ip_address(server)
             # 无出口 IP → 经节点自身代理查询（探活已确认在线，代理应可达）
             if not cur_ip:
-                fetched = await _fetch_exit_ip(node)
+                async with _ip_enrich_sem:
+                    fetched = await _fetch_exit_ip(node)
                 if not fetched:
                     return
                 cur_ip = fetched
@@ -167,24 +168,26 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
                      ("exitCountry", "exitFlag", "exitCity", "exitType", "exitScore")
                      if k in info}
             # 风控值：优先 ippure（fraudScore，无验证稳定），失败再 ping0
-            if patch and node.get("exitRisk") is None:
+            if node.get("exitRisk") is None:
                 try:
                     async with _ip_enrich_sem:
                         online = [n for n in db.list_nodes()
-                                  if n.get("status") == "online" and n.get("port") != node.get("port")]
-                        if node.get("status") == "online":
-                            online = [node] + online  # 目标节点在线时优先经它自己查
-                        ipr = await asyncio.to_thread(ipinfo.lookup_ippure, online[:8])
-                    if ipr.get("exitRisk") is not None:
+                                  if n.get("status") == "online"
+                                  and (n.get("entryProto") or "mixed") == "mixed"]
+                        target = next((n for n in online if n["id"] == nid), None)
+                        ipr = {}
+                        if target:
+                            try:
+                                ipr = await asyncio.to_thread(ipinfo.lookup_ippure, [target])
+                            except Exception:
+                                ipr = {}
+                    if ipr.get("exitIp") == cur_ip and ipr.get("exitRisk") is not None:
                         patch["exitRisk"] = ipr["exitRisk"]
-                    elif patch.get("exitCountry"):
-                        try:
-                            async with _ip_enrich_sem:
-                                p0 = await asyncio.to_thread(ipinfo.lookup_ping0, cur_ip, online[:10])
-                            if p0.get("exitRisk") is not None:
-                                patch["exitRisk"] = p0["exitRisk"]
-                        except Exception:
-                            pass
+                    else:
+                        async with _ip_enrich_sem:
+                            p0 = await asyncio.to_thread(ipinfo.lookup_ping0, cur_ip, online[:10])
+                        if p0.get("exitRisk") is not None:
+                            patch["exitRisk"] = p0["exitRisk"]
                 except Exception:
                     pass
             if patch:
@@ -208,29 +211,20 @@ _guard_paused = False
 
 # ---------- 探活 ----------
 
-# 连续失败自动处理阈值
-# 调保守（2026-08-09 优化）：探活是弱判定（TCP/TLS 握手），单轮抖动/节点风控瞬时拒绝
-# 很常见。① 每轮 delay 失败已重试 2 次（吸收 reload/抖动瞬时失败）；② 握手成功即判在线，
-# 出口 IP 查询失败不再判死（IP 只是情报，不反证转发能力）；③ 阈值抬高——误停用要人工
-# 恢复（约 20 分钟 20 轮连续失败才停），删除阈值仅在节点彻底失联后触发。
+# 后台弱探活需要完整观察期；仅自动停用，节点数据由用户决定是否删除。
 DISABLE_AFTER_FAILS = 20  # 连续失败 ≥20 次（约 20 轮×60s）→ 结合窗口存活率判停用
-DELETE_AFTER_FAILS = 60   # 连续失败 ≥60 次 → 自动删除（保险阈值）
+MIN_FAILURE_SECONDS = 20 * 60  # 后台连续失败至少持续 20 分钟，避免短周期误停
 PROBE_CONCURRENCY = 16    # 探活并发上限（降低对 clash API 的瞬时压力，减少超时误判）
 _probe_running = False  # 探活进行中标记（P1-2 防并发重叠）
 PROBE_DELAY_RETRY = 2     # 每轮 delay 失败重试次数（共 3 次机会，进一步吸收抖动）
 
-# ── 滑窗存活率判定（2026-10-03 根治波动节点误停）──
-# 纯"连续失败 N 次"仍会误停长时间波动的节点：高峰期连续 20 分钟全败并不罕见，但这类
-# 节点平时有 30%~70% 存活率，对 relay 轮询池仍有价值（出口选择是实时探测的，不会选到
-# 瞬时死节点）。停用改为双条件，均看最近 _PROBE_WINDOW 次探活的存活率：
-#   窗口路径：窗口满 30 且存活率 ≤20%（持续半小时 mostly-dead）→ 自动停用
-#   连续路径：连续失败 ≥20 且窗口存活率 ≤30%（真死节点加速通道，保留原阈值语义）
-# 波动节点（窗口存活率 >30%）永远不会被自动停用；纯死节点仍会在 20~30 分钟内被清理。
-_PROBE_WINDOW = 30              # 滑窗长度（≈30 轮，默认探活间隔下约 30 分钟观察期）
-_PROBE_DISABLE_RATE = 0.2       # 窗口存活率 ≤20% 视为"持续不可达" → 停
-_PROBE_DISABLE_RATE_FAST = 0.3  # 连续失败加速通道的窗口存活率上限
-_PROBE_DELETE_RATE = 0.1        # 删除通道的窗口存活率上限
-_probe_hist: Dict[str, Any] = {}  # node_id -> deque[bool]（True=该轮存活）
+# 后台样本满足连败、完整窗口与持续时间三项条件才停用。
+_PROBE_WINDOW = 30
+_PROBE_DISABLE_RATE_FAST = 0.3
+_probe_hist: Dict[str, Any] = {}
+_probe_failure_since: Dict[str, float] = {}
+_probe_tags: Dict[str, tuple] = {}
+_scheduler_tasks: set = set()
 
 
 def _record_probe(node_id: str, ok: bool) -> None:
@@ -259,253 +253,173 @@ def _prune_probe_hist(valid_ids: set) -> None:
         return
     for k in list(_probe_hist.keys()):
         if k not in valid_ids:
-            _probe_hist.pop(k, None)
+            _reset_probe_observation(k)
 
 async def probe_nodes(ids: Optional[List[str]] = None, all_: bool = True,
-                      include_disabled: bool = False) -> List[Dict[str, Any]]:
-    """对节点经 clash API 并发探活。返回 {id, tag, ping, status, error}。
-
-    失败计数：连续失败 DISABLE_AFTER_FAILS 次自动停用（status=disabled），
-    达到 DELETE_AFTER_FAILS 次自动删除节点并重建配置；成功即清零。
-
-    include_disabled=True（手动测活停用节点）时：临时启用 disabled 节点（生成
-    outbound）→ 探活 → 失败恢复 disabled，通过则保持在线。
-
-    互斥：60s 定时循环与手动触发/上一轮重叠时跳过本轮（P1-2：并发探活会让
-    失败计数交错累加——在线节点被误判连续失败提前自动停用）。
-    """
+                      include_disabled: bool = False, *, manual: bool = True) -> List[Dict[str, Any]]:
+    """互斥探活；手动失败只展示，后台失败才累计观察与停用。重叠返回空列表。"""
     global _probe_running
     if _probe_running:
         return []
     _probe_running = True
     try:
-        return await _probe_nodes_inner(ids, all_, include_disabled)
+        return await _probe_nodes_inner(ids, all_, include_disabled, manual=manual)
     finally:
         _probe_running = False
 
 
-async def _fail_probe_once(client: "httpx.AsyncClient", tag: str, url: str,
-                           hdrs: Dict[str, str], retries: int = 1) -> bool:
-    """单轮失败二次确认：clash delay 弱判定，一轮内瞬时 RST/限流不代表节点失效。
-
-    在探活落库失败计数前，对同一 outbound 再打 retries 次 delay；
-    只要有一次返回 delay → 视为可存活（返回 True，不累计失败）。
-    超时用 8000ms（比主探测的 5000ms 更宽松）：慢节点/波动节点主探测卡点失败时，
-    确认环节给更充裕的窗口——原 3000ms 比主探测还严，等于变相收紧，是本末倒置。
-    """
-    for _ in range(retries):
+async def _probe_one(node: Dict[str, Any], client: "httpx.AsyncClient",
+                     url: str, hdrs: Dict[str, str], *, manual: bool) -> Dict[str, Any]:
+    """限流槽内完成重试与后台重确认；管理 API 故障属于 unknown。"""
+    tag = config_manager.outbound_tag(node["protocol"], node["port"])
+    result = {"id": node["id"], "tag": tag, "ping": 0, "status": "offline"}
+    attempts = PROBE_DELAY_RETRY + 1 + (0 if manual else 1)
+    for attempt in range(attempts):
+        if attempt:
+            await asyncio.sleep(0.5 * min(attempt, 2))
         try:
             r = await client.get(
                 f"{config_manager.clash_base()}/proxies/{tag}/delay",
-                params={"url": url, "timeout": "8000"},
+                params={"url": url, "timeout": "8000" if attempt > PROBE_DELAY_RETRY else "5000"},
                 headers=hdrs,
             )
-            if r.status_code == 200 and r.json().get("delay") is not None:
-                return True
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
-    return False
+            if r.status_code in (401, 403, 404):
+                return {**result, "status": "unknown", "error": f"clash API HTTP {r.status_code}"}
+            try:
+                data = r.json()
+            except (ValueError, TypeError):
+                return {**result, "status": "unknown", "error": "clash API 返回无效 JSON"}
+            if not isinstance(data, dict):
+                return {**result, "status": "unknown", "error": "clash API 返回无效结果"}
+            if r.status_code == 200 and data.get("delay") is not None:
+                delay = data["delay"]
+                if isinstance(delay, bool) or not isinstance(delay, (int, float)) or delay < 0:
+                    return {**result, "status": "unknown", "error": "clash API 返回无效 delay"}
+                return {**result, "status": "online", "ping": int(delay)}
+            if not data.get("message"):
+                return {**result, "status": "unknown", "error": f"clash API HTTP {r.status_code} 无探活结果"}
+            result["error"] = str(data["message"])
+        except (httpx.HTTPError, OSError) as exc:
+            return {**result, "status": "unknown", "error": f"clash API 不可达: {exc}"}
+    return result
+
+
+def _reset_probe_observation(node_id: str) -> None:
+    _probe_hist.pop(node_id, None)
+    _probe_failure_since.pop(node_id, None)
+    _probe_tags.pop(node_id, None)
+
+
+async def _probe_round_valid(generation: int) -> bool:
+    running = await asyncio.to_thread(config_manager.is_running)
+    return (running and not config_manager._op_lock.locked()
+            and config_manager.operation_generation() == generation)
+
 
 async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
-                             include_disabled: bool = False) -> List[Dict[str, Any]]:
+                             include_disabled: bool = False, *, manual: bool = True) -> List[Dict[str, Any]]:
     import config_manager as cm
 
-    if not cm.is_running():
+    if not await asyncio.to_thread(cm.is_running) or cm._op_lock.locked():
         return []
-    # 防竞态误杀：若 config_manager 正在 apply/reload（_op_lock 被占），clash API 处于
-    # 不可达窗口——此时探活必然全部失败。跳过本轮，等 reload 完成后再探活。
-    if cm._op_lock.locked():
-        return []
+    generation = cm.operation_generation()
     nodes = db.list_nodes()
     _prune_probe_hist({n["id"] for n in nodes})
-    # 全局 testUrl + clash 头：二次确认（_fail_probe_once）用同一 URL 语义
     _test_url = (db.get_setting("system", {}) or {}).get("testUrl", "https://www.gstatic.com/generate_204")
     if not _test_url or not str(_test_url).startswith("https://"):
         _test_url = "https://www.gstatic.com/generate_204"
     _hdrs = {"Authorization": f"Bearer {cm.get_clash_secret()}"}
     if not all_ and ids:
         nodes = [n for n in nodes if n["id"] in ids]
-    # 默认跳过 disabled；手动测活（include_disabled）时临时启用
-    disabled_ids = [n["id"] for n in nodes if n.get("status") == "disabled"]
-    nodes = [n for n in nodes if n.get("status") != "disabled"]
-    # 只临时启用本次目标范围内的 disabled 节点（all_=全部；ids=仅指定的），
-    # 避免把所有停用节点一起重建进 sing-box 占用端口、探活后又恢复不回来。
-    target_disabled = [nid for nid in disabled_ids if (all_ or (ids and nid in ids))]
-    if include_disabled and target_disabled:
-        for nid in target_disabled:
-            db.update_node(nid, {"status": "offline", "consecutiveFails": 0})
-        try:
-            await cm.apply_config()  # 重建配置含临时启用的节点
-        except Exception:
-            pass
-        # 重新拉取含临时启用节点的列表
-        nodes = db.list_nodes()
-        if not all_ and ids:
-            nodes = [n for n in nodes if n["id"] in ids]
-        nodes = [n for n in nodes if n.get("status") != "disabled"]
-
-    async def _probe_one(node: Dict[str, Any], client: "httpx.AsyncClient") -> Dict[str, Any]:
-        tag = cm.outbound_tag(node["protocol"], node["port"])
-        url = _test_url
-        hdrs = _hdrs
-
-        async def _delay_once() -> Optional[Dict[str, Any]]:
-            """单次 clash delay 探测。返回 JSON dict；HTTP 失败/无 delay 返回 None。
-
-            复用外层共享 client（httpx AsyncClient 并发安全）：原每节点×每重试新建
-            连接，一轮 N 节点×3 尝试 = 3N 次本地建连 churn，reload 窗口易自锁。
-            """
-            try:
-                r = await client.get(
-                    f"{cm.clash_base()}/proxies/{tag}/delay",
-                    params={"url": url, "timeout": "5000"},
-                    headers=hdrs,
-                )
-                if r.status_code == 200:
-                    return r.json()
-            except Exception:
-                return None
-            return None
-
-        # 失败重试：单轮 delay 抖动（reload 窗口/节点瞬时 RST）不该计一败。
-        # 重试 PROBE_DELAY_RETRY 次（共 PROBE_DELAY_RETRY+1 次机会），带指数退避，
-        # 仍失败才判离线——阈值随之可以放宽。
-        resp = None
-        last_msg = None
-        for attempt in range(PROBE_DELAY_RETRY + 1):
-            if attempt > 0:
-                await asyncio.sleep(0.5 * attempt)  # 指数退避：0.5s, 1.0s
-            data = await _delay_once()
-            if data and data.get("delay"):
-                resp = data
-                break
-            if data:
-                last_msg = data.get("message")
-        if resp is not None:
-            # clash delay 只证明 TCP/TLS 握手能过（HEAD 不校验状态码，握手成功≠可用）。
-            # 已有出口 IP 的节点：delay 足够（前轮已全链路验证过）。首次/无 IP 节点：
-            # 追加真实出口链路验证（经 inbound 真实请求）——但注意：出口 IP 查询失败
-            # **不判死**（2026-08-09 优化）：握手已成功说明节点转发能力正常，出口 IP
-            # 只是情报补充（_lazy_enrich_ip 会异步重查），单次 socks5 查询超时/被风控
-            # 拒绝不应反过来把可用节点计失败。拿到 IP 顺手落库加速情报。
-            cur_ip = node.get("exitIp")
-            # 节点自身 server 是域名（如 kookeey 动态IP）→ exitIp 保持域名，不固化解析 IP
-            server = ((node.get("rawConfig") or {}).get("server") or "").strip()
-            domain_server = bool(server) and not _is_ip_address(server)
-            # 已有出口 IP 且不是 hostname → 直接用；域名节点/无 IP 节点触发补查
-            if cur_ip and cur_ip not in ("N/A", "1.1.1.1") and _is_ip_address(cur_ip):
-                return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
-                        "status": "online"}
-            fetched = await _fetch_exit_ip(node)
-            if not fetched:
-                return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
-                        "status": "online",
-                        "error": "出口IP查询失败(握手已通,情报异步补)"}
-            # 域名节点：出口 IP 是动态的，只用于情报查询，不落库 exitIp（域名保持）
-            if domain_server:
-                return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
-                        "status": "online", "exitIpTmp": fetched}
-            return {"id": node["id"], "tag": tag, "ping": resp.get("delay"),
-                    "status": "online", "exitIp": fetched}
-        return {"id": node["id"], "tag": tag, "ping": 0, "status": "offline",
-                "error": last_msg or "delay探测失败"}
+    skipped = []
+    targets = []
+    for node in nodes:
+        if node.get("status") != "disabled":
+            targets.append(node)
+        elif include_disabled and node.get("disabledAuto"):
+            targets.append(node)
+        elif include_disabled:
+            skipped.append({"id": node["id"], "tag": cm.outbound_tag(node["protocol"], node["port"]),
+                            "ping": 0, "status": "disabled", "error": "用户手动停用，请先启用节点再测活"})
+    nodes = targets
 
     if not nodes:
-        return []
-    # 并发限流：176 节点全 gather 会瞬时打满网络/触发节点风控（之前无上限），
-    # 用信号量把同时在建连的探活压到 PROBE_CONCURRENCY 个。
-    # 全轮共享单个 AsyncClient（连接池复用），不再每节点每重试新建连接。
+        return skipped
     sem = asyncio.Semaphore(PROBE_CONCURRENCY)
-
     async with httpx.AsyncClient(timeout=10.0) as probe_client:
-
         async def _probe_limited(n: Dict[str, Any]) -> Dict[str, Any]:
             async with sem:
-                return await _probe_one(n, probe_client)
-
+                return await _probe_one(n, probe_client, _test_url, _hdrs,
+                                        manual=manual and n.get("status") != "disabled")
         results = await asyncio.gather(*(_probe_limited(n) for n in nodes))
-    # 结果落库 + 失败计数 → 自动停用/删除（_probe_one 不落库，避免双重计数）
-    # 注意：只标记需要重建，循环结束后统一 apply 一次——每个节点单独 apply_config
-    # 会触发大量 reload，sing-box 反复重启累积 TIME-WAIT 导致 bind 冲突（1.7.7 无 SO_REUSEADDR）
+    if not await _probe_round_valid(generation):
+        return []
     need_rebuild = False
-    # 手动测活的 disabled 节点：失败直接恢复 disabled（不计连续失败），成功保持在线
-    manual_disabled = set(target_disabled) if include_disabled else set()
-    # 手动测活/单节点测活：失败不回写失败计数（stop-the-world 已够，再叠计数会误停）
-    probe_ctx = {"is_manual": bool(include_disabled) or (ids and not all_)}
     for node, res in zip(nodes, results):
+        if cm._op_lock.locked() or cm.operation_generation() != generation:
+            break
         nid = node["id"]
-        if res.get("status") == "online":
-            db.update_node_probe(nid, res.get("ping", 0), "online")  # 成功清零
+        if res["status"] == "unknown":
+            continue
+        expected = {"expected_port": node["port"], "expected_protocol": node["protocol"]}
+        tag_version = (node["port"], node["protocol"])
+        if _probe_tags.get(nid, tag_version) != tag_version:
+            _reset_probe_observation(nid)
+        _probe_tags[nid] = tag_version
+        if node.get("status") == "disabled":
+            if res["status"] != "online":
+                res["status"] = "disabled"
+                continue
+            changed = db.revive_node_probe(nid, res["ping"], **expected)
+            if changed is None:
+                res.update(status="unknown", error="节点状态或探活 tag 已变，本轮结果已跳过")
+                continue
+            _reset_probe_observation(nid)
             _record_probe(nid, True)
-            # 探活真实出口验证拿到的 IP 一并落库（出口链路已验证可用）
-            # 域名节点返回 exitIpTmp（临时解析 IP）——不落库，仅同步快照供情报补查
-            if res.get("exitIp"):
-                db.update_node(nid, {"exitIp": res["exitIp"]})
-                node["exitIp"] = res["exitIp"]
-            elif res.get("exitIpTmp"):
-                node["exitIp"] = res["exitIpTmp"]  # 快照用临时 IP（不写库），enrich 直接用
-            # 探活成功 → 同步 node 快照状态为 online，供 _lazy_enrich_ip 风控补查用
+            need_rebuild = True
+        else:
+            fails = db.update_node_probe(nid, res["ping"], res["status"],
+                                         count_failure=not manual, **expected)
+            if fails is None:
+                res.update(status="unknown", error="节点状态或探活 tag 已变，本轮结果已跳过")
+                continue
+            if res["status"] == "online":
+                _probe_failure_since.pop(nid, None)
+                if not manual:
+                    _record_probe(nid, True)
+            elif not manual:
+                _record_probe(nid, False)
+                since = _probe_failure_since.setdefault(nid, time.monotonic())
+                tot, rate = _probe_window_rate(nid)
+                current = db.get_node(nid)
+                if (fails >= DISABLE_AFTER_FAILS and tot >= _PROBE_WINDOW
+                        and rate <= _PROBE_DISABLE_RATE_FAST
+                        and time.monotonic() - since >= MIN_FAILURE_SECONDS
+                        and current and current["status"] == "offline"
+                        and current["consecutiveFails"] == fails
+                        and current["port"] == node["port"]
+                        and current["protocol"] == node["protocol"]):
+                    if db.disable_node_after_probe(nid, expected_fails=fails, **expected):
+                        res["status"] = "disabled"
+                        need_rebuild = True
+        if res["status"] == "online":
             node["status"] = "online"
-            # exitIp 已确认 → 情报补查（归属地/风控）可直接进行，无重复出口查询
             _lazy_enrich_ip(node)
-            continue
-        if nid in manual_disabled:
-            # 手动测活失败：恢复 disabled（避免生成 outbound 占用端口）
-            db.update_node(nid, {"status": "disabled", "consecutiveFails": 0})
-            need_rebuild = True
-            continue
-        # 定时探活失败：单轮 delay 失败先二次确认再计败（好节点不受瞬时抖动误杀）
-        if not probe_ctx["is_manual"]:
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as _c:
-                    if await _fail_probe_once(_c, res.get("tag", "") or
-                                              cm.outbound_tag(node["protocol"], node["port"]),
-                                              _test_url, _hdrs):
-                        # 二次确认通过 → 视为存活，清零并保持在线（吞掉该轮抖动）
-                        db.update_node_probe(nid, 0, "online")
-                        _record_probe(nid, True)
-                        node["status"] = "online"
-                        res["status"] = "online"  # 返回值与落库一致（前端按结果显示）
-                        print(f"[probe] 节点 [{node.get('name')}] 单轮抖动，二次确认存活")
-                        continue
-            except Exception:
-                pass
-        fails = db.update_node_probe(nid, 0, "offline")  # 失败 +1 并返回累计值
-        _record_probe(nid, False)
-        tot, rate = _probe_window_rate(nid)
-        ok_cnt = sum(_probe_hist[nid]) if nid in _probe_hist else 0
-        # 滑窗存活率判定（2026-10-03）：波动节点（窗口存活率 >30%）永不自动停用——
-        # 它们对 relay 轮询池仍有价值；只有持续 mostly-dead 的节点才被清理。
-        if fails >= DELETE_AFTER_FAILS and (tot == 0 or rate <= _PROBE_DELETE_RATE):
-            print(f"[probe] 节点 [{node.get('name')}] 连续失败 {fails} 次且窗口存活率 "
-                  f"{rate:.0%}，自动删除")
-            db.delete_node(nid)
-            need_rebuild = True
-        elif (tot >= _PROBE_WINDOW and rate <= _PROBE_DISABLE_RATE) or \
-             (fails >= DISABLE_AFTER_FAILS and rate <= _PROBE_DISABLE_RATE_FAST):
-            print(f"[probe] 节点 [{node.get('name')}] 窗口存活率 {rate:.0%} "
-                  f"（{ok_cnt}/{tot}），自动停用")
-            db.update_node(nid, {"status": "disabled", "disabledAuto": True})
-            need_rebuild = True
     if need_rebuild:
         try:
             await cm.apply_config()
         except Exception:
             pass
-    # 探活后同步 relay 出口（粘滞超时逻辑）：
-    # 粘滞期内保持当前出口不动；超过粘滞时长切到延迟最优节点。
-    # 每次探活刷新出口（探活周期=粘滞决策周期），已是最优则不动。
     try:
-        await _sync_relay_exits_after_probe()
+        await _sync_relay_exits_after_probe(results)
     except Exception:
         pass
-    return results
+    return results + skipped
 
 
 # ---------- relay 出口粘滞超时 ----------
 
-async def _sync_relay_exits_after_probe() -> None:
+async def _sync_relay_exits_after_probe(probe_results: Optional[List[Dict[str, Any]]] = None) -> None:
     """探活后按粘滞超时刷新 relay 出口（selector 运行时切换，零热重载）。
 
     语义：每个 relay-auto-<id> 出口记录切换时间；距离上次切换 < 粘滞时长 →
@@ -545,26 +459,6 @@ async def _sync_relay_exits_after_probe() -> None:
     if not test_url or not str(test_url).startswith("https://"):
         test_url = "https://www.gstatic.com/generate_204"
 
-    async def _delay(tag: str, client: "httpx.AsyncClient") -> Optional[int]:
-        # 时有时无根因之一：单发 3s 超时对慢候选误判不通 → 出口跳空。
-        # 同延时请求失败立即重试一次（共 2 次），超时放宽到 5s，吞掉瞬时 RST。
-        for attempt in range(2):
-            try:
-                r = await client.get(
-                    f"{cm.clash_base()}/proxies/{tag}/delay",
-                    params={"url": test_url, "timeout": "5000"},
-                    headers=hdrs,
-                )
-                if r.status_code == 200:
-                    d = r.json().get("delay")
-                    if d is not None:
-                        return int(d)
-            except Exception:
-                pass
-            if attempt == 0:
-                await asyncio.sleep(0.4)
-        return None
-
     async def _current(rd_tag: str, client: "httpx.AsyncClient") -> Optional[str]:
         try:
             r = await client.get(f"{cm.clash_base()}/proxies/{rd_tag}", headers=hdrs)
@@ -575,9 +469,24 @@ async def _sync_relay_exits_after_probe() -> None:
             pass
         return None
 
-    # 候选去重：所有 relay 的候选并集一次收集，复用单个 AsyncClient 打 delay，
-    # 避免 N×M 串行建连导致 conntrack 堆积 / 误判跳空。
-    async with httpx.AsyncClient(timeout=6.0) as client:
+    # 本轮结果（包含失败）按 tag 缓存；同一个节点不随 relay 数量重复测。
+    delay_cache = {r["tag"]: r.get("ping", 0) if r.get("status") == "online" else None
+                   for r in (probe_results or []) if r.get("tag")}
+    generation = cm.operation_generation()
+    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        missing = {t for t, n in node_by_tag.items() if t not in delay_cache
+                   and any("ALL" in (rd.get("groups") or ["ALL"])
+                           or n.get("group") in (rd.get("groups") or ["ALL"]) for rd in relays)}
+
+        async def measure(t: str) -> None:
+            async with sem:
+                r = await _probe_one(node_by_tag[t], client, test_url, hdrs, manual=True)
+                delay_cache[t] = r["ping"] if r["status"] == "online" else None
+
+        await asyncio.gather(*(measure(t) for t in missing))
+        if not await _probe_round_valid(generation):
+            return
         for rd in relays:
             rd_tag = f"relay-auto-{rd['id']}"
             sel_groups = rd.get("groups") or ["ALL"]
@@ -593,10 +502,18 @@ async def _sync_relay_exits_after_probe() -> None:
                 last = _relay_switch_time.get(rd["id"], 0)
                 if time.time() - last < sticky_sec:
                     continue
+            if cm._op_lock.locked() or cm.operation_generation() != generation:
+                return
+            latest = {cm.outbound_tag(n["protocol"], n["port"]): n for n in db.list_nodes()
+                      if n.get("status") != "disabled"}
+            targets = [t for t in targets if t in latest
+                       and ("ALL" in sel_groups or latest[t].get("group") in sel_groups)]
+            if not targets:
+                continue
             # 挑延迟最优（当前出口也参与比较；全不通则维持当前不动，不静默跳过）
             best, best_delay = None, None
             for t in targets:
-                d = await _delay(t, client)
+                d = delay_cache.get(t)
                 if d is not None and (best_delay is None or d < best_delay):
                     best, best_delay = t, d
             if best is None:
@@ -624,9 +541,9 @@ async def _probe_loop() -> None:
         except (TypeError, ValueError):
             interval = PING_INTERVAL
         await asyncio.sleep(interval)
-        if config_manager.is_running():
+        if await asyncio.to_thread(config_manager.is_running):
             try:
-                results = await probe_nodes()
+                results = await probe_nodes(manual=False)
                 # apply_config 触发了 reload → 追加 grace period，给 sing-box 重建连接池
                 # 的时间，下一轮探活不会紧跟着 reload 窗口误判全挂
                 if results and any(r.get("status") == "offline" for r in results):
@@ -642,17 +559,11 @@ REVIVE_INTERVAL = 600  # 秒：停用节点自动复查周期（网络恢复后�
 
 
 async def _disabled_revive_loop() -> None:
-    """周期复查**自动停用**（disabledAuto=1）的节点：探活通过 → 自动恢复在线回池；
-    仍不通 → 恢复 disabled，不计连续失败、不触发删除。
-
-    只复查自动停用的节点：用户手动停用的（disabledAuto=0）保持停用语义，不被打扰。
-    复用 include_disabled 手动测活通路（temp enable → probe → 失败回退 disabled），
-    波动节点被误停后无需人工干预即可自愈。
-    """
+    """只复查自动停用的 outbound；失败不写库、不重载，成功由 CAS 恢复。"""
     while True:
         await asyncio.sleep(REVIVE_INTERVAL)
         try:
-            if not config_manager.is_running():
+            if not await asyncio.to_thread(config_manager.is_running):
                 continue
             if config_manager._op_lock.locked():
                 continue  # apply/reload 窗口 clash API 不可达，下轮再查
@@ -660,7 +571,7 @@ async def _disabled_revive_loop() -> None:
                         if n.get("status") == "disabled" and n.get("disabledAuto")]
             if not disabled:
                 continue
-            results = await probe_nodes(ids=disabled, all_=False, include_disabled=True)
+            results = await probe_nodes(ids=disabled, all_=False, include_disabled=True, manual=False)
             if not results:
                 continue  # 与定时探活重叠（互斥跳过）或 sing-box 不可用
             revived = sum(1 for r in results if r.get("status") == "online")
@@ -693,7 +604,7 @@ def outbound_tag_for(node: Dict[str, Any]) -> str:
     """节点 → outbound tag（与 config_manager.outbound_tag 一致，避免循环依赖）。"""
     return f"out-{node.get('protocol')}-{node.get('port')}"
 
-async def _rotate_random_relay() -> None:
+async def _rotate_random_relay() -> Optional[str]:
     """随机挑一个可用节点作为 relay 出口，经 clash API 运行时切换（零热重载）。
 
     PUT /proxies/{tag} 只影响新连接、不断已有连接——与固定节点互不干扰。
@@ -810,7 +721,7 @@ async def _guard_loop() -> None:
         # is_running() 基于收割任务判断：进程已退出且被 _reap_proc 收割 → False
         # （asyncio 的 Process.returncode 不调 wait() 永远不更新，直接读它进程死了
         #   也显示"活着"，守护会漏重启。此判断依赖 config_manager 的收割任务）
-        if config_manager.is_running():
+        if await asyncio.to_thread(config_manager.is_running):
             if _guard_paused:
                 _guard_paused = False
             continue
@@ -834,8 +745,18 @@ async def _guard_loop() -> None:
 # ---------- 生命周期 ----------
 
 def start_scheduler(loop: asyncio.AbstractEventLoop) -> None:
-    loop.create_task(_probe_loop())
-    loop.create_task(_sub_refresh_loop())
-    loop.create_task(_relay_random_loop())
-    loop.create_task(_guard_loop())
-    loop.create_task(_disabled_revive_loop())
+    if any(not task.done() for task in _scheduler_tasks):
+        return
+    for worker in (_probe_loop, _sub_refresh_loop, _relay_random_loop,
+                   _guard_loop, _disabled_revive_loop):
+        task = loop.create_task(worker())
+        _scheduler_tasks.add(task)
+        task.add_done_callback(_scheduler_tasks.discard)
+
+
+async def stop_scheduler() -> None:
+    tasks = list(_scheduler_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _scheduler_tasks.difference_update(tasks)
