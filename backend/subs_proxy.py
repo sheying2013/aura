@@ -279,9 +279,9 @@ def _detect_type(content: str) -> str:
         return "json"
     if re.search(r"^\s*proxies:\s*$", t, re.MULTILINE) or re.search(r"^\s*proxies:\s*\[", t, re.MULTILINE):
         return "clash"
-    if "\n" in t and re.search(r"^\s*(ss|vmess|vless|trojan|ssr|hysteria2|tuic)://", t, re.MULTILINE):
+    if "\n" in t and re.search(r"^\s*(ss|vmess|vless|trojan|ssr|hysteria2|tuic|socks5|http)://", t, re.MULTILINE):
         return "urllist"
-    if re.match(r"^(ss|vmess|vless|trojan|ssr|hysteria2|tuic)://", t):
+    if re.match(r"^(ss|vmess|vless|trojan|ssr|hysteria2|tuic|socks5|http)://", t):
         return "urllist"
     if _b64_detect(t):
         return "b64"

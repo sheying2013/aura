@@ -512,6 +512,8 @@ const pendingProbeIds = new Set(); // 独立于 loadNodes 替换的节点对象
 let bulkProbeRunning = false;
 let settingsDirty = false;
 let settingsRevision = 0;
+let savedExportDomain = '';
+let settingsSaveRevision = 0;
 let subState = [];
 let relayState = [];
 let editingNodeId = null;
@@ -944,14 +946,32 @@ function updateGroupFilterOptions() {
             opt.textContent = g === 'ALL' ? (I18N_DICT['ALL GROUPS'] || 'ALL GROUPS') : g;
             select.appendChild(opt);
         });
-        // 停用节点筛选（仅节点列表分组下拉）
-        if (select === filterGroupSelect && nodeState.some(n => n.status === 'disabled')) {
-            const opt = document.createElement('option');
-            opt.value = '__DISABLED__';
-            opt.textContent = '停用节点';
-            select.appendChild(opt);
+        // 停用节点筛选（仅节点列表分组下拉）：支持全部停用及按分组细分停用
+        if (select === filterGroupSelect) {
+            const disabledNodes = nodeState.filter(n => n.status === 'disabled');
+            if (disabledNodes.length > 0) {
+                const optAllDisabled = document.createElement('option');
+                optAllDisabled.value = '__DISABLED__';
+                optAllDisabled.textContent = `停用节点 (全部: ${disabledNodes.length})`;
+                select.appendChild(optAllDisabled);
+
+                const disabledGroupCounts = new Map();
+                disabledNodes.forEach(n => {
+                    const dg = n.group || '默认分组';
+                    disabledGroupCounts.set(dg, (disabledGroupCounts.get(dg) || 0) + 1);
+                });
+                const disabledGroups = Array.from(disabledGroupCounts.keys()).sort((a, b) => a.localeCompare(b, 'zh-CN'));
+                disabledGroups.forEach(dg => {
+                    const count = disabledGroupCounts.get(dg);
+                    const optGroupDisabled = document.createElement('option');
+                    optGroupDisabled.value = `__DISABLED__:${dg}`;
+                    optGroupDisabled.textContent = `　└ 停用 · ${dg} (${count})`;
+                    select.appendChild(optGroupDisabled);
+                });
+            }
         }
-        select.value = groups.has(currentVal) || currentVal === '__DISABLED__' ? currentVal : 'ALL';
+        const optionValues = new Set(Array.from(select.options, option => option.value));
+        select.value = optionValues.has(currentVal) ? currentVal : 'ALL';
     });
 }
 
@@ -1068,9 +1088,14 @@ function getFilteredNodes() {
     const keyword = searchInput ? searchInput.value.trim().toLowerCase() : '';
 
     return nodeState.filter(node => {
-        // 停用节点独立视图：__DISABLED__ 只看停用；普通列表排除 disabled
+        // 停用节点独立视图：__DISABLED__ 只看停用；__DISABLED__:xxx 按特定分组看停用；普通列表排除 disabled
         if (selectedGroup === '__DISABLED__') {
             if (node.status !== 'disabled') return false;
+        } else if (selectedGroup && selectedGroup.startsWith('__DISABLED__:')) {
+            if (node.status !== 'disabled') return false;
+            const targetGroup = selectedGroup.slice('__DISABLED__:'.length);
+            const nodeGroup = node.group || '默认分组';
+            if (nodeGroup !== targetGroup) return false;
         } else {
             if (node.status === 'disabled') return false;
             if (selectedGroup !== 'ALL' && node.group !== selectedGroup) return false;
@@ -1147,6 +1172,8 @@ function renderNodesTable() {
     if (!tbody) return;
     tbody.innerHTML = '';
 
+    const groupSelect = document.getElementById('filter-group');
+    const selectedGroup = groupSelect ? groupSelect.value : 'ALL';
     const nodes = getFilteredNodes();
     if (nodes.length === 0) {
         tbody.innerHTML = `<tr><td colspan="11" style="text-align: center; color: var(--rock); padding: 24px;">暂无节点数据</td></tr>`;
@@ -1155,14 +1182,42 @@ function renderNodesTable() {
         return;
     }
 
+    // 当查看全部停用节点且存在多个分组时，按分组聚类排序并渲染分组小标题隔断
+    const isAllDisabledView = selectedGroup === '__DISABLED__';
+    const distinctGroups = isAllDisabledView ? Array.from(new Set(nodes.map(n => n.group || '默认分组'))) : [];
+    const groupCounts = new Map();
+    nodes.forEach(n => {
+        const group = n.group || '默认分组';
+        groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
+    });
+    if (isAllDisabledView && distinctGroups.length > 1) {
+        nodes.sort((a, b) => (a.group || '默认分组').localeCompare(b.group || '默认分组', 'zh-CN'));
+    }
+
+    const esc = escapeHtml;
+    let lastGroup = null;
     nodes.forEach(node => {
+        const curGroup = node.group || '默认分组';
+        if (isAllDisabledView && distinctGroups.length > 1 && curGroup !== lastGroup) {
+            lastGroup = curGroup;
+            const groupCount = groupCounts.get(curGroup);
+            const headerTr = document.createElement('tr');
+            headerTr.className = 'group-header-row';
+            headerTr.innerHTML = `
+                <td colspan="11" style="background: rgba(255, 255, 255, 0.035); padding: 6px 12px; font-size: 11px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);">
+                    <span class="group-tag" style="margin-right: 8px;">${esc(curGroup)}</span>
+                    <span style="color: var(--rock);">停用节点 (${groupCount} 个)</span>
+                </td>`;
+            tbody.appendChild(headerTr);
+        }
+
         const isSelected = selectedNodeIds.has(node.id);
         const totalNodeTraffic = (node.upTraffic || 0) + (node.downTraffic || 0);
-        const esc = escapeHtml;
         const isDisabled = node.status === 'disabled';
         const statusTitle = isDisabled ? '已停用（连续探活失败自动）' : (node.status || 'offline');
         const tr = document.createElement('tr');
         tr.setAttribute('data-id', node.id);
+        tr.setAttribute('data-group', curGroup);
         tr.innerHTML = `
             <td><input type="checkbox" class="chk-node" data-id="${esc(node.id)}" ${isSelected ? 'checked' : ''} onchange="toggleSelectNode(${inlineJsArg(node.id)})"></td>
             <td data-cell="status"><span class="status-indicator ${esc(node.status) || 'offline'}" title="${esc(statusTitle)}"></span></td>
@@ -1188,7 +1243,7 @@ function _nodeActionsHtml(node) {
     const esc = escapeHtml;
     const pinging = bulkProbeRunning || pendingProbeIds.has(node.id);
     return `
-        <div style="display:flex; gap:3px; justify-content:center;">
+        <div style="display:flex; gap:4px; justify-content:center; align-items:center; flex-wrap: nowrap;">
             <button class="btn-action" onclick="pingSingleNode(${inlineJsArg(node.id)})" data-probe-id="${esc(node.id)}" ${pinging ? 'disabled' : ''}>${pinging ? '测活中…' : L('PING')}</button>
             <button class="btn-action" onclick="openEditNodeModal(${inlineJsArg(node.id)})">${L('EDIT')}</button>
             <button class="btn-action" onclick="exportSingleNode(${inlineJsArg(node.id)})">${L('EXPORT')}</button>
@@ -1207,8 +1262,21 @@ function syncNodesTable() {
     if (nodes.length === 0 || rows.length !== nodes.length) { renderNodesTable(); return; }
     const rowById = Object.create(null);
     rows.forEach(r => { rowById[r.getAttribute('data-id')] = r; });
-    for (const n of nodes) {
-        if (!rowById[n.id]) { renderNodesTable(); return; } // 行集合变化，整体重建
+    const selectedGroup = document.getElementById('filter-group')?.value || 'ALL';
+    const isAllDisabledView = selectedGroup === '__DISABLED__';
+    const distinctGroups = isAllDisabledView ? new Set(nodes.map(n => n.group || '默认分组')) : new Set();
+    if (isAllDisabledView && distinctGroups.size > 1) {
+        nodes.sort((a, b) => (a.group || '默认分组').localeCompare(b.group || '默认分组', 'zh-CN'));
+    }
+    for (const [index, n] of nodes.entries()) {
+        if (!rowById[n.id] || rows[index].getAttribute('data-id') !== n.id ||
+            rows[index].getAttribute('data-group') !== (n.group || '默认分组')) {
+            renderNodesTable(); return;
+        }
+    }
+    const expectedHeaders = isAllDisabledView && distinctGroups.size > 1 ? distinctGroups.size : 0;
+    if (tbody.querySelectorAll('tr.group-header-row').length !== expectedHeaders) {
+        renderNodesTable(); return;
     }
     const esc = escapeHtml;
     nodes.forEach(n => {
@@ -1231,6 +1299,13 @@ function syncNodesTable() {
         }
         const trafficTd = tr.querySelector('td[data-cell="traffic"]');
         if (trafficTd) trafficTd.textContent = formatBytes((n.upTraffic || 0) + (n.downTraffic || 0));
+        const exitipTd = tr.querySelector('td[data-cell="exitip"]');
+        if (exitipTd) {
+            const newExitHtml = renderExitIp(n);
+            if (exitipTd.innerHTML !== newExitHtml) {
+                exitipTd.innerHTML = newExitHtml;
+            }
+        }
         if (statusChanged) {
             // 启用/停用按钮文案、停用徽标随状态重建；其余列不动
             const actTd = tr.querySelector('td[data-cell="actions"]');
@@ -1270,7 +1345,7 @@ async function exportSingleNode(nodeId) {
     if (!node) return;
     const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
     const exportType = document.getElementById('export-type-select') ? document.getElementById('export-type-select').value : 'converted';
-    const vpsIp = window.location.hostname || '127.0.0.1';
+    const vpsIp = getExportHost();
     const uriLines = exportNodeLines(node, vpsIp, protoSel, exportType);
     if (uriLines.length === 0) {
         showToast(`节点 [${node.name}] 没有可导出的原始链接`, 'warn');
@@ -1698,21 +1773,21 @@ async function reassignAllPorts() {
 }
 
 /** 按入口协议导出单个节点的链接（ss 入口 → ss://；mixed 入口 → socks5/http 按选择） */
+function getExportHost() {
+    return savedExportDomain || window.location.hostname || '127.0.0.1';
+}
+
 function exportLinkLines(node, vpsIp, protoSel) {
     const lines = [];
+    const host = vpsIp.includes(':') && !vpsIp.startsWith('[') ? `[${vpsIp}]` : vpsIp;
     if ((node.entryProto || 'mixed') === 'ss') {
         const pass = node.ssPass || node.authPass || 'relaypass';
-        let userinfo;
-        try {
-            userinfo = btoa('aes-256-gcm:' + pass).replace(/=/g, '');
-        } catch (e) {
-            // 密码含非 Latin1 字符时，用 encodeURIComponent 兼容
-            userinfo = btoa(unescape(encodeURIComponent('aes-256-gcm:' + pass))).replace(/=/g, '');
-        }
-        lines.push(`ss://${userinfo}@${vpsIp}:${node.port}#${encodeURIComponent(node.name || 'ss')}`);
+        const bytes = new TextEncoder().encode('aes-256-gcm:' + pass);
+        const userinfo = btoa(Array.from(bytes, b => String.fromCharCode(b)).join('')).replace(/=/g, '');
+        lines.push(`ss://${userinfo}@${host}:${node.port}#${encodeURIComponent(node.name || 'ss')}`);
         return lines;
     }
-    const base = `${node.authUser || 'user'}:${node.authPass || 'pass'}@${vpsIp}:${node.port}`;
+    const base = `${encodeURIComponent(node.authUser || 'user')}:${encodeURIComponent(node.authPass || 'pass')}@${host}:${node.port}`;
     if (protoSel !== 'http') lines.push(`socks5://${base}`);
     if (protoSel !== 'socks5') lines.push(`http://${base}`);
     return lines;
@@ -1730,34 +1805,32 @@ function exportNodeLines(node, vpsIp, protoSel, exportType) {
     return exportLinkLines(node, vpsIp, protoSel);
 }
 
-/** 导出页：按分组/类型/协议生成全部节点导出文本 */
-function generateExportText() {
-    const groupSel = document.getElementById('export-group-select') ? document.getElementById('export-group-select').value : 'ALL';
-    const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
-    const exportType = document.getElementById('export-type-select') ? document.getElementById('export-type-select').value : 'converted';
-    const vpsIp = window.location.hostname || '127.0.0.1';
-
-    const nodesToExport = nodeState.filter(n => groupSel === 'ALL' || n.group === groupSel);
-
+function buildNodeExportText(nodes, vpsIp, protoSel, exportType) {
     const lines = [];
-    nodesToExport.forEach(n => {
+    nodes.forEach(n => {
         const uriLines = exportNodeLines(n, vpsIp, protoSel, exportType);
         if (uriLines.length === 0) return;
-        lines.push(`# 节点: ${n.name.replace(/[\r\n]+/g, ' ')} | 协议: ${n.protocol} | 分组: ${(n.group || '').replace(/[\r\n]+/g, ' ')}${exportType === 'original' ? ' | 原始链接' : ''}`);
+        lines.push(`# 节点: ${(n.name || '').replace(/[\r\n]+/g, ' ')} | 协议: ${n.protocol} | 分组: ${(n.group || '').replace(/[\r\n]+/g, ' ')}${exportType === 'original' ? ' | 原始链接' : ''}`);
         lines.push(...uriLines);
         lines.push('');
     });
+    return lines.join('\n');
+}
 
+/** 导出页：按分组/类型/协议生成全部节点导出文本 */
+function generateExportText() {
+    const groupSel = document.getElementById('export-group-select')?.value || 'ALL';
+    const protoSel = document.getElementById('export-proto-select')?.value || 'both';
+    const exportType = document.getElementById('export-type-select')?.value || 'converted';
+    const nodesToExport = nodeState.filter(n => groupSel === 'ALL' || n.group === groupSel);
     const exportArea = document.getElementById('export-text-area');
-    if (exportArea) exportArea.value = lines.join('\n');
+    if (exportArea) exportArea.value = buildNodeExportText(nodesToExport, getExportHost(), protoSel, exportType);
 }
 
 /** 复制导出区内容到剪贴板 */
 async function copyExportText() {
     const exportArea = document.getElementById('export-text-area');
-    if (!exportArea || !exportArea.value) {
-        generateExportText();
-    }
+    if (!exportArea || !exportArea.value) generateExportText();
     if (exportArea && exportArea.value) return copyToClipboard(exportArea.value);
 }
 
@@ -1765,23 +1838,11 @@ async function exportSelectedNodes() {
     const targetNodes = selectedNodeIds.size > 0
         ? nodeState.filter(n => selectedNodeIds.has(n.id))
         : nodeState;
-
     const exportArea = document.getElementById('export-text-area');
     if (!exportArea) return;
-
-    const protoSel = document.getElementById('export-proto-select') ? document.getElementById('export-proto-select').value : 'both';
-    const exportType = document.getElementById('export-type-select') ? document.getElementById('export-type-select').value : 'converted';
-    const vpsIp = window.location.hostname || '127.0.0.1';
-
-    let text = '';
-    targetNodes.forEach(n => {
-        const uriLines = exportNodeLines(n, vpsIp, protoSel, exportType);
-        if (uriLines.length === 0) return;
-        text += `# 节点: ${n.name.replace(/[\r\n]+/g, ' ')} | 协议: ${n.protocol} | 分组: ${(n.group || '').replace(/[\r\n]+/g, ' ')}${exportType === 'original' ? ' | 原始链接' : ''}\n`;
-        text += uriLines.join('\n');
-        text += '\n\n';
-    });
-    exportArea.value = text;
+    const protoSel = document.getElementById('export-proto-select')?.value || 'both';
+    const exportType = document.getElementById('export-type-select')?.value || 'converted';
+    exportArea.value = buildNodeExportText(targetNodes, getExportHost(), protoSel, exportType);
     const exportNav = document.querySelector('.nav-item[data-target="export"]');
     if (exportNav) exportNav.click();
 }
@@ -2429,9 +2490,12 @@ document.addEventListener('input', markSettingsDirty);
 document.addEventListener('change', markSettingsDirty);
 
 async function loadSettings() {
+    const savedRevision = settingsSaveRevision;
     try {
         const r = await api('/api/settings');
         const s = await r.json();
+        if (savedRevision !== settingsSaveRevision) return;
+        savedExportDomain = s.exportDomain || '';
         // 周期加载不得销毁编辑中的卡片（包括尚未触发有效字段更新的输入）。
         const relayList = document.getElementById('relay-domain-list');
         const relayFocused = relayList && relayList.contains(document.activeElement);
@@ -2460,6 +2524,7 @@ async function loadSettings() {
         setVal('setting-probe-interval', s.probeInterval || 30);
         setVal('setting-log-level', s.logLevel || 'info');
         setVal('setting-listen-ip', s.listenIp || '0.0.0.0');
+        setVal('setting-export-domain', savedExportDomain);
         setVal('setting-test-url', s.testUrl || 'https://www.gstatic.com/generate_204');
         setVal('setting-reserved-ports', Array.isArray(s.reservedPorts) ? s.reservedPorts.join(', ') : (s.reservedPorts || ''));
 
@@ -2484,6 +2549,7 @@ async function saveSystemSettings() {
         probeInterval: parseInt(getVal('setting-probe-interval')) || 30,
         logLevel: getVal('setting-log-level') || 'info',
         listenIp: getVal('setting-listen-ip') || '0.0.0.0',
+        exportDomain: getVal('setting-export-domain').trim(),
         testUrl: getVal('setting-test-url') || 'https://www.gstatic.com/generate_204',
         reservedPorts: reservedPorts,
         stickyEnabled: getChk('setting-sticky-enabled'),
@@ -2501,12 +2567,19 @@ async function saveSystemSettings() {
             body: JSON.stringify(payload)
         });
         const data = await r.json().catch(() => ({}));
-        if (revision === settingsRevision) settingsDirty = false;
+        settingsSaveRevision++;
+        savedExportDomain = data.exportDomain ?? payload.exportDomain;
+        if (revision === settingsRevision) {
+            settingsDirty = false;
+            const field = document.getElementById('setting-export-domain');
+            if (field) field.value = savedExportDomain;
+        }
         if (data.configApplied === false) {
             addLog('WARN', `系统设置已保存，但配置未生效：${data.configMessage || ''}`);
             showToast(`设置已保存，但配置未生效：${data.configMessage || '请查看系统日志'}`, 'warn', 5000);
         } else {
-            addLog('SUCCESS', '系统设置保存成功，配置热重载已生效');
+            addLog('SUCCESS', data.configReloaded === false
+                ? '系统设置保存成功，无需重载内核' : '系统设置保存成功，配置热重载已生效');
             showToast('系统设置已应用');
         }
     } catch (e) {

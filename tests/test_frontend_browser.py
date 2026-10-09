@@ -436,3 +436,152 @@ def test_first_password_gate_does_not_start_data_or_sse(ui):
     assert not requests(state, "/api/config/status")
     assert page.locator("#pwd-modal").evaluate("el=>el.classList.contains('active')")
     assert page.evaluate("window.__streams.every(s=>s.closed)")
+
+
+def test_action_button_font_size_and_disabled_nodes_grouped_display(ui):
+    page, state = ui
+    page.locator('.nav-item[data-target="nodes"]').click()
+    # 1. 验证操作列按钮字体大小已放大（从8px提高至11px）
+    font_size = page.locator('#nodes-tbody .btn-action').first.evaluate(
+        "el => window.getComputedStyle(el).fontSize"
+    )
+    assert font_size == "11px"
+
+    # 2. 模拟多个不同分组的停用节点
+    state["nodes"].append(node("n4", "disabled", name="hk-dis", group="香港"))
+    state["nodes"].append(node("n5", "disabled", name="jp-dis", group="日本"))
+    page.evaluate("loadNodes()")
+
+    # 3. 验证下拉菜单中停用节点项包含全部及各子分组
+    options = page.locator("#filter-group option").all_inner_texts()
+    option_values = page.locator("#filter-group option").evaluate_all(
+        "opts => opts.map(o => o.value)"
+    )
+    assert "__DISABLED__" in option_values
+    assert "__DISABLED__:香港" in option_values
+    assert "__DISABLED__:日本" in option_values
+
+    # 4. 选择特定分组的停用节点，验证只展示该分组
+    page.locator("#filter-group").select_option("__DISABLED__:香港")
+    assert page.locator("#nodes-tbody tr[data-id]").count() == 1
+    assert page.locator("#nodes-tbody tr[data-id]").get_attribute("data-id") == "n4"
+
+    # 5. 选择全部停用节点，验证按分组展示分组隔断标题
+    page.locator("#filter-group").select_option("__DISABLED__")
+    assert page.locator("#nodes-tbody tr[data-id]").count() == 3
+    assert page.locator("#nodes-tbody tr.group-header-row").count() >= 2
+
+@pytest.mark.parametrize("entry_proto", ["mixed", "ss"])
+def test_all_export_paths_use_saved_domain_and_preserve_original(ui, entry_proto):
+    page, state = ui
+    original = "socks5://original:pass@upstream.test:40136#original"
+    state["nodes"] = [node("n1", entryProto=entry_proto, ssPass="secret", rawConfig={"uri": original}),
+                      node("n2", port=52002, entryProto=entry_proto, group="other")]
+    state["settings"]["exportDomain"] = "nodes.example.com"
+    page.evaluate("loadNodes()")
+    page.evaluate("loadSettings()")
+    page.locator('.nav-item[data-target="settings"]').click()
+    assert page.locator("#setting-export-domain").input_value() == "nodes.example.com"
+    page.evaluate("copyToClipboard = async () => true")
+    page.evaluate("exportSingleNode('n1')")
+    text = page.locator("#export-text-area").input_value()
+    assert "@nodes.example.com:52001" in text
+    assert ":52002" not in text
+    assert text.count("@nodes.example.com:") == (1 if entry_proto == "ss" else 2)
+    page.evaluate("selectedNodeIds = new Set(['n2']); exportSelectedNodes()")
+    text = page.locator("#export-text-area").input_value()
+    assert "@nodes.example.com:52002" in text
+    assert ":52001" not in text
+    page.evaluate("generateExportText()")
+    text = page.locator("#export-text-area").input_value()
+    assert "@nodes.example.com:52001" in text and "@nodes.example.com:52002" in text
+    page.locator("#export-type-select").select_option("original")
+    page.evaluate("generateExportText()")
+    text = page.locator("#export-text-area").input_value()
+    assert original in text
+    assert "nodes.example.com" not in text
+    page.evaluate("exportSingleNode('n1')")
+    assert original in page.locator("#export-text-area").input_value()
+    page.evaluate("selectedNodeIds = new Set(['n1']); exportSelectedNodes()")
+    assert original in page.locator("#export-text-area").input_value()
+
+
+def test_export_domain_drafts_failed_save_and_clear(ui):
+    page, state = ui
+    state["settings"]["exportDomain"] = "saved.example.com"
+    page.evaluate("loadSettings()")
+    page.locator('.nav-item[data-target="settings"]').click()
+    field = page.locator("#setting-export-domain")
+    field.fill("draft.example.com")
+    page.evaluate("loadSettings()")
+    assert field.input_value() == "draft.example.com"
+    assert page.evaluate("getExportHost()") == "saved.example.com"
+    state["responses"]["/api/settings"] = (422, {"detail": "invalid domain"})
+    page.evaluate("saveSystemSettings()")
+    assert page.evaluate("settingsDirty")
+    assert page.evaluate("getExportHost()") == "saved.example.com"
+    state["responses"].pop("/api/settings")
+    page.evaluate("saveSystemSettings()")
+    assert state["settings"]["exportDomain"] == "draft.example.com"
+    assert page.evaluate("getExportHost()") == "draft.example.com"
+    assert not page.evaluate("settingsDirty")
+    field.fill("")
+    page.evaluate("saveSystemSettings()")
+    assert state["settings"]["exportDomain"] == ""
+    assert page.evaluate("getExportHost()") == "aura.test"
+    page.evaluate("generateExportText()")
+    assert "@aura.test:52001" in page.locator("#export-text-area").input_value()
+
+
+def test_export_domain_normalized_save_skips_reload_message(ui):
+    page, state = ui
+    page.locator('.nav-item[data-target="settings"]').click()
+    field = page.locator("#setting-export-domain")
+    field.fill(" NODES.Example.COM. ")
+    state["responses"]["/api/settings"] = (200, {
+        "ok": True, "exportDomain": "nodes.example.com", "configApplied": True, "configReloaded": False})
+    page.evaluate("saveSystemSettings()")
+    assert page.evaluate("getExportHost()") == "nodes.example.com"
+    assert field.input_value() == "nodes.example.com"
+    assert page.evaluate("bgLogs.some(log=>log.includes('无需重载内核'))")
+    assert not requests(state, "/api/config/apply")
+
+
+def test_export_uri_credentials_ipv6_and_ss_utf8(ui):
+    page, _ = ui
+    data = {"port": 52001, "authUser": "u@:# /", "authPass": "p@:/?# %", "name": "sample"}
+    lines = page.evaluate("n=>exportLinkLines(n, '2001:db8::1', 'both')", data)
+    assert lines == [
+        "socks5://u%40%3A%23%20%2F:p%40%3A%2F%3F%23%20%25@[2001:db8::1]:52001",
+        "http://u%40%3A%23%20%2F:p%40%3A%2F%3F%23%20%25@[2001:db8::1]:52001",
+    ]
+    assert page.evaluate("n=>exportLinkLines(n, '[2001:db8::1]', 'socks5')", data) == lines[:1]
+    data.update(entryProto="ss", ssPass="caf\u00e9\u5bc6\u7801")
+    result = page.evaluate("n=>exportLinkLines(n, 'nodes.example.com', 'both')[0]", data)
+    import base64
+    encoded = result.split("ss://", 1)[1].split("@", 1)[0]
+    assert base64.b64decode(encoded + "=" * (-len(encoded) % 4)).decode() == "aes-256-gcm:" + data["ssPass"]
+    assert "@nodes.example.com:52001" in result
+
+
+def test_stale_settings_fetch_does_not_replace_saved_domain(ui):
+    page, _ = ui
+    page.locator('.nav-item[data-target="settings"]').click()
+    page.evaluate("""() => {
+        const originalApi = api;
+        window.__releaseSettings = null;
+        api = async (path, options = {}) => {
+            if (path === '/api/settings' && !options.method) {
+                return new Promise(resolve => { window.__releaseSettings = () => resolve({
+                    json: async () => ({exportDomain:'old.example.com'})
+                }); });
+            }
+            return originalApi(path, options);
+        };
+        window.__pendingSettings = loadSettings();
+    }""")
+    page.locator("#setting-export-domain").fill("new.example.com")
+    page.evaluate("saveSystemSettings()")
+    page.evaluate("window.__releaseSettings(); window.__pendingSettings")
+    assert page.evaluate("getExportHost()") == "new.example.com"
+    assert page.locator("#setting-export-domain").input_value() == "new.example.com"

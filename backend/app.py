@@ -3,7 +3,9 @@
 面板入口：http://<host>:19001/admin
 """
 import asyncio
+import ipaddress
 import os
+import re
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -387,10 +389,6 @@ async def get_exit_ip(node_id: str):
     if not ip:
         raise HTTPException(status_code=502, detail="出口 IP 探测失败")
     patch = {"exitIp": ip}
-    # 域名节点（动态 IP，如 kookeey）：出口 IP 仅用于情报查询，不固化 exitIp 保持域名
-    server = ((node.get("rawConfig") or {}).get("server") or "").strip()
-    if server and not scheduler._is_ip_address(server):
-        patch.pop("exitIp", None)
     # 异步查 IP 情报（ipinfo.io 归属地 + ipapi.is 纯净度评分），失败降级不阻塞
     try:
         import ipinfo
@@ -583,11 +581,37 @@ def get_settings():
     return s
 
 
+def _normalize_export_domain(value: str) -> str:
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="节点导出域名必须是字符串")
+    domain = value.strip().removesuffix(".")
+    if not domain:
+        if value.strip():
+            raise HTTPException(status_code=422, detail="节点导出域名格式无效")
+        return ""
+    try:
+        domain = domain.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        raise HTTPException(status_code=422, detail="节点导出域名格式无效")
+    labels = domain.split(".")
+    if (len(domain) > 253 or len(labels) < 2 or
+            any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels)):
+        raise HTTPException(status_code=422, detail="请填写裸域名，不含协议、端口或路径")
+    try:
+        ipaddress.ip_address(domain)
+    except ValueError:
+        return domain
+    raise HTTPException(status_code=422, detail="请填写域名而非 IP 地址")
+
+
 @app.put("/api/settings", dependencies=[Depends(require_auth)])
 async def put_settings(body: dict):
     # 运行时附加键（GET 响应增强，非持久化配置）不得写回 DB（P2-6：前端全量 PUT
     # 会把 relayExits 等每次 GET 附加的运行时数据持久化，脏数据累积）
     body.pop("relayExits", None)
+    if "exportDomain" in body:
+        body["exportDomain"] = _normalize_export_domain(body["exportDomain"])
     # testUrl 校验：sing-box clash API 对 http:// url 置空并回退 gstatic，探活测的不是
     # 配置的 URL → 强制 https://（否则所有节点探活失真，曾导致大量误停用）
     if body.get("testUrl"):
@@ -632,8 +656,22 @@ async def put_settings(body: dict):
             seen_ids.add(relay.id)
             seen_ports.add(relay.port)
         body["relayDomains"] = [models.RelayDomain.model_validate(d).model_dump() for d in domains]
+    previous = {k: v for k, v in cur.items() if k != "relayExits"}
+    if isinstance(previous.get("relayDomains"), list):
+        try:
+            previous["relayDomains"] = [models.RelayDomain.model_validate(d).model_dump()
+                                        for d in previous["relayDomains"]]
+        except ValueError:
+            pass  # A valid update must be able to replace malformed legacy data.
+    changed = {key for key in body.keys() | previous.keys()
+               if body.get(key) != previous.get(key)}
     db.set_setting("system", body)
-    # 同步 relay_domains 表（供后端查询用）
+    # Export-only changes never affect the running proxy core. Unchanged PUTs
+    # still apply config so a previously failed reload can be retried.
+    if changed == {"exportDomain"}:
+        return {"ok": True, "configApplied": True, "configReloaded": False,
+                "configMessage": "节点导出域名已保存，无需重载内核",
+                "exportDomain": body.get("exportDomain", "")}
     if isinstance(body.get("relayDomains"), list):
         db.upsert_relay_domains(body["relayDomains"])
     # 设置/域名变更后自动重生成并热重载 sing-box（新域名入口立即生效）
@@ -645,7 +683,9 @@ async def put_settings(body: dict):
     return {
         "ok": True,
         "configApplied": bool(applied.get("ok")),
+        "configReloaded": bool(applied.get("ok")),
         "configMessage": applied.get("message", ""),
+        "exportDomain": body.get("exportDomain", ""),
     }
 
 

@@ -602,9 +602,9 @@
         .data-table tbody tr td:first-child { padding-left: 10px; }
         .data-table tbody tr td:last-child { padding-right: 10px; }
         .data-table .btn-action {
-            padding: 2px 4px;
-            font-size: 8px;
-            letter-spacing: 0.5px;
+            padding: 2px 6px;
+            font-size: 11px;
+            letter-spacing: 0;
             line-height: 1.4;
             white-space: nowrap;
         }
@@ -722,12 +722,12 @@
             background: rgba(200, 154, 154, 0.1);
         }
         .btn-action {
-            font-size: 10px;
+            font-size: 11px;
             color: var(--fg);
-            opacity: 0.5;
+            opacity: 0.75;
             cursor: pointer;
-            letter-spacing: 1px;
-            transition: color 0.2s;
+            letter-spacing: 0.5px;
+            transition: color 0.2s, opacity 0.2s;
             background: none;
             border: none;
             font-family: inherit;
@@ -1128,7 +1128,7 @@
                                 <th style="width: 112px;">IP 质量</th>
                                 <th style="width: 56px;">延迟</th>
                                 <th style="width: 70px;">流量</th>
-                                <th style="width: 156px; text-align: center;">操作</th>
+                                <th style="width: 188px; text-align: center;">操作</th>
                             </tr>
                         </thead>
                         <tbody id="nodes-tbody">
@@ -1482,6 +1482,11 @@
                             <label class="form-label">自动延迟探活 URL</label>
                             <input type="text" id="setting-test-url" class="form-input" value="https://www.gstatic.com/generate_204">
                         </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="setting-export-domain">节点导出域名</label>
+                        <input type="text" id="setting-export-domain" class="form-input" placeholder="nodes.example.com" autocomplete="off" spellcheck="false" maxlength="253">
+                        <div style="font-size:11px; color:var(--fg); opacity:0.65; margin-top:6px;">保存后，单节点、批量和导出页的中转链接统一使用此域名，端口及账号不变；留空使用面板访问地址。填写裸域名，不含协议、端口或路径。请将 A/AAAA 记录解析到中转服务器，使用仅 DNS 模式；此设置不会创建 DNS 记录，也不会修改原始节点链接。</div>
                     </div>
                 </div>
 

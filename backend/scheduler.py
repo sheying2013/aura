@@ -39,9 +39,8 @@ def _is_ip_address(s: str) -> bool:
 async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
     """经节点自身代理查真实出口 IP。
 
-    - mixed entry（socks5 入口）：经 inbound socks5 代理请求 api.ipify.org
-    - ss entry（Shadowsocks 入口）：无 SOCKS5 握手协议——单跳 ss 落地节点
-      server 域名解析 IP 即出口（如 kookeey.info 系），直接 DNS 解析 rawConfig.server。
+    - mixed entry（socks5/http 入口）：经 inbound socks5 代理请求出口 IP 探测接口
+    - ss entry（Shadowsocks 入口）：若 rawConfig.server 存在且为 IP，直接使用；若是域名尝试 DNS 解析兜底
     """
     port = node.get("port")
     user = node.get("authUser") or "user"
@@ -53,67 +52,105 @@ async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
 
     def _run() -> Optional[str]:
         import socket
-        # ss entry：Shadowsocks 无 SOCKS5 握手，单跳节点 server 即出口
+        import re
+        import ipaddress
+
+        def _recv_exact(sock, size: int) -> bytes:
+            data = bytearray()
+            while len(data) < size:
+                chunk = sock.recv(size - len(data))
+                if not chunk:
+                    raise OSError("SOCKS5 响应提前结束")
+                data.extend(chunk)
+            return bytes(data)
         if entry == "ss":
             server = ((node.get("rawConfig") or {}).get("server") or "").strip()
             if not server:
                 return None
             try:
-                return socket.gethostbyname(server)  # 域名 → 出口 IP
+                return socket.gethostbyname(server)
             except Exception:
                 return None
-        # mixed entry：SOCKS5 握手 → HTTP GET api.ipify.org
-        try:
-            # 构造 socks5 代理请求：手工 SOCKS5 握手 → HTTP GET api.ipify.org
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect(("127.0.0.1", int(port)))
-            # SOCKS5 握手 (no auth)
-            s.send(b"\x05\x01\x00")
-            resp = s.recv(2)
-            if resp != b"\x05\x00":
-                # try user/pass auth
-                s.close()
+
+        # mixed entry: 经本机入站 SOCKS5 代理查询公网出口 IP
+        endpoints = [
+            ("api.ipify.org", 80, b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n"),
+            ("icanhazip.com", 80, b"GET / HTTP/1.0\r\nHost: icanhazip.com\r\nConnection: close\r\n\r\n"),
+        ]
+        for host_str, host_port, req_bytes in endpoints:
+            s = None
+            try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
+                s.settimeout(6)
                 s.connect(("127.0.0.1", int(port)))
-                s.send(b"\x05\x01\x02")
-                resp = s.recv(2)
-                if resp != b"\x05\x02":
-                    s.close()
-                    return None
-                ubytes = user.encode()
-                pbytes = passwd.encode()
-                s.send(b"\x01" + bytes([len(ubytes)]) + ubytes + bytes([len(pbytes)]) + pbytes)
-                auth_resp = s.recv(2)
-                if auth_resp != b"\x01\x00":
-                    s.close()
-                    return None
-            # SOCKS5 CONNECT to api.ipify.org:80
-            host = b"api.ipify.org"
-            s.send(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + b"\x00\x50")
-            conn_reply = s.recv(10)  # connection reply
-            if len(conn_reply) < 2 or conn_reply[1] != 0x00:
-                s.close()
-                return None
-            # HTTP GET
-            s.send(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\n\r\n")
-            data = b""
-            while True:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-            s.close()
-            # parse HTTP response
-            parts = data.split(b"\r\n\r\n", 1)
-            if len(parts) == 2:
-                ip = parts[1].strip().decode()
-                if ip and len(ip) < 50 and not ip.startswith("<"):
-                    return ip
-            return None
-        except Exception:
-            return None
+
+                # SOCKS5 握手：声明支持 0x00(无认证) 与 0x02(账号密码认证)
+                s.sendall(b"\x05\x02\x00\x02")
+                auth_choice = _recv_exact(s, 2)
+                if auth_choice[0] != 0x05:
+                    continue
+                if auth_choice[1] == 0x02:
+                    ub = (user or "").encode()
+                    pb = (passwd or "").encode()
+                    s.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
+                    auth_res = _recv_exact(s, 2)
+                    if auth_res[1] != 0x00:
+                        continue
+                elif auth_choice[1] != 0x00:
+                    continue
+
+                # SOCKS5 CONNECT 目标地址
+                hb = host_str.encode()
+                s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + host_port.to_bytes(2, "big"))
+
+                # 读取 CONNECT 响应头（严格按照 RFC 1928 消费完整响应，防污染后续 HTTP 流）
+                hdr = _recv_exact(s, 4)
+                if hdr[1] != 0x00 or hdr[2] != 0x00:
+                    continue
+                atyp = hdr[3]
+                if atyp == 0x01:  # IPv4
+                    _recv_exact(s, 6)
+                elif atyp == 0x03:  # Domain
+                    dlen = _recv_exact(s, 1)[0]
+                    _recv_exact(s, dlen + 2)
+                elif atyp == 0x04:  # IPv6
+                    _recv_exact(s, 18)
+                else:
+                    continue
+
+                # 发送 HTTP 请求并读取响应
+                s.sendall(req_bytes)
+                buf = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if len(buf) > 65536:
+                        break
+                    if b"\r\n\r\n" in buf and len(buf.split(b"\r\n\r\n", 1)[1]) >= 7:
+                        break
+
+                parts = buf.split(b"\r\n\r\n", 1)
+                if len(parts) == 2:
+                    body = parts[1].strip().decode(errors="ignore")
+                    m = re.search(r"\b([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\b", body)
+                    if m:
+                        candidate = m.group(1)
+                        try:
+                            ipaddress.ip_address(candidate)
+                        except ValueError:
+                            continue
+                        return candidate
+            except Exception:
+                pass
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+        return None
 
     return await _aio.to_thread(_run)
 
@@ -122,21 +159,17 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
     """探活成功后惰性补查出口 IP 情报（归属地/评分 + ippure/ping0 风控值），已齐全则跳过。
 
     节点 exitIp 为空/N/A/1.1.1.1（新导入未查过出口）时，先经节点自身代理查真实出口 IP
-    并落库，再补情报——否则探活永远触发不了 IP 质量数据（原逻辑直接 return 是根因）。
+    并落库，再补情报——保证任何节点（无论 IP 还是域名）都能在前端正确展示实际出口 IP。
     """
     ip = node.get("exitIp")
     nid = node["id"]
-    # 节点 server 是域名（动态 IP，如 kookeey）→ exitIp 保持域名；解析 IP 仅临时查情报
-    server = ((node.get("rawConfig") or {}).get("server") or "").strip()
-    domain_server = bool(server) and not _is_ip_address(server)
     if not ip or ip in ("N/A", "1.1.1.1"):
         ip = None  # 需先查出口 IP
-    # exitIp 存的是 hostname（如 rooster465.autos）→ ipinfo 对 hostname 的
-    # country 解析常失败 → 视为无效 IP，重新通过代理查真实 IP
+    # exitIp 存的是 hostname（如 rooster465.autos）→ 视为无效 IP，重新通过代理查真实 IP
     if ip and not _is_ip_address(ip):
         ip = None
-    # 情报已齐全（域名节点同样适用：之前已用解析 IP 查过 type/risk）→ 跳过
-    if (ip or domain_server) and node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
+    # 情报已齐全：必须具有有效真实出口 IP，且国家、类型和风控值均齐全才跳过
+    if ip and node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
         return  # 情报已齐全
     if nid in _ip_enrich_pending:
         return
@@ -148,9 +181,6 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
     async def _do() -> None:
         cur_ip = ip  # 闭包捕获外层 ip（内层不重新赋值，避免 UnboundLocalError）
         try:
-            # server 是域名（动态 IP）→ exitIp 保持域名不固化；解析 IP 仅临时查情报
-            server = ((node.get("rawConfig") or {}).get("server") or "").strip()
-            domain_server = bool(server) and not _is_ip_address(server)
             # 无出口 IP → 经节点自身代理查询（探活已确认在线，代理应可达）
             if not cur_ip:
                 async with _ip_enrich_sem:
@@ -158,29 +188,31 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
                 if not fetched:
                     return
                 cur_ip = fetched
-                # 域名节点：临时解析 IP 不写 exitIp（动态 IP 固化会过期）
-                if not domain_server:
-                    db.update_node(nid, {"exitIp": cur_ip})
+                # 无论节点 server 是 IP 还是域名，真实出口 IP 都必须落库
+                db.update_node(nid, {"exitIp": cur_ip})
+            import ipinfo
+            online = []
+            target = None
+            if node.get("exitRisk") is None:
+                online = [n for n in db.list_nodes()
+                          if n.get("status") == "online"
+                          and (n.get("entryProto") or "mixed") == "mixed"]
+                target = next((n for n in online if n["id"] == nid), None)
             async with _ip_enrich_sem:
-                import ipinfo
-                info = await asyncio.to_thread(ipinfo.lookup, cur_ip)
+                jobs = [asyncio.to_thread(ipinfo.lookup, cur_ip)]
+                if target:
+                    jobs.append(asyncio.to_thread(ipinfo.lookup_ippure, [target]))
+                values = await asyncio.gather(*jobs, return_exceptions=True)
+            info = values[0] if isinstance(values[0], dict) else {}
             patch = {k: info[k] for k in
                      ("exitCountry", "exitFlag", "exitCity", "exitType", "exitScore")
                      if k in info}
+            patch["exitIp"] = cur_ip
             # 风控值：优先 ippure（fraudScore，无验证稳定），失败再 ping0
             if node.get("exitRisk") is None:
                 try:
                     async with _ip_enrich_sem:
-                        online = [n for n in db.list_nodes()
-                                  if n.get("status") == "online"
-                                  and (n.get("entryProto") or "mixed") == "mixed"]
-                        target = next((n for n in online if n["id"] == nid), None)
-                        ipr = {}
-                        if target:
-                            try:
-                                ipr = await asyncio.to_thread(ipinfo.lookup_ippure, [target])
-                            except Exception:
-                                ipr = {}
+                        ipr = values[1] if len(values) > 1 and isinstance(values[1], dict) else {}
                     if ipr.get("exitIp") == cur_ip and ipr.get("exitRisk") is not None:
                         patch["exitRisk"] = ipr["exitRisk"]
                     else:
@@ -214,7 +246,8 @@ _guard_paused = False
 # 后台弱探活需要完整观察期；仅自动停用，节点数据由用户决定是否删除。
 DISABLE_AFTER_FAILS = 20  # 连续失败 ≥20 次（约 20 轮×60s）→ 结合窗口存活率判停用
 MIN_FAILURE_SECONDS = 20 * 60  # 后台连续失败至少持续 20 分钟，避免短周期误停
-PROBE_CONCURRENCY = 16    # 探活并发上限（降低对 clash API 的瞬时压力，减少超时误判）
+PROBE_CONCURRENCY = 16    # 后台探活并发上限（降低对 Clash API 的瞬时压力）
+MANUAL_PROBE_CONCURRENCY = 32  # 手动探活独立并发，缩短批量节点等待，不改变后台节奏
 _probe_running = False  # 探活进行中标记（P1-2 防并发重叠）
 PROBE_DELAY_RETRY = 2     # 每轮 delay 失败重试次数（共 3 次机会，进一步吸收抖动）
 
@@ -345,7 +378,8 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
 
     if not nodes:
         return skipped
-    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
+    probe_limit = MANUAL_PROBE_CONCURRENCY if manual else PROBE_CONCURRENCY
+    sem = asyncio.Semaphore(probe_limit)
     async with httpx.AsyncClient(timeout=10.0) as probe_client:
         async def _probe_limited(n: Dict[str, Any]) -> Dict[str, Any]:
             async with sem:

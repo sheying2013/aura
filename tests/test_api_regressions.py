@@ -2,7 +2,7 @@
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -115,6 +115,103 @@ def test_invalid_relay_settings_do_not_overwrite_data(api_client, monkeypatch):
     assert response.status_code == 200
     assert db.list_relay_domains() == []
 
+
+
+
+@pytest.mark.parametrize("value, expected", [
+    (" Nodes.Example.COM. ", "nodes.example.com"),
+    ("\u8282\u70b9.example.com", "xn--3px729a.example.com"),
+    ("n-1.example.com", "n-1.example.com"),
+    ("   ", ""),
+])
+def test_export_domain_round_trip_without_core_reload(api_client, monkeypatch, value, expected):
+    db.set_setting("auth", {"password_hash": auth.hash_password("admin"),
+                            "password_change_required": False})
+    relay = {"id": "r1", "domain": "relay.test", "port": 33440}
+    old = {"relayDomains": [relay], "exportDomain": "old.example.com", "autoRefresh": False}
+    db.set_setting("system", old)
+    db.upsert_relay_domains([relay])
+    headers = {"Authorization": "Bearer " + login(api_client)["token"]}
+    applied = AsyncMock()
+    upsert = Mock(wraps=db.upsert_relay_domains)
+    monkeypatch.setattr(app.config_manager, "apply_config", applied)
+    monkeypatch.setattr(db, "upsert_relay_domains", upsert)
+    response = api_client.put("/api/settings", headers=headers,
+                              json={**old, "exportDomain": value, "relayExits": {"r1": "runtime"}})
+    assert response.status_code == 200
+    assert response.json()["exportDomain"] == expected
+    assert response.json()["configReloaded"] is False
+    assert response.json()["configApplied"] is True
+    assert db.get_setting("system")["exportDomain"] == expected
+    assert db.get_setting("system")["autoRefresh"] is False
+    assert "relayExits" not in db.get_setting("system")
+    monkeypatch.setattr(app, "_relay_current_exits", lambda: {})
+    assert api_client.get("/api/settings", headers=headers).json()["exportDomain"] == expected
+    assert [r["id"] for r in db.list_relay_domains()] == ["r1"]
+    applied.assert_not_awaited()
+    upsert.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [
+    None, 123, [], {}, ".", "nodes..test", "https://nodes.test", "nodes.test:443",
+    "nodes.test/path", "u@nodes.test", "nodes.test?x=1", "nodes.test#x",
+    "-nodes.test", "nodes-.test", "nodes_test.example", "nodes.test\nother.test",
+    "localhost", "127.0.0.1", "[2001:db8::1]", "a" * 64 + ".test",
+    ".".join(["a" * 63] * 4),
+])
+def test_invalid_export_domain_does_not_persist(api_client, monkeypatch, value):
+    db.set_setting("auth", {"password_hash": auth.hash_password("admin"),
+                            "password_change_required": False})
+    old = {"exportDomain": "old.example.com", "logLevel": "info"}
+    db.set_setting("system", old)
+    headers = {"Authorization": "Bearer " + login(api_client)["token"]}
+    applied = AsyncMock()
+    monkeypatch.setattr(app.config_manager, "apply_config", applied)
+    response = api_client.put("/api/settings", headers=headers,
+                              json={"exportDomain": value, "logLevel": "debug"})
+    assert response.status_code == 422
+    assert db.get_setting("system") == old
+    applied.assert_not_awaited()
+
+
+def test_export_domain_partial_update_and_core_changes(api_client, monkeypatch):
+    db.set_setting("auth", {"password_hash": auth.hash_password("admin"),
+                            "password_change_required": False})
+    db.set_setting("system", {"exportDomain": "old.example.com", "logLevel": "info"})
+    headers = {"Authorization": "Bearer " + login(api_client)["token"]}
+    applied = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(app.config_manager, "apply_config", applied)
+    response = api_client.put("/api/settings", headers=headers,
+                              json={"exportDomain": "new.example.com"})
+    assert response.status_code == 200
+    applied.assert_not_awaited()
+    assert db.get_setting("system")["logLevel"] == "info"
+    response = api_client.put("/api/settings", headers=headers, json={"logLevel": "debug"})
+    assert response.status_code == 200
+    assert response.json()["configReloaded"] is True
+    applied.assert_awaited_once()
+    assert db.get_setting("system")["exportDomain"] == "new.example.com"
+    applied.reset_mock()
+    response = api_client.put("/api/settings", headers=headers,
+                              json={"exportDomain": "", "logLevel": "warn"})
+    assert response.status_code == 200
+    applied.assert_awaited_once()
+    assert db.get_setting("system")["exportDomain"] == ""
+
+
+def test_unchanged_settings_retry_failed_config_apply(api_client, monkeypatch):
+    db.set_setting("auth", {"password_hash": auth.hash_password("admin"),
+                            "password_change_required": False})
+    db.set_setting("system", {"exportDomain": "nodes.example.com", "logLevel": "debug"})
+    headers = {"Authorization": "Bearer " + login(api_client)["token"]}
+    applied = AsyncMock(side_effect=[{"ok": False, "message": "retry later"}, {"ok": True}])
+    monkeypatch.setattr(app.config_manager, "apply_config", applied)
+    response = api_client.put("/api/settings", headers=headers, json={"logLevel": "debug"})
+    assert response.status_code == 200
+    assert response.json()["configApplied"] is False
+    response = api_client.put("/api/settings", headers=headers, json={"logLevel": "debug"})
+    assert response.json()["configApplied"] is True
+    assert applied.await_count == 2
 
 
 def test_shutdown_cancels_background_tasks(monkeypatch, tmp_path):
