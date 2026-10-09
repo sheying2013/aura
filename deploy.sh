@@ -72,6 +72,9 @@ docker rm -f "$CONTAINER" 2>/dev/null || true
 # 直接监听宿主机，无需为每个端口手动映射；任意新增 relay 域名端口即时生效
 docker run -d --name "$CONTAINER" \
   --network host \
+  --log-driver json-file \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
   -v "$DATA_DIR:/app/backend/data" \
   --restart unless-stopped \
   "$IMAGE"

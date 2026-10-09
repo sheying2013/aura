@@ -26,6 +26,8 @@ DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 CONFIG_BAK_PATH = os.path.join(DATA_DIR, "config.json.bak")
 LOG_PATH = os.path.join(DATA_DIR, "singbox.log")
+LOG_MAX_BYTES = 50 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 CLASH_HOST = "127.0.0.1"
 # 不用 9090（与其他面板/服务冲突常见），选 9095 避开常见占用；
 # 面板设置里的 clashPort 可覆盖（sing-box external_controller 端口必须与探活一致）
@@ -155,6 +157,7 @@ def _begin_operation() -> None:
     global _operation_generation
     _operation_generation += 1
 _logf = None  # sing-box 日志文件句柄，避免 fd 泄漏
+_log_task: Optional[asyncio.Task] = None  # 将 sing-box stdout/stderr 写入轮转文件
 _wait_task: Optional[asyncio.Task] = None  # 收割子进程的 wait() 任务
 
 
@@ -597,6 +600,62 @@ def is_running() -> bool:
         return False
 
 
+async def _log_reader(reader: asyncio.StreamReader) -> None:
+    """把 sing-box 输出写入有上限的日志文件，避免磁盘被持续输出打满。"""
+    global _logf
+    try:
+        while True:
+            chunk = await reader.read(64 * 1024)
+            if not chunk:
+                return
+            if _logf is None:
+                continue
+            try:
+                _logf.write(chunk)
+                if _logf.tell() >= LOG_MAX_BYTES:
+                    _rotate_log()
+            except OSError:
+                pass
+    except asyncio.CancelledError:
+        raise
+
+
+def _open_log() -> None:
+    global _logf
+    os.makedirs(DATA_DIR, exist_ok=True)
+    # 历史版本可能已经留下超大日志，启动时直接截断当前文件，不保留超大旧副本。
+    try:
+        if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+            with open(LOG_PATH, "wb"):
+                pass
+    except OSError:
+        pass
+    _logf = open(LOG_PATH, "ab", buffering=0)
+
+
+def _rotate_log() -> None:
+    global _logf
+    if _logf is None:
+        return
+    try:
+        _logf.flush()
+        _logf.close()
+        _logf = None
+        for index in range(LOG_BACKUP_COUNT - 1, 0, -1):
+            source = f"{LOG_PATH}.{index}"
+            target = f"{LOG_PATH}.{index + 1}"
+            if os.path.exists(source):
+                os.replace(source, target)
+        if os.path.exists(LOG_PATH):
+            os.replace(LOG_PATH, f"{LOG_PATH}.1")
+        _logf = open(LOG_PATH, "ab", buffering=0)
+    except OSError:
+        try:
+            _logf = open(LOG_PATH, "ab", buffering=0)
+        except OSError:
+            _logf = None
+
+
 async def _reap_proc() -> None:
     """收割 sing-box 子进程并打印退出信息。
 
@@ -631,7 +690,7 @@ async def start() -> bool:
 
 async def _start_unlocked() -> bool:
     """无锁内核版 start（调用方需已持 _op_lock）。"""
-    global _proc, _started_at, _logf, _wait_task
+    global _proc, _started_at, _logf, _log_task, _wait_task
     if is_running():
         return True
     cfg = CONFIG_PATH
@@ -648,19 +707,21 @@ async def _start_unlocked() -> bool:
     ok, _ = await asyncio.to_thread(check_config, data)
     if not ok:
         return False
-    os.makedirs(DATA_DIR, exist_ok=True)
-    # 关闭旧句柄避免 fd 泄漏
-    if _logf is not None:
-        try:
+    _open_log()
+    try:
+        _proc = await asyncio.create_subprocess_exec(
+            SINGBOX_BIN, "run", "-c", cfg, "-D", DATA_DIR,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+    except Exception:
+        if _logf is not None:
             _logf.close()
-        except Exception:
-            pass
-    _logf = open(LOG_PATH, "a")
-    _proc = await asyncio.create_subprocess_exec(
-        SINGBOX_BIN, "run", "-c", cfg, "-D", DATA_DIR,
-        stdout=_logf, stderr=_logf,
-    )
+            _logf = None
+        raise
     _started_at = time.time()
+    # 通过 PIPE 读取并轮转日志；直接把文件句柄交给子进程无法在运行中轮转。
+    if _proc.stdout is not None:
+        _log_task = asyncio.create_task(_log_reader(_proc.stdout))
     # 关键：spawn 收割任务——asyncio 的 Process.returncode 不调用 wait() 永远不会更新，
     # 崩溃守护靠这个任务感知进程退出，否则 sing-box 死后守护会永远以为它活着。
     _wait_task = asyncio.create_task(_reap_proc())
@@ -680,7 +741,7 @@ async def stop() -> None:
 
 async def _stop_unlocked() -> None:
     """无锁内核版 stop（调用方需已持 _op_lock，如 _apply_config_impl 内）。"""
-    global _proc, _logf, _wait_task
+    global _proc, _logf, _log_task, _wait_task
     if _proc is not None:
         try:
             _proc.send_signal(signal.SIGTERM)
@@ -698,6 +759,13 @@ async def _stop_unlocked() -> None:
             except (asyncio.CancelledError, Exception):
                 pass
             _wait_task = None
+        if _log_task is not None:
+            _log_task.cancel()
+            try:
+                await _log_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            _log_task = None
         _proc = None
         # 关闭日志句柄避免 fd 泄漏
         if _logf is not None:
