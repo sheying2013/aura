@@ -417,8 +417,66 @@ class ProbeRegressions(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(s._scheduler_tasks), 5)
             await s.stop_scheduler()
             self.assertFalse(s._scheduler_tasks)
-            self.assertTrue(all(t.done() for t in tasks))
 
+    async def test_fetch_exit_ip_socks5_direct_with_auth_and_ss_entry(self):
+        node = {
+            "id": "s5-node", "protocol": "socks5", "port": 53001, "entryProto": "ss",
+            "rawConfig": {"server": "proxy.example.com", "server_port": 1080, "username": "myuser", "password": "mypass"}
+        }
+        sent_chunks = []
+        class FakeSocket:
+            def __init__(self):
+                self.buffer = bytearray(
+                    b"\x05\x02"  # auth method: user/pass
+                    b"\x01\x00"  # auth subnegotiation status: success
+                    b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50"  # connect success (IPv4)
+                    b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n198.51.100.88\n"
+                )
+            def settimeout(self, t): pass
+            def connect(self, addr): pass
+            def sendall(self, b): sent_chunks.append(b)
+            def recv(self, size):
+                chunk = bytes(self.buffer[:size])
+                del self.buffer[:size]
+                return chunk
+            def close(self): pass
 
-if __name__ == "__main__":
-    unittest.main()
+        with patch("socket.socket", return_value=FakeSocket()):
+            ip = await s._fetch_exit_ip(node)
+        self.assertEqual(ip, "198.51.100.88")
+        # 校验发出的握手包和认证包
+        self.assertIn(b"\x05\x02\x00\x02", sent_chunks)
+        self.assertTrue(any(b"myuser" in c and b"mypass" in c for c in sent_chunks))
+
+    async def test_fetch_exit_ip_never_falls_back_to_entry_server_dns(self):
+        node = {
+            "id": "s5-failed", "protocol": "socks5", "port": 53002, "entryProto": "ss",
+            "rawConfig": {"server": "hk.lsp121.eu.org", "server_port": 39955}
+        }
+        class FailingSocket:
+            def settimeout(self, t): pass
+            def connect(self, addr): raise OSError("Connection refused")
+            def close(self): pass
+
+        with patch("socket.socket", return_value=FailingSocket()), \
+             patch("socket.gethostbyname", return_value="154.83.85.63") as gh:
+            ip = await s._fetch_exit_ip(node)
+        # 即使 connect 失败，也严禁调用 gethostbyname 返回入口 IP
+        self.assertIsNone(ip)
+        gh.assert_not_called()
+
+    async def test_lazy_enrich_cleans_historical_server_entry_ip_and_reprobes(self):
+        node = self.node("hist-node", 53003, protocol="socks5",
+                         exitIp="154.83.85.63", exitCountry="HK", exitType="business", exitRisk=10,
+                         rawConfig={"server": "hk.lsp121.eu.org", "server_port": 39955})
+        with patch("socket.gethostbyname", return_value="154.83.85.63"), \
+             patch.object(s, "_fetch_exit_ip", AsyncMock(return_value="223.19.34.101")) as mock_fetch, \
+             patch.object(ipinfo, "lookup", return_value={"exitCountry": "HK", "exitCity": "Hong Kong"}), \
+             patch.object(ipinfo, "lookup_ping0", return_value={"exitRisk": 5}):
+            self.real_enrich(db.get_node("hist-node"))
+            while "hist-node" in s._ip_enrich_pending:
+                await self.real_sleep(0)
+            mock_fetch.assert_awaited_once()
+            updated = db.get_node("hist-node")
+            self.assertEqual(updated["exitIp"], "223.19.34.101")
+

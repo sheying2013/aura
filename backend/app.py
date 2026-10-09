@@ -380,7 +380,8 @@ async def get_exit_ip(node_id: str):
     node = db.get_node(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
-    if not config_manager.is_running():
+    proto = (node.get("protocol") or "").lower()
+    if proto not in ("socks5", "socks", "http") and not config_manager.is_running():
         raise HTTPException(status_code=409, detail="sing-box 未运行")
     port = node["port"]
     user = node.get("authUser") or "user"
