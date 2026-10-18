@@ -10,7 +10,7 @@ import base64
 import ipaddress
 import re
 import socket
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import subs_proxy
 from utils import safe_int
@@ -26,6 +26,16 @@ MIN_BODY = 7  # 短 IPv4 串长度，够用即可提前结束读取
 _TARGETS: Tuple[str, ...] = ("api.ipify.org", "icanhazip.com")
 
 _IPV4_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+
+
+class ProbeAttempt(NamedTuple):
+    """一次探测的结果：ip 为 None 时 reason 说明是哪个环节断的。
+
+    原因取值：native_unsupported / native_endpoint_missing / native_dial_failed /
+    inbound_disabled / inbound_port_invalid / inbound_dial_failed；组合结果用 "+" 连接。
+    """
+    ip: Optional[str]
+    reason: str
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -155,39 +165,77 @@ def _close(sock: Optional[socket.socket]) -> None:
         pass
 
 
-def _probe_native(node: Dict[str, Any]) -> Optional[str]:
+def _probe_native_attempt(node: Dict[str, Any]) -> ProbeAttempt:
     """按节点原生代理协议直连探测（不经过本地 sing-box 入站）。"""
     proto = (node.get("protocol") or "").lower()
     if proto not in NATIVE_PROXY_PROTOS:
-        return None
+        return ProbeAttempt(None, "native_unsupported")
     endpoint = subs_proxy.proxy_endpoint(node)
     if not endpoint:
-        return None
+        return ProbeAttempt(None, "native_endpoint_missing")
     dial = _dial_http if proto == "http" else _dial_socks5
     for target in _TARGETS:
         ip = dial(endpoint.host, endpoint.port, endpoint.username, endpoint.password, target)
         if ip:
-            return ip
-    return None
+            return ProbeAttempt(ip, "")
+    return ProbeAttempt(None, "native_dial_failed")
 
 
-def _probe_inbound(node: Dict[str, Any]) -> Optional[str]:
+def _probe_inbound_attempt(node: Dict[str, Any]) -> ProbeAttempt:
     """经本地 sing-box mixed 入站探测（原生代理探测失败或不适用时的兜底）。"""
+    if (node.get("entryProto") or "mixed") != "mixed":
+        return ProbeAttempt(None, "inbound_disabled")
     port = safe_int(node.get("port"))
-    if (node.get("entryProto") or "mixed") != "mixed" or not 1 <= port <= 65535:
-        return None
+    if not 1 <= port <= 65535:
+        return ProbeAttempt(None, "inbound_port_invalid")
     user = node.get("authUser") or "user"
     passwd = node.get("authPass") or "pass"
     for target in _TARGETS:
         ip = _dial_socks5("127.0.0.1", port, user, passwd, target)
         if ip:
-            return ip
-    return None
+            return ProbeAttempt(ip, "")
+    return ProbeAttempt(None, "inbound_dial_failed")
+
+
+def probe_attempt(node: Dict[str, Any]) -> ProbeAttempt:
+    """先按原生协议直连，失败再走本地入站兜底，并带回断在哪一环。"""
+    native = _probe_native_attempt(node)
+    if native.ip:
+        return native
+    inbound = _probe_inbound_attempt(node)
+    if inbound.ip:
+        return inbound
+    return ProbeAttempt(None, native.reason + "+" + inbound.reason)
+
+
+def diagnose(node: Dict[str, Any]) -> str:
+    """结构性诊断：不发网络，回答「这个节点为什么根本探测不出出口 IP」。
+
+    返回空串表示至少存在一条可用路径；否则给出人类可读原因，让上层失败响应
+    能说清楚是协议不支持、端点缺失，还是混合入站不可用，而不是只回一句 502。
+    """
+    proto = (node.get("protocol") or "").lower()
+    native_ok = proto in NATIVE_PROXY_PROTOS and subs_proxy.proxy_endpoint(node) is not None
+    entry = node.get("entryProto") or "mixed"
+    port = safe_int(node.get("port"))
+    inbound_ok = entry == "mixed" and 1 <= port <= 65535
+    if native_ok or inbound_ok:
+        return ""
+    parts = []
+    if proto not in NATIVE_PROXY_PROTOS:
+        parts.append("协议 " + (proto or "未知") + " 不支持直连探测")
+    else:
+        parts.append("节点 rawConfig 缺少可用的 server/server_port")
+    if entry != "mixed":
+        parts.append("入口协议为 " + entry + "，没有混合入站可兜底")
+    else:
+        parts.append("混合入站端口无效（" + str(port) + "）")
+    return "；".join(parts)
 
 
 def fetch_exit_ip_sync(node: Dict[str, Any]) -> Optional[str]:
     """同步探测（阻塞，仅供 to_thread 调用）。"""
-    return _probe_native(node) or _probe_inbound(node)
+    return probe_attempt(node).ip
 
 
 async def fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:

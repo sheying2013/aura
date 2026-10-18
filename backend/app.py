@@ -387,7 +387,11 @@ async def get_exit_ip(node_id: str):
         raise HTTPException(status_code=409, detail="sing-box 未运行")
     ip = await scheduler._fetch_exit_ip(node)
     if not ip:
-        raise HTTPException(status_code=502, detail="出口 IP 探测失败")
+        # 探测失败要能说清断在哪：协议不支持直连、端点缺失、混合入站不可用……
+        # 否则用户只看到一句 502，无从判断是节点问题还是链路问题。
+        reason = probe_ip.diagnose(node)
+        detail = "出口 IP 探测失败：" + reason if reason else "出口 IP 探测失败"
+        raise HTTPException(status_code=502, detail=detail)
     patch = {"exitIp": ip}
     # 异步查 IP 情报（ipinfo.io 归属地 + ipapi.is 纯净度评分），失败降级不阻塞
     try:
