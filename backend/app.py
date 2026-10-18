@@ -21,6 +21,7 @@ import config_manager
 import db
 import models
 import panel_config
+import probe_ip
 import scheduler
 import stats
 import subs_proxy
@@ -381,11 +382,9 @@ async def get_exit_ip(node_id: str):
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
     proto = (node.get("protocol") or "").lower()
-    if proto not in ("socks5", "socks", "http") and not config_manager.is_running():
+    # 原生代理协议可直连探测，无需本地 sing-box 在跑
+    if proto not in probe_ip.NATIVE_PROXY_PROTOS and not config_manager.is_running():
         raise HTTPException(status_code=409, detail="sing-box 未运行")
-    port = node["port"]
-    user = node.get("authUser") or "user"
-    passwd = node.get("authPass") or "pass"
     ip = await scheduler._fetch_exit_ip(node)
     if not ip:
         raise HTTPException(status_code=502, detail="出口 IP 探测失败")

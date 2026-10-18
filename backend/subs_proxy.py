@@ -7,11 +7,12 @@ import base64
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 from urllib.parse import unquote
 
 import db
 from subscription_fetch import fetch_public_subscription
+from utils import safe_int
 
 
 # ---------- 拉取 ----------
@@ -39,6 +40,43 @@ def _b64_detect(s: str) -> bool:
 def _parse_base64_pwd(s: str) -> str:
     d = _b64_decode(s)
     return d if d else s
+
+
+# ---------- 节点端点规范化 ----------
+
+class ProxyEndpoint(NamedTuple):
+    """节点原生代理（socks5/http）的可直连端点。"""
+    host: str
+    port: int
+    username: str
+    password: str
+
+
+def _endpoint_of(rc: Dict[str, Any]) -> tuple:
+    """从 rawConfig 取 (host, port)，容忍 address/port 别名。"""
+    host = str(rc.get("server") or rc.get("address") or "").strip()
+    return host, safe_int(rc.get("server_port") or rc.get("port") or 0)
+
+
+def proxy_endpoint(node: Dict[str, Any]) -> Optional[ProxyEndpoint]:
+    """解析节点的原生代理端点；rawConfig 不全时回落 uri 解析。
+
+    rawConfig 是规范来源，但历史导入的节点可能只留了 uri。把补齐逻辑放在解析层，
+    所有消费方（出口探测 / 配置生成）才能看到同一份规范化结果。
+    """
+    rc = dict(node.get("rawConfig") or {})
+    host, port = _endpoint_of(rc)
+    if (not host or not 1 <= port <= 65535) and rc.get("uri"):
+        try:
+            parsed = _parse_link(str(rc["uri"])) or {}
+            rc = {**(parsed.get("rawConfig") or {}), **rc}
+        except Exception:
+            return None
+        host, port = _endpoint_of(rc)
+    if not host or not 1 <= port <= 65535:
+        return None
+    return ProxyEndpoint(host, port,
+                         str(rc.get("username") or ""), str(rc.get("password") or ""))
 
 
 # ---------- 单链接解析 ----------

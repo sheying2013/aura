@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set
 import httpx
 
 import db
+from utils import safe_int as _safe_int
 
 SINGBOX_BIN = os.environ.get("SINGBOX_BIN", "sing-box")
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
@@ -218,17 +219,6 @@ def _signal_singbox(sig: signal.Signals) -> int:
 
 def outbound_tag(protocol: str, port: int) -> str:
     return f"out-{protocol}-{port}"
-
-
-def _safe_int(v: Any, default: int = 0) -> int:
-    """安全转 int：订阅里 server_port 可能是 '443abc' 等脏串，int() 会抛 ValueError
-
-    让单个坏节点瘫痪整份配置生成（P0）。失败返回 default，调用方跳过该节点。
-    """
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
 
 
 # ---------- 配置生成 ----------

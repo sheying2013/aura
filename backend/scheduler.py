@@ -1,6 +1,7 @@
 """后台任务编排：60s 批量探活、3h 订阅刷新、10s sing-box 崩溃守护、relay 随机轮询。"""
 import asyncio
 import random
+import socket
 import time
 from collections import deque
 from typing import Any, Dict, List, Optional
@@ -8,8 +9,9 @@ from typing import Any, Dict, List, Optional
 import config_manager
 import db
 import httpx
-import stats
+import probe_ip
 import subs_proxy
+from utils import is_ip_address as _is_ip_address
 
 PING_INTERVAL = 60  # 秒
 SUB_REFRESH_INTERVAL = 3 * 60 * 60  # 秒（3 小时）
@@ -26,216 +28,31 @@ _ENRICH_COOLDOWN = 300  # 5 分钟冷却：补查后即使情报不全也不重�
 _relay_switch_time: Dict[str, float] = {}
 
 
-
-def _is_ip_address(s: str) -> bool:
-    """判断字符串是否为 IP 地址（v4/v6），非 hostname。"""
-    try:
-        import ipaddress
-        ipaddress.ip_address(s)
-        return True
-    except ValueError:
-        return False
-
-
-def _safe_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
-
-
 async def _fetch_exit_ip(node: Dict[str, Any]) -> Optional[str]:
-    """经节点自身代理查真实出口 IP。
+    """经节点自身代理查真实出口 IP（实现见 probe_ip；保留此入口供接口层与测试打桩）。"""
+    return await probe_ip.fetch_exit_ip(node)
 
-    - socks5/socks 节点：直接经由节点远端 SOCKS5 代理向公网查询真实出口 IP（完全不受中转机 entryProto 影响）
-    - http 节点：直接经由节点远端 HTTP 代理向公网查询真实出口 IP
-    - 其他节点（vless/trojan/vmess 等）且 entryProto == 'mixed'：经本机入站 127.0.0.1:port 代理查询
-    - 严禁任何情况下将入口 server 当作出口 IP 返回
-    """
-    import asyncio as _aio
 
-    def _run() -> Optional[str]:
-        import socket
-        import re
-        import ipaddress
+# ---------- IP 情报补查 ----------
 
-        endpoints = [
-            ("api.ipify.org", 80, b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n"),
-            ("icanhazip.com", 80, b"GET / HTTP/1.0\r\nHost: icanhazip.com\r\nConnection: close\r\n\r\n"),
-        ]
+def _has_full_intel(node: Dict[str, Any]) -> bool:
+    """出口情报是否齐全（国家/类型/风控值任缺一项都要补查）。"""
+    return bool(node.get("exitCountry") and node.get("exitType")
+                and node.get("exitRisk") is not None)
 
-        def _recv_exact(sock, size: int) -> bytes:
-            data = bytearray()
-            while len(data) < size:
-                chunk = sock.recv(size - len(data))
-                if not chunk:
-                    raise OSError("SOCKS5 响应提前结束")
-                data.extend(chunk)
-            return bytes(data)
 
-        def _fetch_socks5(host: str, port: int, user: str, passwd: str) -> Optional[str]:
-            for host_str, host_port, req_bytes in endpoints:
-                s = None
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(6)
-                    s.connect((host, port))
+def _entry_host(node: Dict[str, Any]) -> str:
+    """入口服务器 host（只有域名才可能被误当成出口 IP 存下来）。"""
+    rc = node.get("rawConfig") or {}
+    return str(rc.get("server") or rc.get("address") or "").strip()
 
-                    # SOCKS5 握手：声明支持 0x00(无认证) 与 0x02(账号密码认证)
-                    s.sendall(b"\x05\x02\x00\x02")
-                    auth_choice = _recv_exact(s, 2)
-                    if auth_choice[0] != 0x05:
-                        continue
-                    if auth_choice[1] == 0x02:
-                        ub = (user or "").encode()
-                        pb = (passwd or "").encode()
-                        s.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
-                        auth_res = _recv_exact(s, 2)
-                        if auth_res[1] != 0x00:
-                            continue
-                    elif auth_choice[1] != 0x00:
-                        continue
 
-                    # SOCKS5 CONNECT 目标地址
-                    hb = host_str.encode()
-                    s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + host_port.to_bytes(2, "big"))
-
-                    # 读取 CONNECT 响应头（严格按照 RFC 1928 消费完整响应，防污染后续 HTTP 流）
-                    hdr = _recv_exact(s, 4)
-                    if hdr[1] != 0x00 or hdr[2] != 0x00:
-                        continue
-                    atyp = hdr[3]
-                    if atyp == 0x01:  # IPv4
-                        _recv_exact(s, 6)
-                    elif atyp == 0x03:  # Domain
-                        dlen = _recv_exact(s, 1)[0]
-                        _recv_exact(s, dlen + 2)
-                    elif atyp == 0x04:  # IPv6
-                        _recv_exact(s, 18)
-                    else:
-                        continue
-
-                    # 发送 HTTP 请求并读取响应
-                    s.sendall(req_bytes)
-                    buf = b""
-                    while True:
-                        chunk = s.recv(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                        if len(buf) > 65536:
-                            break
-                        if b"\r\n\r\n" in buf and len(buf.split(b"\r\n\r\n", 1)[1]) >= 7:
-                            break
-
-                    parts = buf.split(b"\r\n\r\n", 1)
-                    if len(parts) == 2:
-                        body = parts[1].strip().decode(errors="ignore")
-                        m = re.search(r"\b([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\b", body)
-                        if m:
-                            candidate = m.group(1)
-                            try:
-                                ipaddress.ip_address(candidate)
-                            except ValueError:
-                                continue
-                            return candidate
-                except Exception:
-                    pass
-                finally:
-                    if s:
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-            return None
-
-        def _fetch_http(host: str, port: int, user: str, passwd: str) -> Optional[str]:
-            for host_str, host_port, _ in endpoints:
-                s = None
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(6)
-                    s.connect((host, port))
-                    req_lines = [
-                        f"GET http://{host_str}/ HTTP/1.0",
-                        f"Host: {host_str}",
-                        "Connection: close",
-                    ]
-                    if user or passwd:
-                        import base64
-                        cred = base64.b64encode(f"{user}:{passwd}".encode()).decode()
-                        req_lines.append(f"Proxy-Authorization: Basic {cred}")
-                    req_lines.append("")
-                    req_lines.append("")
-                    s.sendall("\r\n".join(req_lines).encode())
-
-                    buf = b""
-                    while True:
-                        chunk = s.recv(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                        if len(buf) > 65536:
-                            break
-                        if b"\r\n\r\n" in buf and len(buf.split(b"\r\n\r\n", 1)[1]) >= 7:
-                            break
-                    parts = buf.split(b"\r\n\r\n", 1)
-                    if len(parts) == 2:
-                        body = parts[1].strip().decode(errors="ignore")
-                        m = re.search(r"\b([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\b", body)
-                        if m:
-                            candidate = m.group(1)
-                            try:
-                                ipaddress.ip_address(candidate)
-                            except ValueError:
-                                continue
-                            return candidate
-                except Exception:
-                    pass
-                finally:
-                    if s:
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-            return None
-
-        proto = (node.get("protocol") or "").lower()
-        rc = node.get("rawConfig") or {}
-        srv = (rc.get("server") or rc.get("address") or "").strip()
-        srv_port = _safe_int(rc.get("server_port") or rc.get("port") or 0)
-        if (not srv or not (1 <= srv_port <= 65535)) and rc.get("uri"):
-            try:
-                import subs_proxy
-                parsed = subs_proxy._parse_link(rc["uri"])
-                if parsed and parsed.get("rawConfig"):
-                    rc = {**parsed["rawConfig"], **rc}
-                    srv = (rc.get("server") or rc.get("address") or "").strip()
-                    srv_port = _safe_int(rc.get("server_port") or rc.get("port") or 0)
-            except Exception:
-                pass
-
-        # 1. 代理协议原生直连探测（socks5 / socks / http）
-        if proto in ("socks5", "socks") and srv and 1 <= srv_port <= 65535:
-            res = _fetch_socks5(srv, srv_port, rc.get("username") or "", rc.get("password") or "")
-            if res:
-                return res
-        elif proto == "http" and srv and 1 <= srv_port <= 65535:
-            res = _fetch_http(srv, srv_port, rc.get("username") or "", rc.get("password") or "")
-            if res:
-                return res
-
-        # 2. 中转内核入站代理探测（非 socks5/http 节点，或直连失败时的本地兜底）
-        entry = node.get("entryProto") or "mixed"
-        port = node.get("port")
-        if entry == "mixed" and port:
-            res = _fetch_socks5("127.0.0.1", int(port), node.get("authUser") or "user", node.get("authPass") or "pass")
-            if res:
-                return res
-
+def _resolve_host(host: str) -> Optional[str]:
+    """解析域名（阻塞调用，一律经 asyncio.to_thread 使用）。"""
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
         return None
-
-    return await _aio.to_thread(_run)
 
 
 def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
@@ -251,19 +68,12 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
     # exitIp 存的是 hostname（如 rooster465.autos）→ 视为无效 IP，重新通过代理查真实 IP
     if ip and not _is_ip_address(ip):
         ip = None
-    # 检测并清除误存的入口服务器 IP（历史 bug 残留清洗）：
-    # 仅当 server 是域名时，若 exitIp 误存了该域名的入口解析 IP，判定为历史错误数据，触发重新探测真实出口
-    server_host = ((node.get("rawConfig") or {}).get("server") or "").strip()
-    if ip and server_host and not _is_ip_address(server_host):
-        try:
-            import socket
-            if ip == socket.gethostbyname(server_host):
-                ip = None
-        except Exception:
-            pass
-    # 情报已齐全：必须具有有效真实出口 IP，且国家、类型和风控值均齐全才跳过
-    if ip and node.get("exitCountry") and node.get("exitType") and node.get("exitRisk") is not None:
-        return  # 情报已齐全
+    # 入口是域名时，exitIp 才可能是"入口域名解析出的 IP"这类历史脏数据
+    entry_host = _entry_host(node)
+    dirty_risk = bool(ip and entry_host and not _is_ip_address(entry_host))
+    # 情报已齐全且不可能脏 → 直接跳过（最常见快路径，不做任何 I/O）
+    if ip and not dirty_risk and _has_full_intel(node):
+        return
     if nid in _ip_enrich_pending:
         return
     # 冷却：上次补查后 5 分钟内不重查（情报不全时避免每轮探活重复 curl 所有节点）
@@ -274,6 +84,12 @@ def _lazy_enrich_ip(node: Dict[str, Any]) -> None:
     async def _do() -> None:
         cur_ip = ip  # 闭包捕获外层 ip（内层不重新赋值，避免 UnboundLocalError）
         try:
+            # 历史脏数据清洗：DNS 解析放线程里，避免阻塞事件循环
+            if cur_ip and dirty_risk:
+                if cur_ip == await asyncio.to_thread(_resolve_host, entry_host):
+                    cur_ip = None
+            if cur_ip and _has_full_intel(node):
+                return  # 校验后确认干净且情报齐全
             # 无出口 IP → 经节点自身代理查询（探活已确认在线，代理应可达）
             if not cur_ip:
                 async with _ip_enrich_sem:
