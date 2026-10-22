@@ -7,6 +7,7 @@ on:
       - 'docker-compose.yml'
       - '.dockerignore'
       - 'backend/**'
+      - 'aura-rs/**'
       - 'index.html'
       - 'subs.js'
   workflow_dispatch:
@@ -37,9 +38,9 @@ jobs:
       - name: Run container
         run: |
           docker run -d --name aura-test -p 19001:19001 aura-panel
-          # 等待 uvicorn 就绪（最多 30s）
+          # 等待面板端口就绪（最多 30s）
           for i in $(seq 1 30); do
-            if docker logs aura-test 2>&1 | grep -qE "Uvicorn running|Application startup complete"; then
+            if curl -s -o /dev/null --max-time 2 http://127.0.0.1:19001/admin/; then
               echo "server ready after ${i}s"
               break
             fi
@@ -67,8 +68,8 @@ jobs:
       - name: Scan logs for tracebacks
         if: always()
         run: |
-          if docker logs aura-test 2>&1 | grep -iE "traceback|exception in asyncio" ; then
-            echo "FAIL: traceback found in container logs"
+          if docker logs aura-test 2>&1 | grep -iE "traceback|exception in asyncio|thread 'main' panicked" ; then
+            echo "FAIL: crash found in container logs"
             exit 1
           fi
-          echo "no tracebacks in container logs"
+          echo "no crashes in container logs"

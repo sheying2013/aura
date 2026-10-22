@@ -20,6 +20,9 @@ backend/data/
 # 本地截图
 screenshots/
 
+# ========== Rust 构建产物 ==========
+aura-rs/target/
+
 # ========== 版本控制 ==========
 .git/
 .gitignore

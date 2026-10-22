@@ -1,0 +1,27 @@
+name: rust-test
+
+on:
+  push:
+    paths:
+      - 'aura-rs/**'
+      - '.github/workflows/rust-test.yml'
+  pull_request:
+    paths:
+      - 'aura-rs/**'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aura-rs -> target
+      - name: cargo test
+        working-directory: aura-rs
+        run: cargo test --lib
+      - name: cargo build (release)
+        working-directory: aura-rs
+        run: cargo build --release

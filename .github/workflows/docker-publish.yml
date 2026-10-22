@@ -11,6 +11,7 @@ on:
       - 'Dockerfile'
       - '.dockerignore'
       - 'backend/**'
+      - 'aura-rs/**'
       - 'index.html'
       - 'subs.js'
   workflow_dispatch:
