@@ -27,8 +27,9 @@ DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 CONFIG_BAK_PATH = os.path.join(DATA_DIR, "config.json.bak")
 LOG_PATH = os.path.join(DATA_DIR, "singbox.log")
-LOG_MAX_BYTES = 50 * 1024 * 1024
-LOG_BACKUP_COUNT = 3
+# 单文件上限 20MiB + 2 个轮转副本 ≈ 60MiB 总量（原 50MiB×3 ≈ 200MiB，小硬盘机两三天就吃满）
+LOG_MAX_BYTES = 20 * 1024 * 1024
+LOG_BACKUP_COUNT = 2
 CLASH_HOST = "127.0.0.1"
 # 不用 9090（与其他面板/服务冲突常见），选 9095 避开常见占用；
 # 面板设置里的 clashPort 可覆盖（sing-box external_controller 端口必须与探活一致）

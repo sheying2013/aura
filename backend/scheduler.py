@@ -17,6 +17,7 @@ PING_INTERVAL = 60  # 秒
 SUB_REFRESH_INTERVAL = 3 * 60 * 60  # 秒（3 小时）
 GUARD_INTERVAL = 10  # 秒
 MAX_RESTARTS_PER_MIN = 3
+GUARD_WINDOW = 60  # 秒：崩溃重启的滑动统计窗口（测试可调小）
 
 # IP 情报惰性补查：信号量限并发（ipinfo.io 免费 5 万次/月），仅补缺情报的节点
 _ip_enrich_sem = asyncio.Semaphore(8)
@@ -667,18 +668,22 @@ async def _guard_loop() -> None:
         if await asyncio.to_thread(config_manager.is_running):
             if _guard_paused:
                 _guard_paused = False
+            _restart_times.clear()
             continue
-        # 进程已退出 → 需要重启
+        # 进程已退出 → 需要重启。
+        # 只统计「真正发起重启」的次数：若把本轮探测也 append 进来，冷却期内每轮
+        # 都会续期一条时间戳（GUARD_INTERVAL=10s → 60s 窗口恒有 6 条 > 3），冷却
+        # 永不结束、sing-box 再也不会被拉起（2026-10-22 日本机瘫痪 43 分钟的根因）。
         now = time.time()
-        _restart_times.append(now)
-        _restart_times = [t for t in _restart_times if now - t < 60]
-        if len(_restart_times) > MAX_RESTARTS_PER_MIN:
+        _restart_times = [t for t in _restart_times if now - t < GUARD_WINDOW]
+        if len(_restart_times) >= MAX_RESTARTS_PER_MIN:
             # 限流：进入 60s 冷却，等时间推移后自动恢复
             if not _guard_paused:
                 print("[guard] sing-box 崩溃过于频繁，进入 60s 冷却")
             _guard_paused = True
             continue
         _guard_paused = False
+        _restart_times.append(now)
         try:
             await config_manager.start()
         except Exception:
