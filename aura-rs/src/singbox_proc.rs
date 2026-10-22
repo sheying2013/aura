@@ -410,10 +410,25 @@ pub fn is_running_with_port(paths: &ProcPaths, clash_port: u16) -> bool {
     clash_api_alive(clash_port, CLASH_PROBE_TIMEOUT)
 }
 
-/// 粗粒度 clash API 探活：连上并发出 GET /version，看到 200 即视为活着。
+/// 粗粒度 clash API 探活：连上并发出 GET /version，收到任意 HTTP 响应即视为活着。
 ///
-/// 比 Python 少带 Authorization 头（secret 存在 DB 里，本模块保持零 DB 依赖）。
+/// 只用来判断「端口后面有个 HTTP 服务」，不校验响应码，也不带 Authorization
+/// （secret 存在 DB 里，本模块保持零 DB 依赖）。服务端的 clash API 一旦配了
+/// secret，裸请求会拿到 401 —— 那也是活着，所以这里是宽松判据。
 pub fn clash_api_alive(port: u16, timeout: Duration) -> bool {
+    clash_probe(port, timeout, None, false)
+}
+
+/// 严格就绪探测：带 clash secret 请求 /version，必须拿到 200 才算就绪。
+///
+/// 面板生成的 sing-box 配置必带 `experimental.clash_api.secret`，此时不带
+/// Authorization 的裸请求会被回 401；用裸请求判「未就绪」会把刚起来、实际已经
+/// 正常的 sing-box 进程杀掉，表现为「配置已写入，但 clash API 在 5000 毫秒内未就绪」。
+pub fn clash_api_ready(port: u16, timeout: Duration, secret: Option<&str>) -> bool {
+    clash_probe(port, timeout, secret, true)
+}
+
+fn clash_probe(port: u16, timeout: Duration, secret: Option<&str>, require_200: bool) -> bool {
     let Some(addr) = (CLASH_HOST, port)
         .to_socket_addrs()
         .ok()
@@ -426,9 +441,13 @@ pub fn clash_api_alive(port: u16, timeout: Duration) -> bool {
     };
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
+    let auth = match secret {
+        Some(s) if !s.is_empty() => format!("Authorization: Bearer {}\r\n", s),
+        _ => String::new(),
+    };
     let request = format!(
-        "GET /version HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
-        CLASH_HOST, port
+        "GET /version HTTP/1.1\r\nHost: {}:{}\r\n{}Connection: close\r\n\r\n",
+        CLASH_HOST, port, auth
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
@@ -437,7 +456,10 @@ pub fn clash_api_alive(port: u16, timeout: Duration) -> bool {
     match stream.read(&mut buf) {
         Ok(n) if n > 0 => {
             let head = String::from_utf8_lossy(&buf[..n]).into_owned();
-            head.starts_with("HTTP/") && head.contains(" 200")
+            if !head.starts_with("HTTP/") {
+                return false;
+            }
+            !require_200 || head.contains(" 200")
         }
         _ => false,
     }
@@ -901,6 +923,75 @@ mod tests {
             }
         });
         assert!(clash_api_alive(port, Duration::from_millis(500)));
+        let _ = handle.join();
+    }
+
+    /// 服务端配了 secret 时会回 401：宽松探活仍算活着，严格就绪必须带上 secret。
+    #[test]
+    fn clash_probe_handles_401_and_uses_secret() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel::<String>();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 512];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let authed = req.contains("Authorization: Bearer s3cret");
+                let _ = tx.send(req);
+                if authed {
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+                } else {
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 27\r\n\r\n{\"message\":\"unauthorized\"}",
+                    );
+                }
+            }
+        });
+
+        assert!(
+            clash_api_alive(port, Duration::from_millis(500)),
+            "401 说明端口后面有 HTTP 服务，宽松探活应判活着"
+        );
+        assert!(
+            clash_api_ready(port, Duration::from_millis(500), Some("s3cret")),
+            "带正确 secret 时严格探活必须通过"
+        );
+        let _ = handle.join();
+
+        let first = rx.recv().unwrap_or_default();
+        let second = rx.recv().unwrap_or_default();
+        assert!(
+            !first.to_lowercase().contains("authorization"),
+            "宽松探活不应带 Authorization 头"
+        );
+        assert!(second.contains("Authorization: Bearer s3cret"));
+    }
+
+    /// 没有 secret 时严格探活必须失败，不能把 401 当成就绪。
+    #[test]
+    fn clash_ready_false_when_secret_missing() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 27\r\n\r\n{\"message\":\"unauthorized\"}",
+                );
+            }
+        });
+
+        assert!(!clash_api_ready(port, Duration::from_millis(500), None));
         let _ = handle.join();
     }
 

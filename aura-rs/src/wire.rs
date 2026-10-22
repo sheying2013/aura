@@ -317,7 +317,12 @@ impl ConfigAdapter {
             return false;
         }
         let port = self.mgr.clash_port().clamp(1, 65535) as u16;
-        crate::singbox_proc::clash_api_alive(port, std::time::Duration::from_millis(1500))
+        let secret = self.mgr.get_clash_secret();
+        crate::singbox_proc::clash_api_ready(
+            port,
+            std::time::Duration::from_millis(1500),
+            secret.as_deref(),
+        )
     }
 }
 

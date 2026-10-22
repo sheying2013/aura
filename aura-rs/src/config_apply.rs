@@ -134,26 +134,61 @@ impl ClashProbe for NeverReady {
 ///
 /// singbox_proc 不带 Authorization 头（它零 DB 依赖），这里同样先按「端口有
 /// HTTP 应答」判断存活；secret 是否正确的强校验留在调用方（需要时再补）。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct HttpClashProbe {
+    /// 构造时算出的端口（settings 缺失时的回落值）。
     port: u16,
+    /// 设置源；存在时每次探测都重新读 clashPort，跟随用户在设置页的修改。
+    settings: Option<Arc<dyn DbSettings>>,
 }
 
 impl HttpClashProbe {
-    /// 指定 clash 端口。
+    /// 指定 clash 端口（固定）。
     pub fn new(port: u16) -> Self {
-        Self { port }
+        Self {
+            port,
+            settings: None,
+        }
     }
 
-    /// 探测用的端口。
+    /// 端口跟随 settings.system.clashPort 的探活实现。
+    ///
+    /// 必须动态读：用户在设置页改 clash 端口后，sing-box 会按新端口起，
+    /// 探活若还盯着旧端口就会一直判定「未就绪」→ 反复杀进程。
+    pub fn from_settings(settings: Arc<dyn DbSettings>) -> Self {
+        let port = clash_port_from(settings.as_ref()) as u16;
+        Self {
+            port,
+            settings: Some(settings),
+        }
+    }
+
+    /// 探测用的端口（settings 存在时按当前设置算）。
     pub fn port(&self) -> u16 {
-        self.port
+        match self.settings.as_ref() {
+            Some(settings) => clash_port_from(settings.as_ref()) as u16,
+            None => self.port,
+        }
+    }
+}
+
+impl std::fmt::Debug for HttpClashProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpClashProbe")
+            .field("port", &self.port())
+            .finish()
     }
 }
 
 impl ClashProbe for HttpClashProbe {
-    fn version_ok(&self, _base: &str, _secret: &str) -> bool {
-        singbox_proc::clash_api_alive(self.port, singbox_proc::CLASH_PROBE_TIMEOUT)
+    fn version_ok(&self, _base: &str, secret: &str) -> bool {
+        // 必须带上 clash secret：配置里写了 secret 时，裸请求只会拿到 401，
+        // 那样会把已经正常起来的 sing-box 误判成「未就绪」。
+        singbox_proc::clash_api_ready(
+            self.port(),
+            singbox_proc::CLASH_PROBE_TIMEOUT,
+            Some(secret),
+        )
     }
 }
 
@@ -279,16 +314,31 @@ fn wait_child_exit(child: &mut Child, grace: Duration) -> bool {
 pub struct StdProcControl {
     paths: ProcPaths,
     clash_port: u16,
+    /// 设置源；存在时 clash 端口每次动态读，跟随设置页的 clashPort 修改。
+    settings: Option<Arc<dyn DbSettings>>,
     child: StdMutex<Option<Child>>,
     log: StdMutex<Option<Arc<StdMutex<LogFile>>>>,
 }
 
 impl StdProcControl {
-    /// 构造。
+    /// 构造（固定 clash 端口）。
     pub fn new(paths: ProcPaths, clash_port: u16) -> Self {
         Self {
             paths,
             clash_port,
+            settings: None,
+            child: StdMutex::new(None),
+            log: StdMutex::new(None),
+        }
+    }
+
+    /// 构造（clash 端口跟随 settings.system.clashPort）。
+    pub fn from_settings(paths: ProcPaths, settings: Arc<dyn DbSettings>) -> Self {
+        let clash_port = clash_port_from(settings.as_ref()) as u16;
+        Self {
+            paths,
+            clash_port,
+            settings: Some(settings),
             child: StdMutex::new(None),
             log: StdMutex::new(None),
         }
@@ -299,9 +349,12 @@ impl StdProcControl {
         &self.paths
     }
 
-    /// clash 端口。
+    /// clash 端口（settings 存在时按当前设置算）。
     pub fn clash_port(&self) -> u16 {
-        self.clash_port
+        match self.settings.as_ref() {
+            Some(settings) => clash_port_from(settings.as_ref()) as u16,
+            None => self.clash_port,
+        }
     }
 
     fn lock_child(&self) -> std::sync::MutexGuard<'_, Option<Child>> {
@@ -324,7 +377,7 @@ impl ProcControl for StdProcControl {
                 }
             }
         }
-        singbox_proc::is_running_with_port(&self.paths, self.clash_port)
+        singbox_proc::is_running_with_port(&self.paths, self.clash_port())
     }
 
     fn start(&self, _config: &Value) -> Result<()> {
@@ -631,9 +684,10 @@ impl ConfigManager {
 
     /// 生产构造：真实进程控制 + 真实 HTTP 探活 + 全局数据库。
     pub fn production(paths: ProcPaths, settings: Arc<dyn DbSettings>) -> Self {
-        let port = clash_port_from(settings.as_ref());
-        let ctl = Arc::new(StdProcControl::new(paths.clone(), port as u16));
-        let probe = Arc::new(HttpClashProbe::new(port as u16));
+        // 端口必须跟随 settings（用户可在设置页改 clashPort），
+        // 构造时算死会让探活盯着旧端口，热应用永远判定「未就绪」。
+        let ctl = Arc::new(StdProcControl::from_settings(paths.clone(), Arc::clone(&settings)));
+        let probe = Arc::new(HttpClashProbe::from_settings(Arc::clone(&settings)));
         Self::new(paths, settings, ctl, probe)
     }
 
@@ -1312,6 +1366,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// 用户在设置页改 clashPort 后，探活与进程兜底探测都必须跟着换端口。
+    /// 旧实现把端口在构造时算死：sing-box 按新端口起来，探活盯着旧端口，
+    /// 于是热应用反复判定「clash API 未就绪」并把刚起来的进程杀掉。
+    #[test]
+    fn clash_port_follows_settings_for_probe_and_ctl() {
+        let settings = Arc::new(FakeSettings::default());
+        settings.set(SETTING_SYSTEM, json!({ "clashPort": 19095 }));
+
+        let probe = HttpClashProbe::from_settings(Arc::clone(&settings) as Arc<dyn DbSettings>);
+        assert_eq!(probe.port(), 19095);
+
+        settings.set(SETTING_SYSTEM, json!({ "clashPort": 19096 }));
+        assert_eq!(probe.port(), 19096, "探活端口必须跟随设置");
+
+        let ctl = StdProcControl::from_settings(
+            ProcPaths::new(unique_dir("port-follow"), "sing-box"),
+            Arc::clone(&settings) as Arc<dyn DbSettings>,
+        );
+        assert_eq!(ctl.clash_port(), 19096, "进程兜底探测也要跟随设置");
+
+        settings.set(SETTING_SYSTEM, json!({}));
+        assert_eq!(ctl.clash_port(), DEFAULT_CLASH_PORT as u16);
     }
 
     fn rig(tag: &str) -> Rig {
