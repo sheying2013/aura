@@ -655,6 +655,36 @@ async def _relay_random_loop() -> None:
 
 # ---------- 崩溃守护 ----------
 
+# fd 看门狗：连接泄漏时进程仍「活着」，崩溃守护永远等不到退出信号
+# （2026-10-22 新加坡机：sing-box fd 1875 → load 224 → sshd 无法 fork，面板却一直 200）。
+# 健康态约 20 个 fd，稳定运行一小时也只涨到几十；1200 已是 58 个入站节点的 20 倍余量。
+FD_LIMIT = 1200
+FD_RESTART_COOLDOWN = 300  # 两次 fd 重启之间至少间隔 5 分钟，避免反复重启抖动
+_fd_restart_at = 0.0
+
+
+async def _recycle_if_fd_leak() -> bool:
+    """fd 超过阈值就重启 sing-box 回收泄漏的 socket。返回是否真的重启了。"""
+    global _fd_restart_at
+    try:
+        fds = await asyncio.to_thread(config_manager.singbox_fd_count)
+    except Exception:
+        return False
+    if fds <= FD_LIMIT:
+        return False
+    now = time.time()
+    if now - _fd_restart_at < FD_RESTART_COOLDOWN:
+        return False
+    _fd_restart_at = now
+    print(f"[guard] sing-box fd 泄漏（{fds} > {FD_LIMIT}），重启回收连接")
+    try:
+        await config_manager.stop()
+        await config_manager.start()
+    except Exception as e:
+        print(f"[guard] fd 泄漏重启失败: {e}")
+    return True
+
+
 async def _guard_loop() -> None:
     global _guard_paused, _restart_times
     while True:
@@ -669,6 +699,8 @@ async def _guard_loop() -> None:
             if _guard_paused:
                 _guard_paused = False
             _restart_times.clear()
+            # 进程活着也可能在泄漏 fd：每轮顺带体检一次，超限才动它
+            await _recycle_if_fd_leak()
             continue
         # 进程已退出 → 需要重启。
         # 只统计「真正发起重启」的次数：若把本轮探测也 append 进来，冷却期内每轮

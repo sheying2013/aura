@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set
 import httpx
 
 import db
+import netguard
 from utils import safe_int as _safe_int
 
 SINGBOX_BIN = os.environ.get("SINGBOX_BIN", "sing-box")
@@ -177,6 +178,45 @@ def clash_base() -> str:
     return f"http://{CLASH_HOST}:{get_clash_port()}"
 
 
+def find_singbox_pids() -> List[int]:
+    """按命令行特征找出本面板的 sing-box 进程（host 网络下可能逃逸出容器 PID 空间）。
+
+    slim 镜像无 pkill/ps，直接扫 /proc；无 /proc 的平台返回空列表。
+    """
+    pids: List[int] = []
+    cmdline_marker = f"sing-box run -c {CONFIG_PATH}"
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for pid in entries:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode(errors="ignore")
+        except (OSError, IOError):
+            continue
+        if cmdline_marker in cmd:
+            pids.append(int(pid))
+    return pids
+
+
+def singbox_fd_count() -> int:
+    """本面板 sing-box 当前打开的 fd 总数（正常约 20；连接泄漏时会涨到上千）。
+
+    事故（2026-10-22 新加坡机）：出站拨回本机公网 IP 的 hairpin 连接半开不释放，
+    fd 涨到 1875 后整机 load 224、sshd 无法 fork。看门狗靠这个计数判定是否重启。
+    """
+    total = 0
+    for pid in find_singbox_pids():
+        try:
+            total += len(os.listdir(f"/proc/{pid}/fd"))
+        except OSError:
+            continue
+    return total
+
+
 def _signal_singbox(sig: signal.Signals) -> int:
     """向本面板的 sing-box 进程发信号，返回命中数。
 
@@ -187,20 +227,13 @@ def _signal_singbox(sig: signal.Signals) -> int:
     hits = 0
     cmdline_marker = f"sing-box run -c {CONFIG_PATH}"
     try:
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
+        pids = find_singbox_pids()
+        for pid in pids:
             try:
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmd = f.read().replace(b"\x00", b" ").decode(errors="ignore")
-            except (OSError, IOError):
-                continue
-            if cmdline_marker in cmd:
-                try:
-                    os.kill(int(pid), sig)
-                    hits += 1
-                except (OSError, ProcessLookupError):
-                    pass
+                os.kill(pid, sig)
+                hits += 1
+            except (OSError, ProcessLookupError):
+                pass
         if hits:
             return hits
     except OSError:
@@ -224,20 +257,54 @@ def outbound_tag(protocol: str, port: int) -> str:
 
 # ---------- 配置生成 ----------
 
+def _plan_inbound_ports(nodes: List[Dict[str, Any]],
+                        relay_domains: List[Dict[str, Any]],
+                        settings: Dict[str, Any]) -> Set[int]:
+    """本次配置会占用的全部入站端口（节点 + 中转域名 + 面板总入口）。
+
+    供 netguard 判定「出站是否打回自己的入站」用：命中即回环自引用，必须跳过该节点。
+    """
+    ports: Set[int] = set()
+    for node in nodes:
+        # disabled（手动停用或自动停用）都不生成入站：自动停用只保留出站供健康复查，
+        # 手动停用连出站都不生成。所以入站端口集合直接跳过全部 disabled。
+        if node.get("status") == "disabled":
+            continue
+        port = _safe_int(node.get("port"))
+        if port:
+            ports.add(port)
+    for rd in relay_domains:
+        port = _safe_int((rd or {}).get("port"))
+        if port:
+            ports.add(port)
+    main_port = _safe_int((settings or {}).get("inboundPort") or 0)
+    if main_port > 0:
+        ports.add(main_port)
+    return ports
+
+
 def build_config() -> Dict[str, Any]:
-    """从 DB 数据生成完整 sing-box 配置。返回 {config, errors}。"""
+    """从 DB 数据生成完整 sing-box 配置。返回 {config, errors, notes}。"""
     nodes = db.list_nodes()
     relay_domains = db.list_relay_domains()
     settings = db.get_setting("system", {}) or {}
     listen_ip = settings.get("listenIp", "0.0.0.0")
     test_url = settings.get("testUrl", "https://www.gstatic.com/generate_204")
 
+    inbound_ports = _plan_inbound_ports(nodes, relay_domains, settings)
+    self_domains = netguard.self_domains_from_settings(settings, relay_domains)
+
     inbounds: List[Dict] = []
     outbounds: List[Dict] = []
     route_rules: List[Dict] = []
     errors: List[Dict[str, str]] = []
+    notes: List[str] = []
     outbound_tag_set: Set[str] = set()
     used_inbound_ports: Set[int] = set()  # 已占用的入站端口（节点 + relay），防总入口冲突
+
+    # build_config 是同步函数且在事件循环线程里跑：上百个域名的 DNS/端口探测必须限时，
+    # 超预算的节点退化为「不改写」，宁可少一层优化也不能把接口拖卡（每轮重新计时）。
+    netguard.begin_pass()
 
     for node in nodes:
         # 自动停用保留 outbound 供健康复查；无 inbound，也不进入业务 selector。
@@ -410,6 +477,16 @@ def build_config() -> Dict[str, Any]:
                     else [cfg.get("local_address")] if cfg.get("local_address")
                     else ["10.0.0.2/32"],
             })
+        # 自引用防护：出站拨回本机公网 IP 会走云 NAT hairpin（多一个 socket + conntrack），
+        # 上游挂掉时半开连接不释放会把 fd 吃光（2026-10-22 新加坡机事故）。命中本机时
+        # 改写 127.0.0.1；命中本面板入站端口则是回环自引用，直接跳过该节点。
+        kind, detail = netguard.apply_rewrite(out_item, inbound_ports, self_domains)
+        if kind == netguard.LOOP:
+            errors.append({"node": node["name"], "reason": f"{detail}，已跳过"})
+            continue
+        if kind == netguard.HAIRPIN:
+            notes.append(f"{node['name']}: {detail}")
+
         outbounds.append(out_item)
         outbound_tag_set.add(tag_out)
         if not probe_only:
@@ -495,7 +572,11 @@ def build_config() -> Dict[str, Any]:
         "outbounds": outbounds,
         "route": {"rules": route_rules, "auto_detect_interface": True},
     }
-    return {"config": config, "errors": errors}
+    if notes:
+        head = "; ".join(notes[:3])
+        tail = " …" if len(notes) > 3 else ""
+        print(f"[config] 出站 hairpin 改写 {len(notes)} 个：{head}{tail}")
+    return {"config": config, "errors": errors, "notes": notes}
 
 
 def check_config(config: Dict[str, Any]) -> tuple:
@@ -880,6 +961,8 @@ async def status() -> Dict[str, Any]:
         "version": version,
         "clashApiOk": clash_ok,
         "controller": f"{CLASH_HOST}:{get_clash_port()}",
+        # 连接泄漏观测：fd 涨到上千即浏览器侧可见，配合 _guard_loop 自动重启
+        "fdCount": (await asyncio.to_thread(singbox_fd_count)) if running else 0,
     }
 
 
