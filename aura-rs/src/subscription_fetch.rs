@@ -1246,7 +1246,11 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_is_selected_from_the_logical_scheme() {
-        type ProxyCase = (Vec<(&'static str, &'static str)>, &'static str, Option<&'static str>);
+        type ProxyCase = (
+            Vec<(&'static str, &'static str)>,
+            &'static str,
+            Option<&'static str>,
+        );
         let cases: Vec<ProxyCase> = vec![
             (
                 vec![("HTTPS_PROXY", "http://upper:8000")],
