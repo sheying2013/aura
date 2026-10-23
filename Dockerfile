@@ -2,39 +2,56 @@
 # 单二进制 + sing-box 内核；构建：docker build -t aura-panel .
 # 多架构：docker buildx build --platform linux/amd64,linux/arm64 .
 #
-# 交叉编译说明：builder 固定跑在构建机平台（BUILDPLATFORM），arm64 产物用
-# aarch64-linux-gnu-gcc 交叉链接，而不是在 QEMU 里模拟 rustc —— 后者编一次
-# 全量依赖要 30 分钟，交叉编译把它压到几分钟。
+# 交叉编译说明：builder 固定跑在构建机平台（BUILDPLATFORM），一次产出
+# amd64 与 arm64 两个二进制（非宿主架构用 aarch64-linux-gnu-gcc /
+# x86_64-linux-gnu-gcc 交叉链接），runtime 阶段按 TARGETARCH 各取所需。
+# 这样 arm64 镜像不再靠 QEMU 模拟 rustc —— 后者编一次全量依赖约 30 分钟。
 
 ARG BUILDPLATFORM=linux/amd64
 FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
-ARG TARGETARCH=amd64
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends pkg-config; \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu; \
+      rustup target add aarch64-unknown-linux-gnu; \
+    else \
+      apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu g++-x86-64-linux-gnu; \
+      rustup target add x86_64-unknown-linux-gnu; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
 
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
     AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
     CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
-    CC_aarch64-linux-gnu=aarch64-linux-gnu-gcc
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      pkg-config gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
- && rm -rf /var/lib/apt/lists/* \
- && if [ "$TARGETARCH" = "arm64" ]; then rustup target add aarch64-unknown-linux-gnu; fi
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
+    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++
 
 WORKDIR /src
 COPY aura-rs/Cargo.toml aura-rs/Cargo.lock* ./
 COPY aura-rs/src ./src
+
+# 两个架构各编一次，产物落在固定文件名上，供 runtime 按 TARGETARCH 取用。
 RUN set -eux; \
-    if [ "$TARGETARCH" = "arm64" ]; then \
-      cargo build --release --locked --target aarch64-unknown-linux-gnu 2>/dev/null \
-        || cargo build --release --target aarch64-unknown-linux-gnu; \
-      cp target/aarch64-unknown-linux-gnu/release/aura /src/aura-bin; \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      HOST_ARCH=amd64; HOST_TRIPLE=x86_64-unknown-linux-gnu; \
+      CROSS_ARCH=arm64; CROSS_TRIPLE=aarch64-unknown-linux-gnu; \
     else \
-      cargo build --release --locked 2>/dev/null || cargo build --release; \
-      cp target/release/aura /src/aura-bin; \
+      HOST_ARCH=arm64; HOST_TRIPLE=aarch64-unknown-linux-gnu; \
+      CROSS_ARCH=amd64; CROSS_TRIPLE=x86_64-unknown-linux-gnu; \
     fi; \
-    file /src/aura-bin || true
+    build() { \
+      triple="$1"; \
+      cargo build --release --locked --target "$triple" 2>/dev/null \
+        || cargo build --release --target "$triple"; \
+    }; \
+    build "$HOST_TRIPLE"; cp "target/$HOST_TRIPLE/release/aura" "/src/aura-$HOST_ARCH"; \
+    build "$CROSS_TRIPLE"; cp "target/$CROSS_TRIPLE/release/aura" "/src/aura-$CROSS_ARCH"; \
+    ls -l /src/aura-*
 
 FROM debian:bookworm-slim AS runtime
 ARG SINGBOX_VERSION=1.7.7
@@ -53,8 +70,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && sing-box version
 
-# 服务端单二进制（交叉编译产物统一落在 /src/aura-bin）
-COPY --from=builder /src/aura-bin /app/backend/aura
+# 服务端单二进制：按目标平台取对应交叉编译产物
+COPY --from=builder /src/aura-${TARGETARCH:-amd64} /app/backend/aura
 # 前端（编辑源在仓库根，副本进 static 供后端托管）
 COPY index.html /app/backend/static/
 COPY static/js/ /app/backend/static/js/
