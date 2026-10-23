@@ -2837,7 +2837,7 @@ mod tests {
         let d = db();
         let n = node_json("a", 52001);
         assert_eq!(
-            d.create_node_batch_json(&[n.clone()], false)
+            d.create_node_batch_json(std::slice::from_ref(&n), false)
                 .unwrap()
                 .created,
             1
@@ -2937,7 +2937,7 @@ mod tests {
             .unwrap()
             .items[0]
             .clone();
-        assert_eq!(d.delete_node_batch(&[z.id.clone()]).unwrap(), 1);
+        assert_eq!(d.delete_node_batch(std::slice::from_ref(&z.id)).unwrap(), 1);
         let again = d.create_node_batch_json(&[sub_node], true).unwrap();
         assert_eq!((again.created, again.skipped), (0, 1));
     }

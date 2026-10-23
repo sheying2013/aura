@@ -74,8 +74,10 @@ mod tests {
     fn roundtrip_and_atomic_write() {
         let dir = std::env::temp_dir().join(format!("aura-panelcfg-{}", std::process::id()));
         let path = dir.join("panel.conf");
-        let mut c = PanelConfig::default();
-        c.port = 19123;
+        let c = PanelConfig {
+            port: 19123,
+            ..PanelConfig::default()
+        };
         c.save_to(&path).unwrap();
         let back = PanelConfig::load_from(&path);
         assert_eq!(back.port, 19123);

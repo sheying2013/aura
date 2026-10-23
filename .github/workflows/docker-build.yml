@@ -30,6 +30,8 @@ jobs:
             --platform linux/amd64,linux/arm64 \
             -t aura-panel \
             --load=false \
+            --cache-from type=gha,scope=aura-multiarch \
+            --cache-to type=gha,mode=max,scope=aura-multiarch \
             .
 
       - name: Build native amd64 image

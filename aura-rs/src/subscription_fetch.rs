@@ -958,9 +958,11 @@ mod tests {
 
     // ---------- 解析器 mock ----------
 
+    type AnswerFn = Box<dyn Fn(&str, usize) -> std::io::Result<Vec<IpAddr>> + Send + Sync>;
+
     struct MockResolver {
         calls: Mutex<Vec<(String, u16)>>,
-        answers: Box<dyn Fn(&str, usize) -> std::io::Result<Vec<IpAddr>> + Send + Sync>,
+        answers: AnswerFn,
     }
 
     impl MockResolver {
@@ -1175,10 +1177,7 @@ mod tests {
             decode_body("héllo".as_bytes(), Some("text/plain; charset=utf-8")),
             "héllo"
         );
-        assert_eq!(
-            decode_body(&[0xff], Some("text/plain; charset=utf-8")).contains('\u{fffd}'),
-            true
-        );
+        assert!(decode_body(&[0xff], Some("text/plain; charset=utf-8")).contains('\u{fffd}'));
     }
 
     #[derive(Debug)]
@@ -1247,7 +1246,8 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_is_selected_from_the_logical_scheme() {
-        let cases: Vec<(Vec<(&str, &str)>, &str, Option<&str>)> = vec![
+        type ProxyCase = (Vec<(&'static str, &'static str)>, &'static str, Option<&'static str>);
+        let cases: Vec<ProxyCase> = vec![
             (
                 vec![("HTTPS_PROXY", "http://upper:8000")],
                 "https://sub.example/s",
