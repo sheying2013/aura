@@ -70,16 +70,44 @@ async fn run() -> anyhow::Result<()> {
         Arc::new(ConfigAdapter::new(Arc::clone(&mgr), Arc::clone(&db)));
 
     // lifespan: 已有配置就应用并拉起内核（配置不存在则等用户创建节点后再启动）。
+    //
+    // 失败必须重试、用尽后退出，不能只 warn 降级：一旦降级，容器是 running、
+    // 面板是 200，但 sing-box 没起来，节点静默全断，从外部完全看不出故障
+    // （2026-10-23 日本机「端口被占用: 33444」事故就是这个形态）。
+    // 退出后由 --restart always 重新拉起，形成可见、可自愈的失败。
     if cfg.config_exists() || mgr.paths().config_bak_path().exists() {
-        match mgr.apply_config(false).await {
-            Ok(report) => tracing::info!(
-                ok = report.ok(),
-                written = report.written,
-                restarted = report.restarted,
-                message = %report.message(),
-                "启动时应用配置"
-            ),
-            Err(err) => tracing::warn!("启动时应用配置失败: {err:#}"),
+        const STARTUP_APPLY_ATTEMPTS: u32 = 3;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=STARTUP_APPLY_ATTEMPTS {
+            match mgr.apply_config(false).await {
+                Ok(report) => {
+                    tracing::info!(
+                        ok = report.ok(),
+                        written = report.written,
+                        restarted = report.restarted,
+                        message = %report.message(),
+                        "启动时应用配置"
+                    );
+                    last_err = None;
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        attempt = attempt,
+                        attempts = STARTUP_APPLY_ATTEMPTS,
+                        "启动时应用配置失败: {err:#}"
+                    );
+                    last_err = Some(err);
+                    if attempt < STARTUP_APPLY_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(anyhow::anyhow!(
+                "启动时应用配置重试用尽，节点内核未启动: {err:#}"
+            ));
         }
     }
 
