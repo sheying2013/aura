@@ -507,13 +507,55 @@ pub fn probe_port_free(port: i64) -> bool {
     }
 }
 
+/// 从 /proc/net/tcp{,6} 文本里挑出 LISTEN（state 0A）的本地端口。
+fn parse_listening_ports(text: &str, out: &mut BTreeSet<i64>) {
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 || fields[3] != "0A" {
+            continue;
+        }
+        if let Some((_, hex_port)) = fields[1].rsplit_once(':') {
+            if let Ok(port) = i64::from_str_radix(hex_port, 16) {
+                out.insert(port);
+            }
+        }
+    }
+}
+
+/// 系统里所有处于 LISTEN 的本地端口。非 Linux（读不到 /proc）返回空集。
+pub fn listening_ports() -> BTreeSet<i64> {
+    let mut ports = BTreeSet::new();
+    let mut readable = false;
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            readable = true;
+            parse_listening_ports(&text, &mut ports);
+        }
+    }
+    if !readable {
+        return BTreeSet::new();
+    }
+    ports
+}
+
 /// 找出第一个被外部进程占用的入站端口；skip 里的端口跳过（sing-box 自己正在用的）。
+///
+/// Linux 上只认 LISTEN：节点端口常落在内核临时端口段（ip_local_port_range）里，
+/// 出站连接会以 (本机IP, 源端口) 占住同一端口号，此时 bind 0.0.0.0 会失败，
+/// 但 sing-box 仍能正常 bind。用 bind 判占用会把可用端口误判成冲突，
+/// 直接把整份配置的应用挡下来（生产上表现为「端口被占用: 33444」启动失败）。
 pub fn detect_port_conflict(config: &Value, skip: &BTreeSet<i64>) -> Option<i64> {
+    let listening = listening_ports();
+    let have_proc = !listening.is_empty() || std::path::Path::new("/proc/net/tcp").exists();
     for port in inbound_ports(config) {
         if skip.contains(&port) {
             continue;
         }
-        if !probe_port_free(port) {
+        if have_proc {
+            if listening.contains(&port) {
+                return Some(port);
+            }
+        } else if !probe_port_free(port) {
             return Some(port);
         }
     }
@@ -1794,6 +1836,27 @@ mod tests {
         let probe = HttpClashProbe::new(1);
         assert!(!probe.version_ok(&format!("http://{}:{}", CLASH_HOST, 1), ""));
         assert_eq!(probe.port(), 1);
+    }
+
+    #[test]
+    fn parse_listening_ports_ignores_non_listen_sockets() {
+        // /proc/net/tcp 片段：0A=LISTEN、01=ESTABLISHED、06=TIME_WAIT
+        let text = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                    0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0000 100 0 0 10 0\n\
+                    1: 0100007F:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2 1 0000 100 0 0 10 0\n\
+                    2: 0A00000A:9C40 0A00000A:0050 01 00000000:00000000 00:00000000 00000000     0        0 3 1 0000 100 0 0 10 0\n\
+                    3: 0100007F:1F92 0100007F:9999 06 00000000:00000000 03:00000000 00000000     0        0 4 1 0000 100 0 0 10 0";
+        let mut ports = BTreeSet::new();
+        parse_listening_ports(text, &mut ports);
+        // 0x1F90=8080、0x1F91=8081；ESTABLISHED 的 0x9C40=40000 与 TIME_WAIT 的 0x1F92=8082 都不该算占用
+        assert_eq!(ports, BTreeSet::from([8080, 8081]));
+    }
+
+    #[test]
+    fn detect_port_conflict_ignores_ephemeral_client_sockets() {
+        // 关键回归：端口无人 LISTEN 时，即便内核把它当临时源端口用了，也不能判成冲突。
+        let config = json!({ "inbounds": [{ "listen_port": 65519 }] });
+        assert_eq!(detect_port_conflict(&config, &BTreeSet::new()), None);
     }
 
     #[test]
