@@ -45,7 +45,7 @@ pub fn b64_decode(value: &str) -> Option<String> {
     if normalized.is_empty() {
         return None;
     }
-    while normalized.len() % 4 != 0 {
+    while !normalized.len().is_multiple_of(4) {
         normalized.push('=');
     }
     let payload: String = normalized.into_iter().collect();
@@ -915,8 +915,8 @@ pub fn parse_clash_yaml(content: &str) -> Vec<SubParseNode> {
     // 先按 "- " 切块；遇到下一个顶层键就停止（proxies 列表结束）。
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut current: Option<Vec<String>> = None;
-    for index in start_index..lines.len() {
-        let line = lines[index];
+    for (index, line) in lines.iter().enumerate().skip(start_index) {
+        let line = *line;
         if index > start_index && top_level_key().is_match(line) {
             break;
         }
@@ -1633,7 +1633,7 @@ pub async fn refresh_subs(
     for record in store.list_subs() {
         if !all {
             if let Some(ids) = ids {
-                if !ids.iter().any(|id| *id == record.sub.id) {
+                if !ids.contains(&record.sub.id) {
                     continue;
                 }
             }

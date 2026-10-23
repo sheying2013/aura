@@ -184,11 +184,7 @@ impl ClashProbe for HttpClashProbe {
     fn version_ok(&self, _base: &str, secret: &str) -> bool {
         // 必须带上 clash secret：配置里写了 secret 时，裸请求只会拿到 401，
         // 那样会把已经正常起来的 sing-box 误判成「未就绪」。
-        singbox_proc::clash_api_ready(
-            self.port(),
-            singbox_proc::CLASH_PROBE_TIMEOUT,
-            Some(secret),
-        )
+        singbox_proc::clash_api_ready(self.port(), singbox_proc::CLASH_PROBE_TIMEOUT, Some(secret))
     }
 }
 
@@ -686,7 +682,10 @@ impl ConfigManager {
     pub fn production(paths: ProcPaths, settings: Arc<dyn DbSettings>) -> Self {
         // 端口必须跟随 settings（用户可在设置页改 clashPort），
         // 构造时算死会让探活盯着旧端口，热应用永远判定「未就绪」。
-        let ctl = Arc::new(StdProcControl::from_settings(paths.clone(), Arc::clone(&settings)));
+        let ctl = Arc::new(StdProcControl::from_settings(
+            paths.clone(),
+            Arc::clone(&settings),
+        ));
         let probe = Arc::new(HttpClashProbe::from_settings(Arc::clone(&settings)));
         Self::new(paths, settings, ctl, probe)
     }

@@ -514,9 +514,8 @@ pub fn select_probe_targets(
                 continue;
             }
         }
-        if !node.is_disabled() {
-            out.targets.push(node.clone());
-        } else if include_disabled && node.disabled_auto {
+        // 正常节点一律探；disabled 节点只有「自动停用」且调用方要求包含时才探。
+        if !node.is_disabled() || (include_disabled && node.disabled_auto) {
             out.targets.push(node.clone());
         } else if include_disabled {
             out.skipped.push(SkippedProbe {
@@ -1480,7 +1479,7 @@ impl Enricher {
             if risk.is_none() {
                 let pool: Vec<crate::ipinfo::ProxyNode> = online
                     .iter()
-                    .filter_map(|v| crate::ipinfo::ProxyNode::from_value(v))
+                    .filter_map(crate::ipinfo::ProxyNode::from_value)
                     .take(10)
                     .collect();
                 if !pool.is_empty() {
@@ -1804,7 +1803,7 @@ impl ProbeEngine {
         let mut need_rebuild = false;
         let mut to_enrich: Vec<Value> = Vec::new();
         let mut out: Vec<Value> = Vec::new();
-        for (target, mut item) in selection.targets.iter().zip(results.into_iter()) {
+        for (target, mut item) in selection.targets.iter().zip(results) {
             if self.op.locked() || self.op.generation() != generation {
                 break;
             }

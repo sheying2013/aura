@@ -135,6 +135,9 @@ struct Inner {
     relay_now_cache: HashMap<String, String>,
 }
 
+/// 一帧 /connections 采样算出的流量增量：节点 key -> (上行字节, 下行字节)。
+pub type ConnDeltas = HashMap<String, (u64, u64)>;
+
 pub struct Stats {
     inner: Mutex<Inner>,
     store: Arc<dyn StatsStore>,
@@ -209,18 +212,11 @@ impl Stats {
     }
 
     /// 处理一帧 `/connections` 快照。返回 (节点增量, 中转增量)，调用方负责写库。
-    pub fn process_connections(
-        &self,
-        conns: &[Value],
-    ) -> (HashMap<String, (u64, u64)>, HashMap<String, (u64, u64)>) {
+    pub fn process_connections(&self, conns: &[Value]) -> (ConnDeltas, ConnDeltas) {
         self.process_connections_at(conns, monotonic())
     }
 
-    pub fn process_connections_at(
-        &self,
-        conns: &[Value],
-        now: f64,
-    ) -> (HashMap<String, (u64, u64)>, HashMap<String, (u64, u64)>) {
+    pub fn process_connections_at(&self, conns: &[Value], now: f64) -> (ConnDeltas, ConnDeltas) {
         let mut g = self.inner.lock().unwrap();
         let mut dt = match g.conn_sample_ts {
             Some(t) => now - t,

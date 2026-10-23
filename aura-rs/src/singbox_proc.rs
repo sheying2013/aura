@@ -456,10 +456,13 @@ fn clash_probe(port: u16, timeout: Duration, secret: Option<&str>, require_200: 
     match stream.read(&mut buf) {
         Ok(n) if n > 0 => {
             let head = String::from_utf8_lossy(&buf[..n]).into_owned();
-            if !head.starts_with("HTTP/") {
+            // 只看状态行：首包可能已带响应体，用整包 contains(" 200") 会把
+            // 「401 + body 里恰好含 200」误判成就绪。
+            let status_line = head.split("\r\n").next().unwrap_or("").to_string();
+            if !status_line.starts_with("HTTP/") {
                 return false;
             }
-            !require_200 || head.contains(" 200")
+            !require_200 || status_line.contains(" 200")
         }
         _ => false,
     }

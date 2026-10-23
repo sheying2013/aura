@@ -240,9 +240,10 @@ impl Auth {
         let now = now_secs();
         Self::prune_failures(&mut state, now);
         let recent = state.failures.get(key).cloned().unwrap_or_default();
-        let limited = if recent.is_empty() && state.failures.len() >= MAX_FAILURE_KEYS {
-            true
-        } else if recent.len() >= MAX_FAILURES_PER_KEY {
+        // 两个上限：跟踪的 key 总数过多（全局防刷爆内存），或单 key 失败次数过多。
+        let limited = if (recent.is_empty() && state.failures.len() >= MAX_FAILURE_KEYS)
+            || recent.len() >= MAX_FAILURES_PER_KEY
+        {
             true
         } else {
             recent

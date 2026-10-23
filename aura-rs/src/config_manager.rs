@@ -406,7 +406,7 @@ fn fill_vless_vmess_tls(
         let obj = tls_dict.as_object_mut().expect("tls_enabled_dict 返回对象");
         let has_reality = obj
             .get("reality")
-            .map(|v| crate::config_manager::is_truthy(v))
+            .map(crate::config_manager::is_truthy)
             .unwrap_or(false);
         let has_sni = obj
             .get("server_name")

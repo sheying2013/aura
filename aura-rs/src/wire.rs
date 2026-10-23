@@ -114,10 +114,10 @@ impl SubsStore for Db {
                     }
                 }
                 NodeBatchResponse {
-                    created: r.created as i64,
-                    updated: r.updated as i64,
-                    skipped: r.skipped as i64,
-                    duplicate: r.duplicate as i64,
+                    created: r.created,
+                    updated: r.updated,
+                    skipped: r.skipped,
+                    duplicate: r.duplicate,
                     failed: 0,
                     items: r.items,
                 }
@@ -235,11 +235,6 @@ impl Prober for NoopProber {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 端口占用检查（create_node 用）
-// ---------------------------------------------------------------------------
-
-/// nodes + relay_domains + settings.system.reservedPorts 的全部已占用端口。
 // ---------------------------------------------------------------------------
 // 生产用 ConfigService 适配层
 // ---------------------------------------------------------------------------
@@ -436,6 +431,11 @@ impl ConfigService for ConfigAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 端口占用检查（create_node 用）
+// ---------------------------------------------------------------------------
+
+/// nodes + relay_domains + settings.system.reservedPorts 的全部已占用端口。
 pub fn used_ports(db: &Db, relay_domains: &[RelayDomain]) -> Vec<i64> {
     let mut ports: Vec<i64> = Vec::new();
     if let Ok(nodes) = Db::list_nodes(db, None, None, None) {
