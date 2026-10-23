@@ -1683,20 +1683,137 @@
 
     <!-- 5. 编辑节点 Modal -->
     <div class="modal-overlay" id="edit-modal">
-        <div class="modal-content">
+        <div class="modal-content" style="max-width: 620px;">
             <h2 class="modal-title">编辑节点</h2>
+            
+            <!-- 节点基本信息 -->
             <div class="form-group">
                 <label class="form-label">节点名称（备注）</label>
                 <input type="text" id="edit-node-name" class="form-input" value="HK-Premium-01">
             </div>
+            <div class="form-group">
+                <label class="form-label">所属分组</label>
+                <input type="text" id="edit-node-group" class="form-input" value="Premium HK">
+            </div>
+
+            <!-- 原始上游节点配置 -->
+            <div style="font-size: 11px; font-weight: 500; color: var(--rock); letter-spacing: 1px; text-transform: uppercase; margin: 20px 0 10px; border-bottom: 1px dashed var(--dim); padding-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
+                <span>原始节点（上游源站配置）</span>
+                <button type="button" class="btn" style="padding: 2px 8px; font-size: 10px; height: auto;" onclick="toggleEditRawLinkBar()">从单链接快速填入</button>
+            </div>
+
+            <div id="edit-raw-link-bar" style="display: none; background: rgba(0,0,0,0.25); border: 1px solid var(--dim); border-radius: 4px; padding: 10px; margin-bottom: 12px;">
+                <div style="font-size: 11px; color: var(--rock); margin-bottom: 6px;">粘贴单链接快速解析填入（如 socks5://...、ss://...、vless://...）：</div>
+                <div style="display: flex; gap: 8px;">
+                    <input type="text" id="edit-raw-link-input" class="form-input" style="flex: 1;" placeholder="socks5://..., ss://..., vmess://..., vless://..., trojan://...">
+                    <button type="button" class="btn btn-primary" style="padding: 6px 14px; font-size: 11px;" onclick="handleParseEditRawLink()">解析填入</button>
+                </div>
+                <div id="edit-raw-link-msg" style="font-size: 10px; margin-top: 4px; min-height: 14px;"></div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">原始协议</label>
+                <select id="edit-raw-protocol" class="form-select" onchange="handleEditRawProtoChange()">
+                    <option value="socks5">SOCKS5</option>
+                    <option value="http">HTTP</option>
+                    <option value="shadowsocks">Shadowsocks (SS)</option>
+                    <option value="vmess">VMess</option>
+                    <option value="vless">VLESS</option>
+                    <option value="trojan">Trojan</option>
+                    <option value="hysteria2">Hysteria 2</option>
+                    <option value="tuic">TUIC</option>
+                    <option value="wireguard">WireGuard</option>
+                </select>
+            </div>
+
             <div style="display:flex; gap: 16px;">
-                <div class="form-group" style="flex:1;">
-                    <label class="form-label">分组</label>
-                    <input type="text" id="edit-node-group" class="form-input" value="Premium HK">
+                <div class="form-group" style="flex:2;">
+                    <label class="form-label">服务器地址 (IP / 域名)</label>
+                    <input type="text" id="edit-raw-server" class="form-input" placeholder="例如: 1.2.3.4 或 jp.example.com">
                 </div>
                 <div class="form-group" style="flex:1;">
-                    <label class="form-label">端口</label>
+                    <label class="form-label">服务器端口</label>
+                    <input type="number" id="edit-raw-port" class="form-input" placeholder="1-65535" min="1" max="65535">
+                </div>
+            </div>
+
+            <!-- SOCKS5 / HTTP 认证 -->
+            <div id="edit-raw-socks-group" style="display:flex; gap: 16px;">
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">原始认证用户名（可选）</label>
+                    <input type="text" id="edit-raw-user" class="form-input" placeholder="无认证留空">
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">原始认证密码（可选）</label>
+                    <input type="text" id="edit-raw-pass" class="form-input" placeholder="无认证留空">
+                </div>
+            </div>
+
+            <!-- Shadowsocks 加密与密码 -->
+            <div id="edit-raw-ss-group" style="display:none; gap: 16px;">
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">加密方式 (Cipher)</label>
+                    <input type="text" id="edit-raw-ss-method" class="form-input" placeholder="如: aes-256-gcm">
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">节点密码</label>
+                    <input type="text" id="edit-raw-ss-pass" class="form-input" placeholder="Shadowsocks 密码">
+                </div>
+            </div>
+
+            <!-- VMess / VLESS / TUIC UUID -->
+            <div id="edit-raw-uuid-group" style="display:none; gap: 16px;">
+                <div class="form-group" style="flex:2;">
+                    <label class="form-label">用户 UUID</label>
+                    <input type="text" id="edit-raw-uuid" class="form-input" placeholder="UUID">
+                </div>
+                <div class="form-group" style="flex:1;" id="edit-raw-flow-group">
+                    <label class="form-label">流控 (Flow)</label>
+                    <input type="text" id="edit-raw-flow" class="form-input" placeholder="如: xtls-rprx-vision">
+                </div>
+                <div class="form-group" style="flex:1;" id="edit-raw-security-group">
+                    <label class="form-label">加密 (Security)</label>
+                    <input type="text" id="edit-raw-security" class="form-input" placeholder="auto / none">
+                </div>
+            </div>
+
+            <!-- Trojan / Hysteria2 密码与 SNI -->
+            <div id="edit-raw-pass-sni-group" style="display:none; gap: 16px;">
+                <div class="form-group" style="flex:1;" id="edit-raw-generic-pass-group">
+                    <label class="form-label">节点密码</label>
+                    <input type="text" id="edit-raw-generic-pass" class="form-input" placeholder="密码">
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">TLS SNI / 伪装域名（可选）</label>
+                    <input type="text" id="edit-raw-sni" class="form-input" placeholder="留空默认同服务器地址">
+                </div>
+            </div>
+
+            <!-- 高级：rawConfig JSON 展开 -->
+            <details id="edit-raw-json-details" style="margin: 6px 0 14px 0; font-size: 11px;">
+                <summary style="cursor: pointer; opacity: 0.8; color: var(--rock);">展开高级原始配置 (rawConfig JSON)</summary>
+                <div style="margin-top: 6px;">
+                    <textarea id="edit-raw-json" class="form-input" style="height: 100px; font-family: var(--font-mono); font-size: 11px; line-height: 1.4;" placeholder="{}"></textarea>
+                    <div style="font-size: 10px; opacity: 0.6; margin-top: 2px;">可直接修改拓展属性（如 transport/tls），保存时将自动浅合并。</div>
+                </div>
+            </details>
+
+            <!-- 本地中转配置 -->
+            <div style="font-size: 11px; font-weight: 500; color: var(--rock); letter-spacing: 1px; text-transform: uppercase; margin: 20px 0 10px; border-bottom: 1px dashed var(--dim); padding-bottom: 6px;">
+                <span>本地中转（转换后入口配置）</span>
+            </div>
+
+            <div style="display:flex; gap: 16px;">
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">中转监听端口</label>
                     <input type="number" id="edit-node-port" class="form-input" value="10001">
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label class="form-label">对外出口协议</label>
+                    <select id="edit-node-entry" class="form-select" onchange="toggleEditEntryPassField()">
+                        <option value="mixed">socks5 + http（中转代理）</option>
+                        <option value="ss">Shadowsocks (aes-256-gcm)</option>
+                    </select>
                 </div>
             </div>
             <div style="display:flex; gap: 16px;">
@@ -1709,18 +1826,12 @@
                     <input type="text" id="edit-node-auth-pass" class="form-input" placeholder="密码">
                 </div>
             </div>
-            <div id="edit-node-sub" style="font-size: 11px; opacity: 0.7; margin-bottom: 12px; font-family: var(--font-mono);"></div>
-            <div class="form-group">
-                <label class="form-label">对外出口协议</label>
-                <select id="edit-node-entry" class="form-select" onchange="toggleEditEntryPassField()">
-                    <option value="mixed">socks5 + http（中转代理）</option>
-                    <option value="ss">Shadowsocks (aes-256-gcm)</option>
-                </select>
-            </div>
             <div class="form-group" id="edit-node-sspass-group">
                 <label class="form-label">Shadowsocks 密码（留空保留原密码）</label>
                 <input type="text" id="edit-node-sspass" class="form-input" placeholder="留空保留原密码">
             </div>
+            <div id="edit-node-sub" style="font-size: 11px; opacity: 0.7; margin-bottom: 12px; font-family: var(--font-mono);"></div>
+
             <div id="edit-node-error" style="color: var(--danger); font-size: 11px; margin-bottom: 14px; min-height: 16px;"></div>
             <div class="modal-actions">
                 <button class="btn" onclick="closeModal('edit-modal')">取消</button>

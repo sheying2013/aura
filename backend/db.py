@@ -517,6 +517,29 @@ def update_node(node_id: str, patch: Dict[str, Any]) -> Optional[Dict]:
         merged = {**cur}
         for k, v in patch.items():
             merged[k] = v
+        if isinstance(patch.get("rawConfig"), dict):
+            cur_raw = cur.get("rawConfig") if isinstance(cur.get("rawConfig"), dict) else {}
+            merged["rawConfig"] = {**cur_raw, **patch["rawConfig"]}
+
+        # 如果原始上游服务器地址、端口或协议改变，且 patch 未显式指定 exitIp，重置 exitIp 为 N/A、ping 归零，清理过期的地理/风控标记
+        cur_raw = cur.get("rawConfig") or {}
+        new_raw = merged.get("rawConfig") or {}
+        cur_server = cur_raw.get("server") or cur_raw.get("address")
+        new_server = new_raw.get("server") or new_raw.get("address")
+        cur_port = cur_raw.get("server_port") or cur_raw.get("port")
+        new_port = new_raw.get("server_port") or new_raw.get("port")
+        proto_changed = "protocol" in patch and patch["protocol"] != cur.get("protocol")
+        upstream_changed = (new_server is not None and new_server != cur_server) or                            (new_port is not None and new_port != cur_port) or proto_changed
+        if upstream_changed and "exitIp" not in patch:
+            merged["exitIp"] = "N/A"
+            merged["ping"] = 0
+            merged["exitCountry"] = None
+            merged["exitFlag"] = None
+            merged["exitCity"] = None
+            merged["exitType"] = None
+            merged["exitScore"] = None
+            merged["exitRisk"] = None
+
         if "status" in patch:
             # 显式 status 变更是管理动作；自动停用调用必须显式传 disabledAuto=True。
             merged["consecutiveFails"] = 0

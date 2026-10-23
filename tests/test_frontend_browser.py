@@ -531,6 +531,13 @@ def test_export_domain_drafts_failed_save_and_clear(ui):
     assert page.evaluate("getExportHost()") == "aura.test"
     page.evaluate("generateExportText()")
     assert "@aura.test:52001" in page.locator("#export-text-area").input_value()
+    assert not page.evaluate("settingsDirty")
+    field.fill("")
+    page.evaluate("saveSystemSettings()")
+    assert state["settings"]["exportDomain"] == ""
+    assert page.evaluate("getExportHost()") == "aura.test"
+    page.evaluate("generateExportText()")
+    assert "@aura.test:52001" in page.locator("#export-text-area").input_value()
 
 
 def test_export_domain_normalized_save_skips_reload_message(ui):
@@ -585,3 +592,74 @@ def test_stale_settings_fetch_does_not_replace_saved_domain(ui):
     page.evaluate("window.__releaseSettings(); window.__pendingSettings")
     assert page.evaluate("getExportHost()") == "new.example.com"
     assert page.locator("#setting-export-domain").input_value() == "new.example.com"
+
+
+def test_edit_raw_upstream_node_modal_and_patch(ui):
+    page, state = ui
+    state["nodes"] = [node("n1", protocol="socks5", rawConfig={"server": "jp.example.com", "server_port": 40136, "username": "olduser", "password": "oldpass"})]
+    page.evaluate("loadNodes()")
+
+    # 1. 打开编辑弹窗
+    page.evaluate("openEditNodeModal('n1')")
+    assert page.locator("#edit-modal").evaluate("el => el.classList.contains('active')")
+    assert page.locator("#edit-raw-server").input_value() == "jp.example.com"
+    assert page.locator("#edit-raw-port").input_value() == "40136"
+    assert page.locator("#edit-raw-user").input_value() == "olduser"
+    assert page.locator("#edit-raw-pass").input_value() == "oldpass"
+    assert page.locator("#edit-raw-protocol").input_value() == "socks5"
+    assert page.locator("#edit-raw-socks-group").evaluate("el => el.style.display !== 'none'")
+
+    # 2. 切换协议至 vless，验证协议字段组联动显隐
+    page.locator("#edit-raw-protocol").select_option("vless")
+    page.evaluate("handleEditRawProtoChange()")
+    assert page.locator("#edit-raw-socks-group").evaluate("el => el.style.display === 'none'")
+    assert page.locator("#edit-raw-uuid-group").evaluate("el => el.style.display !== 'none'")
+    assert page.locator("#edit-raw-flow-group").evaluate("el => el.style.display !== 'none'")
+
+    # 3. 切回 socks5 并修改原始服务器与端口
+    page.locator("#edit-raw-protocol").select_option("socks5")
+    page.evaluate("handleEditRawProtoChange()")
+    page.locator("#edit-raw-server").fill("198.51.100.99")
+    page.locator("#edit-raw-port").fill("40139")
+    page.locator("#edit-raw-user").fill("newuser")
+    page.locator("#edit-raw-pass").fill("newpass")
+
+    # 4. 点击保存并验证发送的 PATCH 请求载荷
+    state["requests"].clear()
+    page.evaluate("handleSaveNodeEdit()")
+    assert not page.locator("#edit-modal").evaluate("el => el.classList.contains('active')")
+
+    patch_req = next(r for r in state["requests"] if r[0] == "PATCH" and r[1] == "/api/nodes/n1")
+    patch_payload = patch_req[2]
+    assert patch_payload["protocol"] == "socks5"
+    assert patch_payload["rawConfig"]["server"] == "198.51.100.99"
+    assert patch_payload["rawConfig"]["server_port"] == 40139
+    assert patch_payload["rawConfig"]["username"] == "newuser"
+    assert patch_payload["rawConfig"]["password"] == "newpass"
+
+    # 5. 测试从单链接快速解析填入
+    page.evaluate("openEditNodeModal('n1')")
+    page.evaluate("toggleEditRawLinkBar()")
+    assert page.locator("#edit-raw-link-bar").evaluate("el => el.style.display !== 'none'")
+
+    # mock /api/subs/parse
+    state["responses"]["/api/subs/parse"] = (200, {
+        "nodes": [{
+            "protocol": "socks5",
+            "name": "快速导入测试",
+            "rawConfig": {
+                "server": "198.51.100.88",
+                "server_port": 40188,
+                "username": "u88",
+                "password": "p88"
+            }
+        }]
+    })
+    page.locator("#edit-raw-link-input").fill("socks5://u88:p88@198.51.100.88:40188#快速导入测试")
+    page.evaluate("handleParseEditRawLink()")
+
+    assert page.locator("#edit-raw-server").input_value() == "198.51.100.88"
+    assert page.locator("#edit-raw-port").input_value() == "40188"
+    assert page.locator("#edit-raw-user").input_value() == "u88"
+    assert page.locator("#edit-raw-pass").input_value() == "p88"
+    assert "成功解析" in page.locator("#edit-raw-link-msg").inner_text()

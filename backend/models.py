@@ -85,6 +85,7 @@ class NodeListResponse(BaseModel):
 class NodePatch(BaseModel):
     """节点可 patch 字段（可选，缺省不变）。"""
     name: Optional[str] = None
+    protocol: Optional[str] = None
     group: Optional[str] = None
     port: Optional[int] = None
     segment: Optional[int] = None

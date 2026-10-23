@@ -1205,6 +1205,58 @@ impl Db {
         for (k, v) in &patch_obj {
             merged.insert(k.clone(), v.clone());
         }
+        // 如果传入了 rawConfig 且为 Object，浅合并已有 rawConfig，保留未传入的凭据与拓展参数
+        if let Some(Value::Object(new_raw)) = patch_obj.get("rawConfig") {
+            let mut cur_raw = cur
+                .base
+                .raw_config
+                .as_ref()
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            for (rk, rv) in new_raw {
+                cur_raw.insert(rk.clone(), rv.clone());
+            }
+            merged.insert("rawConfig".into(), Value::Object(cur_raw));
+        }
+
+        // 如果原始上游服务器地址、端口或协议改变，且 patch 未显式指定 exitIp，重置 exitIp 为 N/A、ping 归零，清理过期的地理/风控标记
+        let cur_raw_obj = cur.base.raw_config.as_ref().and_then(|v| v.as_object());
+        let cur_server = cur_raw_obj
+            .and_then(|o| o.get("server").or_else(|| o.get("address")))
+            .and_then(|v| v.as_str());
+        let cur_sport = cur_raw_obj
+            .and_then(|o| o.get("server_port").or_else(|| o.get("port")))
+            .and_then(val_i64);
+
+        let new_raw_obj = merged.get("rawConfig").and_then(|v| v.as_object());
+        let new_server = new_raw_obj
+            .and_then(|o| o.get("server").or_else(|| o.get("address")))
+            .and_then(|v| v.as_str());
+        let new_sport = new_raw_obj
+            .and_then(|o| o.get("server_port").or_else(|| o.get("port")))
+            .and_then(val_i64);
+
+        let proto_changed = patch_obj
+            .get("protocol")
+            .and_then(val_str)
+            .map(|p| p != cur.base.protocol)
+            .unwrap_or(false);
+        let upstream_changed = (new_server.is_some() && new_server != cur_server)
+            || (new_sport.is_some() && new_sport != cur_sport)
+            || proto_changed;
+
+        if upstream_changed && !patch_obj.contains_key("exitIp") {
+            merged.insert("exitIp".into(), Value::String("N/A".into()));
+            merged.insert("ping".into(), Value::from(0));
+            merged.insert("exitCountry".into(), Value::Null);
+            merged.insert("exitFlag".into(), Value::Null);
+            merged.insert("exitCity".into(), Value::Null);
+            merged.insert("exitType".into(), Value::Null);
+            merged.insert("exitScore".into(), Value::Null);
+            merged.insert("exitRisk".into(), Value::Null);
+        }
+
         // 显式 status 变更是管理动作：清零失败计数；自动停用必须显式传 disabledAuto=True。
         if patch_obj.contains_key("status") {
             merged.insert("consecutiveFails".into(), Value::from(0));
@@ -1874,6 +1926,9 @@ pub fn patch_to_value(p: &NodePatch) -> Value {
     if let Some(v) = &p.name {
         m.insert("name".into(), Value::String(v.clone()));
     }
+    if let Some(v) = &p.protocol {
+        m.insert("protocol".into(), Value::String(v.clone()));
+    }
     if let Some(v) = &p.group {
         m.insert("group".into(), Value::String(v.clone()));
     }
@@ -2497,6 +2552,99 @@ mod tests {
         assert_eq!(after.base.consecutive_fails, Some(24));
         assert_eq!(after.base.disabled_auto, Some(true));
         assert_eq!(after.base.exit_ip.as_deref(), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn update_node_json_upstream_raw_config_merge_and_exit_ip_reset() {
+        let d = db();
+        let mut initial_node = node_json("test-upstream", 52002);
+        initial_node["rawConfig"] = json!({
+            "server": "1.1.1.1",
+            "server_port": 1080,
+            "username": "user1",
+            "password": "pass1",
+            "method": "aes-256-gcm"
+        });
+        initial_node["exitIp"] = json!("1.1.1.1");
+        initial_node["ping"] = json!(88);
+        initial_node["exitCountry"] = json!("HK");
+
+        let node = d
+            .create_node_batch_json(&[initial_node], false)
+            .unwrap()
+            .items[0]
+            .clone();
+
+        // 1. 只改 server，验证浅合并（保留 password、username 等）且 exit_ip 重置为 N/A、ping 归零、exitCountry 清空
+        let updated = d
+            .update_node_json(
+                &node.id,
+                &json!({
+                    "rawConfig": {
+                        "server": "2.2.2.2"
+                    }
+                }),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.base.exit_ip.as_deref(), Some("N/A"));
+        assert_eq!(updated.base.ping, Some(0));
+        assert_eq!(updated.base.exit_country, None);
+
+        let raw = updated.base.raw_config.unwrap();
+        assert_eq!(raw["server"], json!("2.2.2.2"));
+        assert_eq!(raw["server_port"], json!(1080));
+        assert_eq!(raw["username"], json!("user1"));
+        assert_eq!(raw["password"], json!("pass1"));
+
+        // 2. 改原始端口 server_port，同样触发 reset
+        d.update_node_json(
+            &node.id,
+            &json!({"exitIp": "9.9.9.9", "ping": 50, "exitCountry": "US"}),
+        )
+        .unwrap();
+
+        let updated2 = d
+            .update_node_json(
+                &node.id,
+                &json!({
+                    "rawConfig": {
+                        "server_port": 2080
+                    }
+                }),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated2.base.exit_ip.as_deref(), Some("N/A"));
+        assert_eq!(updated2.base.ping, Some(0));
+        assert_eq!(updated2.base.exit_country, None);
+        let raw2 = updated2.base.raw_config.unwrap();
+        assert_eq!(raw2["server"], json!("2.2.2.2"));
+        assert_eq!(raw2["server_port"], json!(2080));
+
+        // 3. 改协议（从 shadowsocks 改为 vless），同样触发 reset
+        d.update_node_json(&node.id, &json!({"exitIp": "9.9.9.9", "ping": 50}))
+            .unwrap();
+        let updated3 = d
+            .update_node_json(&node.id, &json!({"protocol": "vless"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated3.base.protocol, "vless");
+        assert_eq!(updated3.base.exit_ip.as_deref(), Some("N/A"));
+        assert_eq!(updated3.base.ping, Some(0));
+
+        // 4. 只改 remark 名称，不应重置 exit_ip 与 ping
+        d.update_node_json(&node.id, &json!({"exitIp": "9.9.9.9", "ping": 50}))
+            .unwrap();
+        let updated4 = d
+            .update_node_json(&node.id, &json!({"name": "renamed-upstream"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated4.base.name, "renamed-upstream");
+        assert_eq!(updated4.base.exit_ip.as_deref(), Some("9.9.9.9"));
+        assert_eq!(updated4.base.ping, Some(50));
     }
 
     // 11. 老库迁移补回 disabled_auto

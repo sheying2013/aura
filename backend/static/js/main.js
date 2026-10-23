@@ -1472,6 +1472,135 @@ async function pingSingleNode(id) {
 }
 
 // Node Edit Modal
+function toggleEditRawLinkBar() {
+    const bar = document.getElementById('edit-raw-link-bar');
+    if (!bar) return;
+    const isHidden = bar.style.display === 'none';
+    bar.style.display = isHidden ? 'block' : 'none';
+    if (isHidden) {
+        const inp = document.getElementById('edit-raw-link-input');
+        if (inp) { inp.value = ''; inp.focus(); }
+        const msg = document.getElementById('edit-raw-link-msg');
+        if (msg) msg.textContent = '';
+    }
+}
+
+function handleEditRawProtoChange() {
+    const protoEl = document.getElementById('edit-raw-protocol');
+    const p = (protoEl ? protoEl.value : 'socks5').toLowerCase();
+
+    const socksGroup = document.getElementById('edit-raw-socks-group');
+    const ssGroup = document.getElementById('edit-raw-ss-group');
+    const uuidGroup = document.getElementById('edit-raw-uuid-group');
+    const passSniGroup = document.getElementById('edit-raw-pass-sni-group');
+    const flowGroup = document.getElementById('edit-raw-flow-group');
+    const secGroup = document.getElementById('edit-raw-security-group');
+    const genPassGroup = document.getElementById('edit-raw-generic-pass-group');
+
+    if (socksGroup) socksGroup.style.display = (p === 'socks5' || p === 'http') ? 'flex' : 'none';
+    if (ssGroup) ssGroup.style.display = (p === 'shadowsocks') ? 'flex' : 'none';
+    if (uuidGroup) uuidGroup.style.display = (p === 'vmess' || p === 'vless' || p === 'tuic') ? 'flex' : 'none';
+    if (flowGroup) flowGroup.style.display = (p === 'vless') ? 'block' : 'none';
+    if (secGroup) secGroup.style.display = (p === 'vmess') ? 'block' : 'none';
+    if (passSniGroup) passSniGroup.style.display = (p === 'trojan' || p === 'hysteria2' || p === 'tuic') ? 'flex' : 'none';
+    if (genPassGroup) genPassGroup.style.display = (p === 'trojan' || p === 'hysteria2') ? 'block' : 'none';
+}
+
+function fillEditRawFieldsFromConfig(proto, raw) {
+    if (!raw) raw = {};
+    const p = (proto || '').toLowerCase();
+
+    // server & port
+    const srv = raw.server || raw.address || '';
+    const sp = raw.server_port || raw.port || '';
+    const srvEl = document.getElementById('edit-raw-server');
+    const spEl = document.getElementById('edit-raw-port');
+    if (srvEl) srvEl.value = srv;
+    if (spEl) spEl.value = sp;
+
+    // SOCKS / HTTP
+    const userEl = document.getElementById('edit-raw-user');
+    const passEl = document.getElementById('edit-raw-pass');
+    if (userEl) userEl.value = raw.username || '';
+    if (passEl) passEl.value = raw.password || '';
+
+    // Shadowsocks
+    const ssMethodEl = document.getElementById('edit-raw-ss-method');
+    const ssPassEl = document.getElementById('edit-raw-ss-pass');
+    if (ssMethodEl) ssMethodEl.value = raw.method || raw.cipher || 'aes-256-gcm';
+    if (ssPassEl) ssPassEl.value = raw.password || '';
+
+    // VMess / VLESS / TUIC UUID
+    const uuidEl = document.getElementById('edit-raw-uuid');
+    const flowEl = document.getElementById('edit-raw-flow');
+    const secEl = document.getElementById('edit-raw-security');
+    if (uuidEl) uuidEl.value = raw.uuid || '';
+    if (flowEl) flowEl.value = raw.flow || '';
+    if (secEl) secEl.value = raw.security || 'auto';
+
+    // Trojan / Hysteria2
+    const genPassEl = document.getElementById('edit-raw-generic-pass');
+    const sniEl = document.getElementById('edit-raw-sni');
+    if (genPassEl) genPassEl.value = raw.password || raw.auth || '';
+    const tlsObj = raw.tls && typeof raw.tls === 'object' ? raw.tls : null;
+    if (sniEl) sniEl.value = raw.sni || (tlsObj && tlsObj.server_name) || raw.server_name || '';
+}
+
+async function handleParseEditRawLink() {
+    const linkInput = document.getElementById('edit-raw-link-input');
+    const msgEl = document.getElementById('edit-raw-link-msg');
+    if (!linkInput) return;
+    const link = linkInput.value.trim();
+    if (!link) {
+        if (msgEl) { msgEl.style.color = 'var(--danger)'; msgEl.textContent = '请先粘贴单链接文本'; }
+        return;
+    }
+    if (msgEl) { msgEl.style.color = 'var(--fg)'; msgEl.textContent = '正在解析...'; }
+
+    try {
+        const r = await api('/api/subs/parse', {
+            method: 'POST',
+            body: JSON.stringify({ content: link })
+        });
+        const res = await r.json();
+        const nodes = (res && res.nodes) || [];
+        if (nodes.length === 0) {
+            throw new Error('未识别到有效节点链接');
+        }
+        const parsed = nodes[0];
+        const raw = parsed.rawConfig || {};
+
+        // 填入协议
+        const protoEl = document.getElementById('edit-raw-protocol');
+        if (protoEl && parsed.protocol) {
+            protoEl.value = parsed.protocol;
+        }
+        // 如果备注名称还是默认值或者用户想更新，可更新节点名称
+        const nameEl = document.getElementById('edit-node-name');
+        if (nameEl && parsed.name && (!nameEl.value || nameEl.value.startsWith('Imported-Node-'))) {
+            nameEl.value = parsed.name;
+        }
+
+        fillEditRawFieldsFromConfig(parsed.protocol || 'socks5', raw);
+
+        // 刷新 JSON
+        const jsonEl = document.getElementById('edit-raw-json');
+        if (jsonEl) jsonEl.value = JSON.stringify(raw, null, 2);
+
+        handleEditRawProtoChange();
+
+        if (msgEl) {
+            msgEl.style.color = 'var(--success)';
+            msgEl.textContent = `成功解析 [${parsed.protocol}] 节点配置并已填入下方！`;
+        }
+    } catch (e) {
+        if (msgEl) {
+            msgEl.style.color = 'var(--danger)';
+            msgEl.textContent = '解析失败: ' + e.message;
+        }
+    }
+}
+
 function openEditNodeModal(id) {
     const node = nodeState.find(n => n.id === id);
     if (!node) return;
@@ -1492,9 +1621,36 @@ function openEditNodeModal(id) {
     if (passEl) passEl.value = node.authPass || '';
     if (entryEl) entryEl.value = node.entryProto || 'mixed';
     if (ssPassEl) ssPassEl.value = node.ssPass || '';
+
+    // 原始节点配置初始化
+    const raw = (node.rawConfig && typeof node.rawConfig === 'object') ? node.rawConfig : {};
+    const protoEl = document.getElementById('edit-raw-protocol');
+    const proto = (node.protocol || raw.type || 'socks5').toLowerCase();
+    if (protoEl) protoEl.value = proto;
+
+    fillEditRawFieldsFromConfig(proto, raw);
+
+    const jsonEl = document.getElementById('edit-raw-json');
+    if (jsonEl) {
+        try {
+            jsonEl.value = JSON.stringify(raw, null, 2);
+        } catch (_) {
+            jsonEl.value = '{}';
+        }
+    }
+
+    const linkBar = document.getElementById('edit-raw-link-bar');
+    if (linkBar) linkBar.style.display = 'none';
+    const linkMsg = document.getElementById('edit-raw-link-msg');
+    if (linkMsg) linkMsg.textContent = '';
+    const errEl = document.getElementById('edit-node-error');
+    if (errEl) errEl.textContent = '';
+
+    handleEditRawProtoChange();
+
     // 协议/端口静态信息行（旧版 edit-node-sub）
     const subEl = document.getElementById('edit-node-sub');
-    if (subEl) subEl.textContent = `协议: ${(node.protocol || '').toUpperCase()} | 端口: ${node.port}${node.subName ? ' | 订阅: ' + node.subName : ''}`;
+    if (subEl) subEl.textContent = `内部中转端口: ${node.port}${node.subName ? ' | 所属订阅: ' + node.subName : ''}`;
     toggleEditEntryPassField();
 
     openModal('edit-modal');
@@ -1606,28 +1762,139 @@ async function handleBatchGroup() {
 
 async function handleSaveNodeEdit() {
     if (!editingNodeId) return;
+    const node = nodeState.find(n => n.id === editingNodeId);
+    const errEl = document.getElementById('edit-node-error');
+    if (errEl) errEl.textContent = '';
+
+    // 本地中转参数
     const name = document.getElementById('edit-node-name').value.trim();
     const group = document.getElementById('edit-node-group').value.trim();
-    const port = parseInt(document.getElementById('edit-node-port').value);
+    const port = parseInt(document.getElementById('edit-node-port').value, 10);
     const authUser = document.getElementById('edit-node-auth-user').value.trim();
     const authPass = document.getElementById('edit-node-auth-pass').value.trim();
     const entryProto = document.getElementById('edit-node-entry').value;
     const ssPass = document.getElementById('edit-node-sspass').value.trim();
 
+    if (!name) {
+        if (errEl) errEl.textContent = '节点备注名称不能为空';
+        return;
+    }
+    if (isNaN(port) || port < 1 || port > 65535) {
+        if (errEl) errEl.textContent = '本地中转端口必须在 1-65535 之间';
+        return;
+    }
+
+    // 原始上游节点参数
+    const rawProto = document.getElementById('edit-raw-protocol').value;
+    const rawServer = document.getElementById('edit-raw-server').value.trim();
+    const rawPortVal = document.getElementById('edit-raw-port').value.trim();
+    const rawPort = parseInt(rawPortVal, 10);
+
+    if (!rawServer) {
+        if (errEl) errEl.textContent = '原始服务器地址不能为空 (IP 或域名)';
+        return;
+    }
+    if (isNaN(rawPort) || rawPort < 1 || rawPort > 65535) {
+        if (errEl) errEl.textContent = '原始服务器端口必须在 1-65535 之间';
+        return;
+    }
+
+    // 从 JSON 框或原 rawConfig 获取基础对象
+    let rawConfigPatch = {};
+    const jsonStr = (document.getElementById('edit-raw-json') ? document.getElementById('edit-raw-json').value : '').trim();
+    if (jsonStr) {
+        try {
+            const parsedJson = JSON.parse(jsonStr);
+            if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+                rawConfigPatch = { ...parsedJson };
+            }
+        } catch (e) {
+            if (errEl) errEl.textContent = '高级 JSON 格式错误: ' + e.message;
+            return;
+        }
+    } else if (node && node.rawConfig) {
+        rawConfigPatch = { ...node.rawConfig };
+    }
+
+    // 表单字段优先级高于手动 JSON
+    rawConfigPatch.server = rawServer;
+    rawConfigPatch.server_port = rawPort;
+    // 清理可能导致冲突的别名
+    if ('address' in rawConfigPatch && rawConfigPatch.address !== rawServer) rawConfigPatch.address = rawServer;
+    if ('port' in rawConfigPatch && rawConfigPatch.port !== rawPort) rawConfigPatch.port = rawPort;
+
+    const p = rawProto.toLowerCase();
+    if (p === 'socks5' || p === 'http') {
+        const u = document.getElementById('edit-raw-user').value.trim();
+        const pw = document.getElementById('edit-raw-pass').value.trim();
+        rawConfigPatch.username = u;
+        rawConfigPatch.password = pw;
+    } else if (p === 'shadowsocks') {
+        const m = document.getElementById('edit-raw-ss-method').value.trim();
+        const pw = document.getElementById('edit-raw-ss-pass').value.trim();
+        if (m) rawConfigPatch.method = m;
+        if (pw) rawConfigPatch.password = pw;
+    } else if (p === 'vmess') {
+        const uuid = document.getElementById('edit-raw-uuid').value.trim();
+        const sec = document.getElementById('edit-raw-security').value.trim();
+        if (uuid) rawConfigPatch.uuid = uuid;
+        if (sec) rawConfigPatch.security = sec;
+    } else if (p === 'vless') {
+        const uuid = document.getElementById('edit-raw-uuid').value.trim();
+        const flow = document.getElementById('edit-raw-flow').value.trim();
+        if (uuid) rawConfigPatch.uuid = uuid;
+        rawConfigPatch.flow = flow;
+    } else if (p === 'trojan') {
+        const pw = document.getElementById('edit-raw-generic-pass').value.trim();
+        const sni = document.getElementById('edit-raw-sni').value.trim();
+        if (pw) rawConfigPatch.password = pw;
+        if (sni) {
+            rawConfigPatch.sni = sni;
+            if (!rawConfigPatch.tls || typeof rawConfigPatch.tls !== 'object') {
+                rawConfigPatch.tls = { enabled: true, server_name: sni, insecure: true };
+            } else {
+                rawConfigPatch.tls.server_name = sni;
+            }
+        }
+    } else if (p === 'hysteria2') {
+        const pw = document.getElementById('edit-raw-generic-pass').value.trim();
+        const sni = document.getElementById('edit-raw-sni').value.trim();
+        if (pw) { rawConfigPatch.password = pw; rawConfigPatch.auth = pw; }
+        if (sni) {
+            rawConfigPatch.sni = sni;
+            if (!rawConfigPatch.tls || typeof rawConfigPatch.tls !== 'object') {
+                rawConfigPatch.tls = { enabled: true, server_name: sni };
+            } else {
+                rawConfigPatch.tls.server_name = sni;
+            }
+        }
+    } else if (p === 'tuic') {
+        const uuid = document.getElementById('edit-raw-uuid').value.trim();
+        const pw = document.getElementById('edit-raw-generic-pass').value.trim();
+        if (uuid) rawConfigPatch.uuid = uuid;
+        if (pw) rawConfigPatch.password = pw;
+    }
+
     try {
         await api(`/api/nodes/${editingNodeId}`, {
             method: 'PATCH',
             body: JSON.stringify({
-                name, group, port, authUser, authPass, entryProto,
+                name,
+                group,
+                port,
+                authUser,
+                authPass,
+                entryProto,
+                protocol: rawProto,
+                rawConfig: rawConfigPatch,
                 ...(ssPass ? { ssPass } : {})
             })
         });
         closeModal('edit-modal');
-        addLog('SUCCESS', `修改节点 [${name}] 成功`);
+        addLog('SUCCESS', `修改节点 [${name}] 成功（上游: ${rawProto}://${rawServer}:${rawPort}）`);
         await loadNodes();
         await applyConfigSilent();
     } catch (e) {
-        const errEl = document.getElementById('edit-node-error');
         if (errEl) errEl.textContent = e.message;
     }
 }

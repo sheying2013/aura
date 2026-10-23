@@ -57,6 +57,7 @@ pub struct Node {
 #[serde(rename_all = "camelCase", default)]
 pub struct NodePatch {
     pub name: Option<String>,
+    pub protocol: Option<String>,
     pub group: Option<String>,
     pub port: Option<i64>,
     pub segment: Option<i64>,
