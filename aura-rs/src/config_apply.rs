@@ -1819,7 +1819,13 @@ mod tests {
     fn std_proc_control_requires_config_file() {
         let dir = unique_dir("stdproc");
         std::fs::create_dir_all(&dir).unwrap();
-        let ctl = StdProcControl::new(ProcPaths::new(dir.clone(), "sing-box"), 9095);
+        // 用必然空闲的端口：若硬编码 9095，宿主上恰好有 sing-box 监听该端口时
+        // is_running() 会误判为真，start() 提前返回 Ok，测试随环境随机失败。
+        let free_port = {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("绑定临时端口");
+            probe.local_addr().unwrap().port()
+        };
+        let ctl = StdProcControl::new(ProcPaths::new(dir.clone(), "sing-box"), free_port);
         let err = ctl.start(&json!({})).unwrap_err();
         assert!(
             err.to_string().contains("配置文件不存在"),
