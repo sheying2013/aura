@@ -448,14 +448,18 @@ pub fn dial_socks5(endpoint: &ProxyTarget, site: &str) -> Result<String, String>
     let mut stream = connect(&endpoint.host, endpoint.port)?;
     let (user, pass) = endpoint.auth();
     socks5_handshake(&mut stream, site, TARGET_HTTP_PORT, user, pass)?;
-    read_ip(&mut stream, &origin_request(site))
+    let res = read_ip(&mut stream, &origin_request(site));
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    res
 }
 
 /// 经明文 HTTP 代理（绝对 URI + 可选 Basic 认证）取回站点回显 IP。
 pub fn dial_http(endpoint: &ProxyTarget, site: &str) -> Result<String, String> {
     let mut stream = connect(&endpoint.host, endpoint.port)?;
     let (user, pass) = endpoint.auth();
-    read_ip(&mut stream, &proxy_request(site, user, pass))
+    let res = read_ip(&mut stream, &proxy_request(site, user, pass));
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    res
 }
 
 /// 建立 TCP 连接并设置读写超时（Python 的 connect + settimeout 等价物）。
@@ -473,6 +477,7 @@ fn connect(host: &str, port: u16) -> Result<TcpStream, String> {
             Ok(s) => {
                 let _ = s.set_read_timeout(Some(CONNECT_TIMEOUT));
                 let _ = s.set_write_timeout(Some(CONNECT_TIMEOUT));
+                let _ = s.set_nodelay(true);
                 return Ok(s);
             }
             Err(e) => last = format!("连接 {addr} 失败: {e}"),

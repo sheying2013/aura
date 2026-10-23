@@ -402,6 +402,24 @@ pub fn probe_attempts(mode: ProbeMode) -> usize {
     PROBE_DELAY_RETRY + 1 + if mode.counts_failures() { 1 } else { 0 }
 }
 
+/// 结合节点当前状态获取有效探活尝试次数：
+/// 对于已离线或处于连续失败中的节点，后台探活仅尝试 1 次，严禁在死节点上高频重复重试引发连接风暴与挂起 socket 堆积；
+/// 对于在线节点，给予完整重试机会，防抖动误杀。
+pub fn probe_attempts_for_node(mode: ProbeMode, status: &str, fails: i64) -> usize {
+    if !mode.counts_failures() {
+        // 手动测活：始终按完整尝试次数，快速反馈
+        probe_attempts(mode)
+    } else if fails >= 3 {
+        // 顽固死节点熔断限流：已连续失败 >= 3 次的节点，每轮只做 1 次探活尝试，
+        // 彻底根绝死节点每轮 4 次重试叠加挂起 socket 造成的 TCP 堵塞与连接风暴
+        1
+    } else {
+        // 正常在线或初次偶发抖动节点：给予 4 次重试机会（含 8s 缓冲），防误杀
+        let _ = status;
+        probe_attempts(mode)
+    }
+}
+
 /// 第 attempt 次尝试的 delay 超时毫秒：后台最后一次用 8s 重确认，其余 5s。
 pub fn probe_delay_timeout_ms(attempt: usize) -> u64 {
     if attempt > PROBE_DELAY_RETRY {
@@ -467,6 +485,7 @@ pub struct ProbeTargetNode {
     pub disabled_auto: bool,
     pub port: i64,
     pub protocol: String,
+    pub consecutive_fails: i64,
 }
 
 impl ProbeTargetNode {
@@ -477,7 +496,13 @@ impl ProbeTargetNode {
             disabled_auto,
             port,
             protocol: protocol.to_string(),
+            consecutive_fails: 0,
         }
+    }
+
+    pub fn with_fails(mut self, fails: i64) -> Self {
+        self.consecutive_fails = fails;
+        self
     }
 
     pub fn is_disabled(&self) -> bool {
@@ -1094,7 +1119,8 @@ impl ClashApi for HttpClashApi {
             let mut rb = self
                 .client
                 .get(format!("{}/proxies/{}/delay", req.base, req.tag))
-                .query(&[("url", req.url.as_str()), ("timeout", timeout.as_str())]);
+                .query(&[("url", req.url.as_str()), ("timeout", timeout.as_str())])
+                .timeout(Duration::from_millis(req.timeout_ms + 1500));
             if let Some(h) = bearer(req.secret.as_deref()) {
                 rb = rb.header("Authorization", h);
             }
@@ -1741,6 +1767,7 @@ impl ProbeEngine {
                     n.base.port.unwrap_or(0),
                     &n.base.protocol,
                 )
+                .with_fails(n.base.consecutive_fails.unwrap_or(0))
             })
             .collect();
         let by_id: HashMap<String, ProbeTargetNode> =
@@ -1927,7 +1954,8 @@ pub async fn probe_one(
         status: "offline".to_string(),
         error: None,
     };
-    for attempt in 0..probe_attempts(mode) {
+    let attempts = probe_attempts_for_node(mode, &node.status, node.consecutive_fails);
+    for attempt in 0..attempts {
         let backoff = probe_retry_backoff(attempt) * retry_scale;
         if backoff > 0.0 {
             tokio::time::sleep(Duration::from_secs_f64(backoff)).await;
@@ -2104,7 +2132,8 @@ impl ProbeEngine {
                     node.base.disabled_auto.unwrap_or(false),
                     node.base.port.unwrap_or(0),
                     &node.base.protocol,
-                );
+                )
+                .with_fails(node.base.consecutive_fails.unwrap_or(0));
                 let clash = self.clash.clone();
                 let base = base.clone();
                 let secret = secret.clone();
@@ -3655,6 +3684,61 @@ mod probe_tests {
         let node = db.get_node("n1").unwrap().unwrap();
         assert_eq!(node.base.status.as_deref(), Some("online"));
         assert!(cfg.applies() > 0);
+    }
+
+    #[test]
+    fn probe_attempts_for_node_logic() {
+        // 手动测活始终保持 3 次尝试
+        assert_eq!(probe_attempts_for_node(ProbeMode::Manual, "online", 0), 3);
+        assert_eq!(probe_attempts_for_node(ProbeMode::Manual, "offline", 10), 3);
+
+        // 后台测活：初次离线或抖动节点（fails < 3），提供完整的 4 次尝试机会（防误杀）
+        assert_eq!(
+            probe_attempts_for_node(ProbeMode::Background, "online", 0),
+            4
+        );
+        assert_eq!(
+            probe_attempts_for_node(ProbeMode::Background, "offline", 0),
+            4
+        );
+        assert_eq!(
+            probe_attempts_for_node(ProbeMode::Background, "offline", 2),
+            4
+        );
+
+        // 后台测活：顽固死节点（fails >= 3），熔断限制为 1 次，防止连接风暴和 TCP 堵塞
+        assert_eq!(
+            probe_attempts_for_node(ProbeMode::Background, "offline", 3),
+            1
+        );
+        assert_eq!(
+            probe_attempts_for_node(ProbeMode::Background, "offline", 20),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_failing_node_throttles_to_single_attempt() {
+        let db = mem_db();
+        add_node(&db, "n1", 10001, "offline");
+        // 垫入 3 次失败，使其达到顽固死节点阈值
+        for _ in 0..3 {
+            db.update_node_probe("n1", 0, "offline", true, Some(10001), Some("trojan"))
+                .expect("seed failure");
+        }
+        let cfg = FakeCfg::new(true);
+        let clash = FakeClash::with(vec![
+            DelayOutcome::Retry("timeout".into()),
+            DelayOutcome::Retry("timeout".into()),
+            DelayOutcome::Retry("timeout".into()),
+            DelayOutcome::Retry("timeout".into()),
+        ]);
+        let engine = engine_with(db, cfg, clash.clone(), FakeOp::new());
+        // 后台测活
+        let out = crate::wire::Prober::probe(&engine, None, true, false, false).await;
+        assert_eq!(status_of(&out, "n1"), "offline");
+        // 顽固死节点仅消耗 1 次请求，不再发起 4 倍连接风暴
+        assert_eq!(clash.request_count(), 1);
     }
 
     // ---------- 出口情报 ----------
