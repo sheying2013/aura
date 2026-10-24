@@ -575,6 +575,46 @@ fn row_to_sub_row(row: &Row<'_>) -> rusqlite::Result<SubRow> {
     })
 }
 
+// ---------------------------------------------------------------- 批量探活
+
+/// 批量探活的单条输入：字段与 [`Db::update_node_probe`] 的参数一一对应。
+///
+/// 拆成结构体只为把一轮探活结果攒起来一次性落库；单条语义（CAS 条件、
+/// consecutive_fails 递增、port/protocol 变更处理）与逐条调用完全相同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeUpdateRow {
+    pub node_id: String,
+    pub ping: i64,
+    pub status: String,
+    pub count_failure: bool,
+    pub expected_port: Option<i64>,
+    pub expected_protocol: Option<String>,
+}
+
+impl ProbeUpdateRow {
+    pub fn new(
+        node_id: impl Into<String>,
+        ping: i64,
+        status: impl Into<String>,
+        count_failure: bool,
+        expected_port: Option<i64>,
+        expected_protocol: Option<&str>,
+    ) -> Self {
+        Self {
+            node_id: node_id.into(),
+            ping,
+            status: status.into(),
+            count_failure,
+            expected_port,
+            expected_protocol: expected_protocol.map(|s| s.to_string()),
+        }
+    }
+}
+
+/// 批量探活单条结果，含义与 [`Db::update_node_probe`] 的返回值一致：
+/// `None` = CAS 落空（节点已停用/删除/tag 变化），调用方必须丢弃过期结果。
+pub type UpdateNodeProbeOutcome = Option<i64>;
+
 // ---------------------------------------------------------------- Db
 
 /// 单连接 + Mutex 的 DB 句柄（与 Python 版 threading.Lock 语义一致：整连接串行）。
@@ -1614,6 +1654,66 @@ impl Db {
             )
             .optional()?
             .flatten())
+    }
+
+    /// 批量落库一轮探活结果：**单个事务**内逐条执行与 [`Db::update_node_probe`]
+    /// 完全等价的 CAS 更新（同一条 SQL、同一套绑定顺序、同一返回值语义），
+    /// 任意一条出错整体回滚，避免"写了一半"的探活结果。
+    pub fn update_node_probe_batch(
+        &self,
+        items: &[ProbeUpdateRow],
+    ) -> Result<Vec<UpdateNodeProbeOutcome>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut out: Vec<UpdateNodeProbeOutcome> = Vec::with_capacity(items.len());
+        {
+            for item in items {
+                // 以下 SQL 构造与 update_node_probe 逐字等价（改这里必须同步那里）。
+                let mut sql = String::from("UPDATE nodes SET ping=?, status=?, consecutive_fails=");
+                if item.status == "online" {
+                    sql.push('0');
+                } else if item.count_failure {
+                    sql.push_str("consecutive_fails+1");
+                } else {
+                    sql.push_str("consecutive_fails");
+                }
+                sql.push_str(", updated_at=? WHERE id=? AND status!='disabled'");
+                let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                    Box::new(item.ping),
+                    Box::new(item.status.clone()),
+                    Box::new(now_ms()),
+                    Box::new(item.node_id.clone()),
+                ];
+                if let Some(p) = item.expected_port {
+                    sql.push_str(" AND port=?");
+                    bound.push(Box::new(p));
+                }
+                if let Some(pr) = item.expected_protocol.clone() {
+                    sql.push_str(" AND protocol=?");
+                    bound.push(Box::new(pr));
+                }
+                let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+                let changed = tx.execute(&sql, refs.as_slice())?;
+                if changed == 0 {
+                    out.push(None);
+                    continue;
+                }
+                let fails = tx
+                    .query_row(
+                        "SELECT consecutive_fails FROM nodes WHERE id=?",
+                        [item.node_id.as_str()],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                out.push(fails);
+            }
+        }
+        tx.commit()?;
+        Ok(out)
     }
 
     /// 仅复活 tag 未变的自动停用节点；手动停用/过期探活不得改状态。
@@ -2789,6 +2889,310 @@ mod tests {
         );
         let after = d.get_node(&node.id).unwrap().unwrap();
         assert_eq!(j(&after), j(&node));
+    }
+
+    // 14b. 批量落库与逐条落库完全等价（success / 失败递增 / port 变化 /
+    //      protocol 变化 / offline 恢复 online / 不存在节点 / 大批量混合）
+    #[test]
+    fn update_node_probe_batch_matches_single_row_semantics() {
+        use std::collections::HashMap;
+
+        let single = db();
+        let batch = db();
+        // 两个库建同名同端口的节点，最终状态按 name 对齐比较（id 各自独立）。
+        let mut single_ids: HashMap<String, String> = HashMap::new();
+        let mut batch_ids: HashMap<String, String> = HashMap::new();
+        let mut port_of: HashMap<String, i64> = HashMap::new();
+        for (name, port) in [("a", 52001), ("b", 52002), ("c", 52003)] {
+            let n = single
+                .create_node_batch_json(&[node_json(name, port)], false)
+                .unwrap()
+                .items[0]
+                .clone();
+            single_ids.insert(name.to_string(), n.id);
+            let m = batch
+                .create_node_batch_json(&[node_json(name, port)], false)
+                .unwrap()
+                .items[0]
+                .clone();
+            batch_ids.insert(name.to_string(), m.id);
+            port_of.insert(name.to_string(), port);
+        }
+
+        type Rows = Vec<ProbeUpdateRow>;
+        type ScenarioBuilder = Box<dyn Fn(&HashMap<String, String>) -> Rows>;
+        let scenarios: Vec<(&str, ScenarioBuilder)> = vec![
+            (
+                "普通成功（online，清零）",
+                Box::new(|ids| {
+                    vec![ProbeUpdateRow::new(
+                        ids["a"].clone(),
+                        88,
+                        "online",
+                        true,
+                        Some(52001),
+                        Some("shadowsocks"),
+                    )]
+                }),
+            ),
+            (
+                "连续失败递增两次",
+                Box::new(|ids| {
+                    vec![
+                        ProbeUpdateRow::new(
+                            ids["a"].clone(),
+                            0,
+                            "offline",
+                            true,
+                            Some(52001),
+                            Some("shadowsocks"),
+                        ),
+                        ProbeUpdateRow::new(
+                            ids["a"].clone(),
+                            0,
+                            "timeout",
+                            true,
+                            Some(52001),
+                            Some("shadowsocks"),
+                        ),
+                    ]
+                }),
+            ),
+            (
+                "port 变化（tag 变化，CAS 落空）",
+                Box::new(|ids| {
+                    vec![ProbeUpdateRow::new(
+                        ids["a"].clone(),
+                        24,
+                        "online",
+                        true,
+                        Some(52099),
+                        Some("shadowsocks"),
+                    )]
+                }),
+            ),
+            (
+                "protocol 变化（tag 变化，CAS 落空）",
+                Box::new(|ids| {
+                    vec![ProbeUpdateRow::new(
+                        ids["a"].clone(),
+                        24,
+                        "online",
+                        true,
+                        Some(52001),
+                        Some("vless"),
+                    )]
+                }),
+            ),
+            (
+                "手动失败不计数",
+                Box::new(|ids| {
+                    vec![ProbeUpdateRow::new(
+                        ids["b"].clone(),
+                        0,
+                        "offline",
+                        false,
+                        Some(52002),
+                        Some("shadowsocks"),
+                    )]
+                }),
+            ),
+            (
+                "节点不存在",
+                Box::new(|_ids| {
+                    vec![ProbeUpdateRow::new(
+                        "node-dead",
+                        12,
+                        "online",
+                        true,
+                        None,
+                        None,
+                    )]
+                }),
+            ),
+            (
+                "多节点混合一轮（无 tag 约束）",
+                Box::new(|ids| {
+                    vec![
+                        ProbeUpdateRow::new(ids["b"].clone(), 31, "online", true, None, None),
+                        ProbeUpdateRow::new(ids["c"].clone(), 0, "offline", true, None, None),
+                        ProbeUpdateRow::new(ids["a"].clone(), 0, "offline", true, None, None),
+                    ]
+                }),
+            ),
+            (
+                "offline 恢复 online（清零）",
+                Box::new(|ids| {
+                    vec![ProbeUpdateRow::new(
+                        ids["a"].clone(),
+                        42,
+                        "online",
+                        true,
+                        Some(52001),
+                        Some("shadowsocks"),
+                    )]
+                }),
+            ),
+        ];
+
+        for (i, (name, build)) in scenarios.iter().enumerate() {
+            let srows = build(&single_ids);
+            let brows = build(&batch_ids);
+            let expected: Vec<Option<i64>> = srows
+                .iter()
+                .map(|r| {
+                    single
+                        .update_node_probe(
+                            &r.node_id,
+                            r.ping,
+                            &r.status,
+                            r.count_failure,
+                            r.expected_port,
+                            r.expected_protocol.as_deref(),
+                        )
+                        .unwrap()
+                })
+                .collect();
+            let got = batch.update_node_probe_batch(&brows).unwrap();
+            assert_eq!(got, expected, "场景 {i}「{name}」返回值与逐条调用不一致");
+            for (node_name, sid) in &single_ids {
+                let s = single.get_node(sid).unwrap().unwrap();
+                let b = batch.get_node(&batch_ids[node_name]).unwrap().unwrap();
+                assert_eq!(
+                    (
+                        s.base.status.clone(),
+                        s.base.ping,
+                        s.base.consecutive_fails,
+                        s.base.port,
+                        s.base.protocol.clone(),
+                        s.base.disabled_auto,
+                    ),
+                    (
+                        b.base.status.clone(),
+                        b.base.ping,
+                        b.base.consecutive_fails,
+                        b.base.port,
+                        b.base.protocol.clone(),
+                        b.base.disabled_auto,
+                    ),
+                    "场景 {i}「{name}」节点 {node_name} 最终状态不一致"
+                );
+            }
+            // 同时把语义钉死（避免新旧实现一起跑偏）
+            match i {
+                0 => assert_eq!(got, vec![Some(0)]),
+                1 => assert_eq!(got, vec![Some(1), Some(2)]),
+                2 | 3 | 5 => assert_eq!(got, vec![None]),
+                4 => assert_eq!(got, vec![Some(0)]),
+                6 => assert_eq!(got, vec![Some(0), Some(1), Some(3)]),
+                7 => assert_eq!(got, vec![Some(0)]),
+                _ => {}
+            }
+        }
+
+        // offline 恢复 online 之后：状态 online、计数清零、ping 落库
+        let a = batch.get_node(&batch_ids["a"]).unwrap().unwrap();
+        assert_eq!(a.base.status.as_deref(), Some("online"));
+        assert_eq!(a.base.consecutive_fails, Some(0));
+        assert_eq!(a.base.ping, Some(42));
+    }
+
+    // 14c. 一次批量调用 = 一个事务：中途出错必须整体回滚（逐条自动提交会写脏前半段）
+    #[test]
+    fn update_node_probe_batch_rolls_back_on_error_in_single_transaction() {
+        let d = db();
+        let items = d
+            .create_node_batch_json(
+                &[
+                    node_json("a", 52001),
+                    node_json("b", 52002),
+                    node_json("c", 52003),
+                ],
+                false,
+            )
+            .unwrap()
+            .items;
+        assert_eq!(items.len(), 3);
+        let before: Vec<Value> = items.iter().map(j).collect();
+        let rows: Vec<ProbeUpdateRow> = items
+            .iter()
+            .map(|n| {
+                ProbeUpdateRow::new(
+                    n.id.clone(),
+                    0,
+                    "offline",
+                    true,
+                    n.base.port,
+                    Some(n.base.protocol.as_str()),
+                )
+            })
+            .collect();
+        // 在第二个节点的 UPDATE 上注入错误（触发器里的字面量必须转义单引号）
+        let boom_id = items[1].id.replace('\'', "''");
+        d.execute(
+            &format!(
+                "CREATE TRIGGER probe_boom BEFORE UPDATE ON nodes WHEN NEW.id='{boom_id}' \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END"
+            ),
+            &[],
+        )
+        .unwrap();
+
+        assert!(
+            d.update_node_probe_batch(&rows).is_err(),
+            "第二条出错时批量必须整体失败"
+        );
+        for (i, node) in items.iter().enumerate() {
+            let after = d.get_node(&node.id).unwrap().unwrap();
+            assert_eq!(j(&after), before[i], "节点 {i} 被写脏：事务没有整体回滚");
+        }
+        assert!(
+            d.with_conn(|c| c.is_autocommit()),
+            "批量方法必须收尾提交/回滚，不能留下悬挂事务"
+        );
+
+        // 去掉触发器后同一批数据必须能正常落库（证明失败只因注入的错误）
+        d.execute("DROP TRIGGER probe_boom", &[]).unwrap();
+        let out = d.update_node_probe_batch(&rows).unwrap();
+        assert_eq!(out, vec![Some(1), Some(1), Some(1)]);
+    }
+
+    // 14d. 500 条批量输入：不 panic、结果条数与顺序正确、事务性写入全部生效
+    #[test]
+    fn update_node_probe_batch_handles_500_rows() {
+        let d = db();
+        let payloads: Vec<Value> = (0..500).map(|i| node_json(&format!("n{i}"), 0)).collect();
+        let items = d.create_node_batch_json(&payloads, false).unwrap().items;
+        assert_eq!(items.len(), 500);
+        let rows: Vec<ProbeUpdateRow> = items
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                ProbeUpdateRow::new(
+                    n.id.clone(),
+                    (i % 100) as i64,
+                    if i % 2 == 0 { "online" } else { "offline" },
+                    true,
+                    n.base.port,
+                    Some(n.base.protocol.as_str()),
+                )
+            })
+            .collect();
+        let out = d.update_node_probe_batch(&rows).unwrap();
+        assert_eq!(out.len(), 500);
+        assert!(out.iter().all(|o| o.is_some()));
+        assert_eq!(d.list_nodes(None, None, None).unwrap().len(), 500);
+        for (i, n) in items.iter().enumerate() {
+            let after = d.get_node(&n.id).unwrap().unwrap();
+            assert_eq!(after.base.ping, Some((i % 100) as i64));
+            if i % 2 == 0 {
+                assert_eq!(after.base.status.as_deref(), Some("online"));
+                assert_eq!(after.base.consecutive_fails.unwrap_or(-1), 0);
+            } else {
+                assert_eq!(after.base.status.as_deref(), Some("offline"));
+                assert_eq!(after.base.consecutive_fails, Some(1));
+            }
+        }
     }
 
     // 15. 不存在的节点

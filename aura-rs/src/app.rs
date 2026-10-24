@@ -378,6 +378,22 @@ fn db_err(e: anyhow::Error) -> ApiError {
     ApiError::internal(e.to_string())
 }
 
+/// 判断错误链里是否有 sqlite 唯一约束冲突（端口/主键被并发抢占）。
+///
+/// 用于把「并发创建撞端口」和其它真实故障区分开：只有唯一约束冲突才该映射成
+/// 409，磁盘满、库损坏、序列化失败等必须如实回 500。Python 参考实现同样只
+/// 捕获 `sqlite3.IntegrityError` 映射 409（`backend/app.py:192-194`），其余异常
+/// 直接冒泡成 500。
+fn is_unique_violation(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("UNIQUE constraint failed") || msg.contains("PRIMARY KEY")
+        )
+    })
+}
+
 async fn list_nodes(State(st): State<AppState>, Query(q): Query<NodeQuery>) -> ApiResult<Response> {
     let items = st
         .db
@@ -406,13 +422,14 @@ async fn create_node(State(st): State<AppState>, Json(body): Json<Value>) -> Api
     node.port = port;
     match st.db.create_node(&node) {
         Ok(created) => Ok((StatusCode::CREATED, Json(created)).into_response()),
-        Err(e) => {
-            tracing::error!("create_node 失败: {e}");
+        Err(e) if is_unique_violation(&e) => {
+            tracing::warn!("create_node 端口被并发抢占: {e}");
             Err(ApiError::conflict_detail(json!({
                 "port": port,
                 "reason": "端口已被占用（并发创建）",
             })))
         }
+        Err(e) => Err(db_err(e)),
     }
 }
 
@@ -678,7 +695,10 @@ async fn ping_nodes(State(st): State<AppState>, Json(body): Json<Value>) -> ApiR
         .prober
         .probe(req.ids, req.all, req.include_disabled, true)
         .await;
-    Ok(Json(json!({ "items": items })).into_response())
+    // 契约（API_CONTRACT.md:22 / backend/app.py:372 response_model=List[PingResultItem]）：
+    // 直接返回结果数组，不能包成 {"items": [...]}，否则前端 reportProbeResults 会抛
+    // 「探活响应格式错误」导致所有探活按钮失效。
+    Ok(Json(items).into_response())
 }
 
 async fn node_exit_ip(
@@ -1699,12 +1719,35 @@ mod tests {
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
     }
 
+    #[test]
+    fn unique_violation_is_distinguished_from_other_db_errors() {
+        // sqlite 唯一约束冲突（并发抢占端口）→ 只有当 409 处理。
+        let unique = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(2067), // SQLITE_CONSTRAINT_UNIQUE
+            Some("UNIQUE constraint failed: nodes.port".into()),
+        ));
+        assert!(is_unique_violation(&unique));
+        // anyhow context 包裹后仍要能识别（db 层常常带 context 上抛）。
+        assert!(is_unique_violation(&unique.context("insert node")));
+        // 其它故障（磁盘满、库损坏、序列化失败）不得被伪装成端口冲突。
+        assert!(!is_unique_violation(&anyhow::anyhow!("disk I/O error")));
+        assert!(!is_unique_violation(&anyhow::Error::new(
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(10),
+                Some("disk I/O error".into())
+            )
+        )));
+    }
+
     #[tokio::test]
-    async fn ping_nodes_returns_items() {
+    async fn ping_nodes_returns_bare_result_array() {
         let (router, _db, _cfg) = build();
         let (status, body) = call(router, "POST", "/api/nodes/ping", Some(json!({}))).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["items"][0]["ping"], json!(12));
+        // 契约是裸数组：前端 reportProbeResults 严格校验 Array.isArray(results)。
+        assert!(body.is_array(), "探活响应必须是数组，实际: {}", body);
+        assert!(body.get("items").is_none(), "探活响应不得再包 items 字段");
+        assert_eq!(body[0]["ping"], json!(12));
     }
 
     #[tokio::test]

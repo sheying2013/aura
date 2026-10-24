@@ -21,6 +21,17 @@ use aura::subscription_fetch::Fetcher;
 use aura::types::RelayDomain;
 use aura::wire::{AppAuthStore, ConfigAdapter, ConfigService, Prober};
 
+/// 后台周期任务统一用 Delay 语义的 interval。
+///
+/// tokio 的 interval 默认是 MissedTickBehavior::Burst：只要某轮被阻塞（网络抖动、
+/// DB 争锁），错过的那几次 tick 会在恢复瞬间以零间隔连续补发，把 DB 与 clash API
+/// 打成尖峰。Delay 语义下错过的 tick 直接丢掉、只按周期往后排，天然不会堆积。
+fn periodic(period: Duration) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -193,7 +204,7 @@ fn spawn_stats_loops(stats: Arc<Stats>, cfg: Arc<dyn ConfigService>, db: Arc<Db>
     {
         let stats = Arc::clone(&stats);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut tick = periodic(Duration::from_secs(1));
             loop {
                 tick.tick().await;
                 stats.broadcast_once(epoch_now());
@@ -207,7 +218,7 @@ fn spawn_stats_loops(stats: Arc<Stats>, cfg: Arc<dyn ConfigService>, db: Arc<Db>
         let cfg = Arc::clone(&cfg);
         tokio::spawn(async move {
             let client = reqwest::Client::new();
-            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            let mut tick = periodic(Duration::from_secs(5));
             loop {
                 tick.tick().await;
                 if !cfg.is_running() {
@@ -224,7 +235,7 @@ fn spawn_stats_loops(stats: Arc<Stats>, cfg: Arc<dyn ConfigService>, db: Arc<Db>
     {
         let stats = Arc::clone(&stats);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            let mut tick = periodic(Duration::from_secs(15));
             loop {
                 tick.tick().await;
                 stats.refresh_tag_maps();
@@ -239,33 +250,56 @@ fn spawn_stats_loops(stats: Arc<Stats>, cfg: Arc<dyn ConfigService>, db: Arc<Db>
         let db = Arc::clone(&db);
         tokio::spawn(async move {
             let client = reqwest::Client::new();
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            let mut tick = periodic(Duration::from_secs(2));
             loop {
                 tick.tick().await;
                 if !cfg.is_running() {
                     continue;
                 }
-                let Ok(domains) = db.list_relay_domains() else {
-                    continue;
-                };
+                // 同步 rusqlite 查询放到 blocking 池，避免占住 tokio worker。
+                let db_bg = Arc::clone(&db);
+                let domains =
+                    match tokio::task::spawn_blocking(move || db_bg.list_relay_domains()).await {
+                        Ok(Ok(v)) => v,
+                        _ => continue,
+                    };
                 let base = cfg.clash_base();
                 let secret = cfg.clash_secret();
+                // 多个 relay 并发查询：串行时 N 个 relay × 2s 超时会把 2s 周期彻底拖垮。
+                let mut set = tokio::task::JoinSet::new();
                 for rd in domains {
                     let tag = format!("relay-auto-{}", rd.id);
                     let url = format!("{}/proxies/{}", base.trim_end_matches('/'), tag);
-                    let mut req = client.get(url).timeout(Duration::from_secs(2));
-                    if let Some(secret) = secret.as_deref() {
-                        req = req.header("authorization", format!("Bearer {secret}"));
+                    let client = client.clone();
+                    let secret = secret.clone();
+                    set.spawn(async move {
+                        let mut req = client.get(url).timeout(Duration::from_secs(2));
+                        if let Some(secret) = secret.as_deref() {
+                            req = req.header("authorization", format!("Bearer {secret}"));
+                        }
+                        let resp = req.send().await.ok()?;
+                        if !resp.status().is_success() {
+                            return None;
+                        }
+                        let body = resp.json::<Value>().await.ok()?;
+                        let now = body.get("now").and_then(|v| v.as_str())?.to_string();
+                        Some((tag, now))
+                    });
+                }
+                // 整轮总预算：超时就丢掉本轮（JoinSet 被 drop 时会 abort 未完成任务）。
+                let collected = tokio::time::timeout(Duration::from_secs(3), async move {
+                    let mut out = Vec::new();
+                    while let Some(res) = set.join_next().await {
+                        if let Ok(Some(pair)) = res {
+                            out.push(pair);
+                        }
                     }
-                    let Ok(resp) = req.send().await else { continue };
-                    if !resp.status().is_success() {
-                        continue;
-                    }
-                    let Ok(body) = resp.json::<Value>().await else {
-                        continue;
-                    };
-                    if let Some(now) = body.get("now").and_then(|v| v.as_str()) {
-                        stats.set_relay_now(&tag, now);
+                    out
+                })
+                .await;
+                if let Ok(items) = collected {
+                    for (tag, now) in items {
+                        stats.set_relay_now(&tag, &now);
                     }
                 }
             }

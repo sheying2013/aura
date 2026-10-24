@@ -307,17 +307,26 @@ impl ConfigAdapter {
         guard.map(|t| (crate::scheduler::epoch_now() - t).max(0.0))
     }
 
-    fn clash_ok(&self, running: bool) -> bool {
+    /// clash API 就绪探测（最长 1.5s）。
+    ///
+    /// `clash_api_ready` 是同步 TCP 握手，直接在 async 上下文里调用会把这段
+    /// 物理睡眠压在 axum 的 tokio worker 线程上（apply/restart 又正好发生在
+    /// 进程重启窗口，端口最可能还没开）。统一丢进 blocking 池执行。
+    async fn clash_ok(&self, running: bool) -> bool {
         if !running {
             return false;
         }
         let port = self.mgr.clash_port().clamp(1, 65535) as u16;
         let secret = self.mgr.get_clash_secret();
-        crate::singbox_proc::clash_api_ready(
-            port,
-            std::time::Duration::from_millis(1500),
-            secret.as_deref(),
-        )
+        tokio::task::spawn_blocking(move || {
+            crate::singbox_proc::clash_api_ready(
+                port,
+                std::time::Duration::from_millis(1500),
+                secret.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
@@ -350,7 +359,7 @@ impl ConfigService for ConfigAdapter {
                     } else {
                         self.clear_started();
                     }
-                    let clash_api_ok = self.clash_ok(running);
+                    let clash_api_ok = self.clash_ok(running).await;
                     Ok(serde_json::json!({
                         "ok": report.ok(),
                         "message": report.message(),
@@ -395,7 +404,7 @@ impl ConfigService for ConfigAdapter {
             } else {
                 None
             };
-            let clash_api_ok = self.clash_ok(running);
+            let clash_api_ok = self.clash_ok(running).await;
             if running {
                 self.mark_started();
             } else {

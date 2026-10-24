@@ -1,15 +1,92 @@
 // Modal Logic
+const MODAL_NO_ESCAPE = ['pwd-modal'];   // 首登强制改密：不允许 Esc / 点遮罩关闭，避免绕过强制流程
+const modalFocusStack = [];              // 记录打开前的焦点元素，关闭时归还
+
 function openModal(id) {
     const el = document.getElementById(id);
-    if (el) el.classList.add('active');
+    if (!el) return;
+    if (!el.classList.contains('active')) {
+        modalFocusStack.push({ id: id, el: document.activeElement });
+    }
+    el.classList.add('active');
     // 打开导入弹窗时初始化 ss 密码框显隐联动
     if (id === 'import-modal') toggleImportPassField();
     if (id === 'edit-modal') toggleEditEntryPassField();
+    // 打开后把焦点送进第一个可编辑控件，键盘用户无需 Tab 找输入框
+    const first = el.querySelector('input:not([type="hidden"]):not([disabled]), textarea:not([disabled]), select:not([disabled])');
+    if (first) {
+        setTimeout(() => {
+            try {
+                first.focus();
+                if (first.select && (first.tagName === 'INPUT' || first.tagName === 'TEXTAREA')) first.select();
+            } catch (e) { /* 忽略不可聚焦元素 */ }
+        }, 30);
+    }
 }
-function closeModal(id) {
+
+/** 弹窗是否正在提交中（内部按钮带 data-submitting 标记） */
+function isModalBusy(id) {
     const el = document.getElementById(id);
-    if (el) el.classList.remove('active');
+    return !!(el && el.querySelector('[data-submitting="1"]'));
 }
+
+/** closeModal(id, force)：force=true 供提交成功后由代码主动关闭，绕过"提交中不许用户关掉"的保护 */
+function closeModal(id, force) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // 请求进行中时忽略用户触发的关闭（Esc / 点遮罩 / ✕），避免结果落在已销毁的弹窗上
+    if (!force && isModalBusy(id)) return;
+    el.classList.remove('active');
+    // 焦点归还给触发按钮（弹窗已滚走/被重渲染则安全跳过）
+    for (let i = modalFocusStack.length - 1; i >= 0; i--) {
+        if (modalFocusStack[i].id !== id) continue;
+        const prev = modalFocusStack[i].el;
+        modalFocusStack.splice(i, 1);
+        if (prev && typeof prev.focus === 'function' && document.contains(prev)) {
+            try { prev.focus(); } catch (e) { /* 忽略 */ }
+        }
+        break;
+    }
+}
+
+// Esc 关闭最上层模态框（强制流程除外）
+document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' && e.key !== 'Esc') return;
+    const overlays = Array.prototype.slice.call(document.querySelectorAll('.modal-overlay.active'));
+    if (overlays.length === 0) return;
+    const top = overlays[overlays.length - 1];
+    if (MODAL_NO_ESCAPE.includes(top.id) || isModalBusy(top.id)) return;
+    e.preventDefault();
+    closeModal(top.id);
+});
+
+// ---- 移动端侧栏抽屉 ----
+function toggleSidebar() {
+    const sidebar = document.querySelector('.sidebar');
+    if (!sidebar) return;
+    const open = !sidebar.classList.contains('open');
+    sidebar.classList.toggle('open', open);
+    document.body.classList.toggle('sidebar-open', open);
+}
+
+function closeSidebar() {
+    const sidebar = document.querySelector('.sidebar');
+    if (sidebar) sidebar.classList.remove('open');
+    document.body.classList.remove('sidebar-open');
+}
+
+// 视口回到桌面宽度时清掉抽屉状态（避免 body 残留 sidebar-open 挡住点击）
+window.addEventListener('resize', function () {
+    if (window.innerWidth > 767) closeSidebar();
+});
+
+// 点击遮罩层空白处关闭（点内容区不关闭；用 mousedown 避免拖选误关）
+document.addEventListener('mousedown', function (e) {
+    const t = e.target;
+    if (!t || !t.classList || !t.classList.contains('modal-overlay') || !t.classList.contains('active')) return;
+    if (MODAL_NO_ESCAPE.includes(t.id)) return;
+    closeModal(t.id);
+});
 
 // --- i18n Engine ---
 const I18N_DICT = {
@@ -472,6 +549,7 @@ class TextScramble {
 // Navigation Routing
 document.querySelectorAll('.nav-item').forEach(item => {
     item.addEventListener('click', () => {
+        closeSidebar();   // 移动端：点完导航自动收起抽屉
         if (item.classList.contains('active')) return;
         document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
         item.classList.add('active');
@@ -492,6 +570,8 @@ document.querySelectorAll('.nav-item').forEach(item => {
 
             if (targetId === 'traffic') {
                 renderTrafficChart();
+            } else if (targetId === 'dashboard') {
+                drawTrafficChart(true);   // 切回仪表盘立即补画曲线（跳过 2s 节流）
             } else if (targetId === 'config') {
                 loadConfig();
             }
@@ -698,6 +778,27 @@ async function api(path, options = {}) {
     return resp;
 }
 
+/**
+ * 提交类按钮防重复提交：请求期间 disabled + 文案占位，成功/失败都恢复原状。
+ * 同时打上 data-submitting 标记，让 closeModal 知道"正在提交，先别关"。
+ * 传 busyText=false 可只禁用不改文案（登录按钮等自带文案的场景）。
+ */
+async function withBusyButton(btn, fn, busyText) {
+    if (!btn) return fn();
+    if (btn.disabled) return;            // 已在提交中：直接忽略重复点击
+    const prevText = btn.textContent;
+    btn.disabled = true;
+    btn.setAttribute('data-submitting', '1');
+    if (busyText !== false) btn.textContent = busyText || '处理中…';
+    try {
+        return await fn();
+    } finally {
+        btn.disabled = false;
+        btn.removeAttribute('data-submitting');
+        if (busyText !== false) btn.textContent = prevText;
+    }
+}
+
 /** 操作后端数据后重建 sing-box 配置（节点增删改/导入/停用等必须生效） */
 async function applyConfigSilent() {
     try {
@@ -898,9 +999,25 @@ async function loadEngineStatus() {
 
 function startUptimeTimer() {
     if (uptimeTimer) clearInterval(uptimeTimer);
+    if (document.hidden) { uptimeTimer = null; return; }   // 后台不轮询，回到前台由 visibilitychange 拉起
     loadEngineStatus();
     uptimeTimer = setInterval(loadEngineStatus, 10000);
 }
+
+// 页面切到后台：停掉所有周期性刷新，避免后台空转请求 + 渲染；
+// 回到前台：立即刷一次并恢复定时器（SSE 断线重连由自身 onerror 负责，这里补一次状态刷新）。
+document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+        if (uptimeTimer) { clearInterval(uptimeTimer); uptimeTimer = null; }
+        return;
+    }
+    if (!authToken) return;
+    // 首登强制改密门禁期间不要触发受保护接口
+    const pwdOverlay = document.getElementById('pwd-modal');
+    if (pwdOverlay && pwdOverlay.classList.contains('active')) return;
+    startUptimeTimer();
+    drawTrafficChart(true);   // 回前台补画一帧（内部会重置节流时间戳）
+});
 
 // Data Loaders
 async function loadAllData() {
@@ -915,6 +1032,8 @@ async function loadNodes() {
         const r = await api('/api/nodes');
         const data = await r.json();
         nodeState = data.items || [];
+        // 先把三个分组下拉（含 Traffic 页筛选）按真实分组填好，后面的图表/表格才能按分组正确过滤
+        updateGroupFilterOptions();
         renderNodeMatrix();
         renderNodesTable();
         renderQuickStats();
@@ -922,7 +1041,6 @@ async function loadNodes() {
         renderTrafficChart();
         renderTrafficTable();
         drawTrafficChart(); // 初始化实时曲线（等待数据时显示提示）
-        updateGroupFilterOptions();
     } catch (e) {
         console.warn('加载节点列表失败:', e);
     }
@@ -1081,24 +1199,38 @@ function renderNodeMatrix() {
     });
 }
 
+/** 节点三态归一：disabled 独立一态，online 仅 status==='online'，其余都算 offline */
+function nodeStatusOf(node) {
+    if (node.status === 'disabled') return 'disabled';
+    return node.status === 'online' ? 'online' : 'offline';
+}
+
 function getFilteredNodes() {
     const groupSelect = document.getElementById('filter-group');
+    const statusSelect = document.getElementById('filter-status');
     const searchInput = document.getElementById('search-keyword');
     const selectedGroup = groupSelect ? groupSelect.value : 'ALL';
+    const statusFilter = statusSelect ? statusSelect.value : 'ALL';
     const keyword = searchInput ? searchInput.value.trim().toLowerCase() : '';
+    const isDisabledView = selectedGroup === '__DISABLED__' ||
+        (selectedGroup && selectedGroup.startsWith('__DISABLED__:'));
 
     return nodeState.filter(node => {
-        // 停用节点独立视图：__DISABLED__ 只看停用；__DISABLED__:xxx 按特定分组看停用；普通列表排除 disabled
-        if (selectedGroup === '__DISABLED__') {
-            if (node.status !== 'disabled') return false;
-        } else if (selectedGroup && selectedGroup.startsWith('__DISABLED__:')) {
-            if (node.status !== 'disabled') return false;
-            const targetGroup = selectedGroup.slice('__DISABLED__:'.length);
-            const nodeGroup = node.group || '默认分组';
-            if (nodeGroup !== targetGroup) return false;
-        } else {
-            if (node.status === 'disabled') return false;
-            if (selectedGroup !== 'ALL' && node.group !== selectedGroup) return false;
+        const status = nodeStatusOf(node);
+        // 停用节点独立视图：__DISABLED__ 只看停用；__DISABLED__:xxx 按特定分组看停用；普通列表排除 disabled。
+        // 显式状态筛选（online/offline/disabled）优先于分组视图的隐含状态，让停用节点也能在普通视图被单独筛出。
+        if (statusFilter !== 'ALL') {
+            if (status !== statusFilter) return false;
+        } else if (isDisabledView) {
+            if (status !== 'disabled') return false;
+        } else if (status === 'disabled') {
+            return false;
+        }
+        if (isDisabledView) {
+            const targetGroup = selectedGroup.slice('__DISABLED__'.length).replace(/^:/, '');
+            if (targetGroup && (node.group || '默认分组') !== targetGroup) return false;
+        } else if (selectedGroup !== 'ALL' && node.group !== selectedGroup) {
+            return false;
         }
         if (keyword) {
             const nameMatch = (node.name || '').toLowerCase().includes(keyword);
@@ -1109,6 +1241,124 @@ function getFilteredNodes() {
         return true;
     });
 }
+
+// ---------- 本地排序 / 分页 / 概览计数（纯前端，不产生额外后端请求） ----------
+const nodeViewState = { sortKey: '', sortDir: 1, page: 1, pageSize: 50 };
+
+/** 按表头选择排序（port/name/ping/traffic），未选择时保持后端顺序 */
+function applyNodeSort(list) {
+    const key = nodeViewState.sortKey;
+    if (!key) return list;
+    const dir = nodeViewState.sortDir;
+    const metric = (n) => {
+        if (key === 'port') return Number(n.port) || 0;
+        if (key === 'ping') return n.ping > 0 ? Number(n.ping) : (dir > 0 ? Number.MAX_SAFE_INTEGER : -1);
+        if (key === 'traffic') return (n.upTraffic || 0) + (n.downTraffic || 0);
+        if (key === 'name') return (n.name || '').toLowerCase();
+        return '';
+    };
+    return list.slice().sort((a, b) => {
+        const va = metric(a);
+        const vb = metric(b);
+        if (typeof va === 'string' || typeof vb === 'string') {
+            return String(va).localeCompare(String(vb), 'zh-CN') * dir;
+        }
+        if (va === vb) {
+            return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
+        }
+        return (va - vb) * dir;
+    });
+}
+
+/** 概览计数：在线 X / 离线 Y / 停用 Z（基于已加载的全部节点，不受筛选影响） */
+function updateNodeOverviewCounts() {
+    let online = 0, offline = 0, disabled = 0;
+    nodeState.forEach(n => {
+        const s = nodeStatusOf(n);
+        if (s === 'online') online++;
+        else if (s === 'disabled') disabled++;
+        else offline++;
+    });
+    const setVal = (id, val) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = val;
+    };
+    setVal('nodes-count-online', online);
+    setVal('nodes-count-offline', offline);
+    setVal('nodes-count-disabled', disabled);
+    setVal('nodes-count-total', nodeState.length);
+}
+
+/** 本地分页：pageSize<=0 表示「全部」不分页 */
+function packNodePage(list) {
+    const size = Number(nodeViewState.pageSize) || 0;
+    const total = list.length;
+    const pages = size > 0 ? Math.max(1, Math.ceil(total / size)) : 1;
+    if (!Number.isFinite(nodeViewState.page) || nodeViewState.page < 1) nodeViewState.page = 1;
+    if (nodeViewState.page > pages) nodeViewState.page = pages;
+    const totalEl = document.getElementById('nodes-pager-total');
+    if (totalEl) totalEl.textContent = total;
+    const infoEl = document.getElementById('nodes-page-info');
+    if (infoEl) infoEl.textContent = `${nodeViewState.page} / ${pages}`;
+    const prevBtn = document.getElementById('nodes-page-prev');
+    if (prevBtn) prevBtn.disabled = nodeViewState.page <= 1;
+    const nextBtn = document.getElementById('nodes-page-next');
+    if (nextBtn) nextBtn.disabled = nodeViewState.page >= pages;
+    if (size <= 0) return list;
+    const start = (nodeViewState.page - 1) * size;
+    return list.slice(start, start + size);
+}
+
+/** 当前页要渲染的节点（筛选 → 排序 → 分页），渲染与增量同步必须共用，否则 SSE 每次都会判定不一致而全表重建 */
+function getVisibleNodes() {
+    updateNodeOverviewCounts();
+    return packNodePage(applyNodeSort(getFilteredNodes()));
+}
+
+function setNodePageSize(v) {
+    const size = parseInt(v, 10);
+    nodeViewState.pageSize = isNaN(size) ? 50 : size;
+    nodeViewState.page = 1;
+    renderNodesTable();
+}
+
+function gotoNodePage(delta) {
+    nodeViewState.page += delta;
+    renderNodesTable();
+}
+
+/** 筛选条件变化后回到第一页 */
+function resetNodeFilterView() {
+    nodeViewState.page = 1;
+    renderNodesTable();
+}
+
+/** 表头排序箭头状态 */
+function syncSortCaret() {
+    document.querySelectorAll('#nodes .data-table th[data-sort]').forEach(th => {
+        const active = th.getAttribute('data-sort') === nodeViewState.sortKey;
+        th.classList.toggle('sorted', active);
+        const caret = th.querySelector('.sort-caret');
+        if (caret) caret.textContent = active ? (nodeViewState.sortDir === 1 ? '▲' : '▼') : '';
+    });
+}
+
+document.addEventListener('click', function (e) {
+    const target = e.target;
+    if (!target || typeof target.closest !== 'function') return;
+    const th = target.closest('#nodes .data-table th[data-sort]');
+    if (!th) return;
+    const key = th.getAttribute('data-sort');
+    if (nodeViewState.sortKey === key) {
+        nodeViewState.sortDir = nodeViewState.sortDir === 1 ? -1 : 1;
+    } else {
+        nodeViewState.sortKey = key;
+        nodeViewState.sortDir = 1;
+    }
+    nodeViewState.page = 1;
+    syncSortCaret();
+    renderNodesTable();
+});
 
 // ---------- 出口 IP 情报渲染（旧版 renderExitIp 移植） ----------
 
@@ -1170,11 +1420,12 @@ function renderExitIp(n) {
 function renderNodesTable() {
     const tbody = document.getElementById('nodes-tbody');
     if (!tbody) return;
+    syncSortCaret();   // 重建后恢复排序箭头（SSE 增量重建也不会丢状态）
     tbody.innerHTML = '';
 
     const groupSelect = document.getElementById('filter-group');
     const selectedGroup = groupSelect ? groupSelect.value : 'ALL';
-    const nodes = getFilteredNodes();
+    const nodes = getVisibleNodes();
     if (nodes.length === 0) {
         tbody.innerHTML = `<tr><td colspan="11" style="text-align: center; color: var(--rock); padding: 24px;">暂无节点数据</td></tr>`;
         syncNodeSelection();
@@ -1242,13 +1493,18 @@ function renderNodesTable() {
 function _nodeActionsHtml(node) {
     const esc = escapeHtml;
     const pinging = bulkProbeRunning || pendingProbeIds.has(node.id);
+    const isDisabled = node.status === 'disabled';
+    // 操作列 5 个按钮：紧凑图标 + 两字标签，允许换行（配合窄屏横向滚动不裁切）。
+    // 图标不能单独承担语义：触屏没有 hover 提示、读屏也只读得到文案，所以每个按钮
+    // 保留可见标签并补 aria-label（回归用例同样按可见文案断言「停用」）。
+    const btnStyle = 'min-width:24px; padding:2px 6px;';
     return `
-        <div style="display:flex; gap:4px; justify-content:center; align-items:center; flex-wrap: nowrap;">
-            <button class="btn-action" onclick="pingSingleNode(${inlineJsArg(node.id)})" data-probe-id="${esc(node.id)}" ${pinging ? 'disabled' : ''}>${pinging ? '测活中…' : L('PING')}</button>
-            <button class="btn-action" onclick="openEditNodeModal(${inlineJsArg(node.id)})">${L('EDIT')}</button>
-            <button class="btn-action" onclick="exportSingleNode(${inlineJsArg(node.id)})">${L('EXPORT')}</button>
-            <button class="btn-action ${node.status !== 'disabled' ? 'danger' : ''}" onclick="toggleNodeEnable(${inlineJsArg(node.id)})">${node.status !== 'disabled' ? L('DISABLE') : L('ENABLE')}</button>
-            <button class="btn-action danger" onclick="deleteSingleNode(${inlineJsArg(node.id)})">${L('DROP')}</button>
+        <div style="display:flex; gap:3px; justify-content:center; align-items:center; flex-wrap: wrap;">
+            <button class="btn-action" style="${btnStyle}" onclick="pingSingleNode(${inlineJsArg(node.id)})" data-probe-id="${esc(node.id)}" title="探活：立即测试该节点延迟" aria-label="探活" ${pinging ? 'disabled' : ''}>${pinging ? '…' : '⏱ 探活'}</button>
+            <button class="btn-action" style="${btnStyle}" onclick="openEditNodeModal(${inlineJsArg(node.id)})" title="编辑节点参数" aria-label="编辑">✎ 编辑</button>
+            <button class="btn-action" style="${btnStyle}" onclick="exportSingleNode(${inlineJsArg(node.id)})" title="导出该节点链接" aria-label="导出">⤓ 导出</button>
+            <button class="btn-action ${!isDisabled ? 'danger' : ''}" style="${btnStyle}" onclick="toggleNodeEnable(${inlineJsArg(node.id)})" title="${!isDisabled ? '停用该节点（不再分发到配置）' : '启用该节点'}" aria-label="${!isDisabled ? '停用' : '启用'}">${!isDisabled ? '⏸ 停用' : '▶ 启用'}</button>
+            <button class="btn-action danger" style="${btnStyle}" onclick="deleteSingleNode(${inlineJsArg(node.id)})" title="删除该节点" aria-label="删除">✕ 删除</button>
         </div>`;
 }
 
@@ -1257,7 +1513,7 @@ function _nodeActionsHtml(node) {
 function syncNodesTable() {
     const tbody = document.getElementById('nodes-tbody');
     if (!tbody) return;
-    const nodes = getFilteredNodes();
+    const nodes = getVisibleNodes();
     const rows = Array.from(tbody.querySelectorAll('tr[data-id]'));
     if (nodes.length === 0 || rows.length !== nodes.length) { renderNodesTable(); return; }
     const rowById = Object.create(null);
@@ -1368,7 +1624,8 @@ function syncNodeSelection() {
     document.querySelectorAll('#nodes-tbody .chk-node').forEach(chk => {
         chk.checked = selectedNodeIds.has(chk.dataset.id);
     });
-    const nodes = getFilteredNodes();
+    // 用当前可见（已排序/分页）集合，保证表头全选框只代表本页，避免跨页静默全选
+    const nodes = getVisibleNodes();
     const count = nodes.filter(n => selectedNodeIds.has(n.id)).length;
     const master = document.getElementById('chk-all');
     if (master) {
@@ -1378,7 +1635,8 @@ function syncNodeSelection() {
 }
 
 function toggleSelectAll(master) {
-    const nodes = getFilteredNodes();
+    // 全选只作用于当前页，跨页选择需逐页勾选
+    const nodes = getVisibleNodes();
     if (master.checked) {
         nodes.forEach(n => selectedNodeIds.add(n.id));
     } else {
@@ -1397,16 +1655,26 @@ function toggleSelectNode(id) {
 }
 
 const filterGroupEl = document.getElementById('filter-group');
-if (filterGroupEl) filterGroupEl.addEventListener('change', renderNodesTable);
+if (filterGroupEl) filterGroupEl.addEventListener('change', resetNodeFilterView);
+// 搜索 250ms 防抖：输入过程中不每次按键都全量重渲染整张节点表
+let nodeSearchTimer = null;
 const searchKeywordEl = document.getElementById('search-keyword');
-if (searchKeywordEl) searchKeywordEl.addEventListener('input', renderNodesTable);
+if (searchKeywordEl) searchKeywordEl.addEventListener('input', function () {
+    if (nodeSearchTimer) clearTimeout(nodeSearchTimer);
+    nodeSearchTimer = setTimeout(function () {
+        nodeSearchTimer = null;
+        resetNodeFilterView();
+    }, 250);
+});
 
 // Ping / Probe Handlers
 function syncProbeButtons() {
     document.querySelectorAll('[data-probe-id]').forEach(btn => {
         const busy = bulkProbeRunning || pendingProbeIds.has(btn.dataset.probeId);
         btn.disabled = busy;
-        btn.textContent = busy ? '测活中…' : L('PING');
+        // 行内操作列已改为图标按钮（title 提供文案），这里同步图标态而不是写回英文长文案
+        btn.textContent = busy ? '…' : '⏱';
+        btn.title = busy ? '正在探活…' : '探活：立即测试该节点延迟';
     });
     document.querySelectorAll('[data-probe-all]').forEach(btn => {
         btn.disabled = bulkProbeRunning || pendingProbeIds.size > 0;
@@ -1415,19 +1683,21 @@ function syncProbeButtons() {
 }
 
 function reportProbeResults(results) {
-    if (!Array.isArray(results)) throw new Error('探活响应格式错误');
-    if (results.length === 0) {
+    // 后端契约是裸数组；兼容旧镜像 / 反代包装的 { items: [...] } 形态，避免整段 UI 因格式差异报错
+    const list = Array.isArray(results) ? results : (results && Array.isArray(results.items) ? results.items : null);
+    if (!list) throw new Error('探活响应格式错误');
+    if (list.length === 0) {
         addLog('WARN', '探活未返回结果，后台可能正在测活，请稍后重试');
         showToast('后台测活繁忙或无可测节点，请稍后重试', 'warn');
         return;
     }
-    results.forEach(res => {
-        if (res.error) {
+    list.forEach(res => {
+        if (res && res.error) {
             addLog('WARN', `节点 ${res.id || ''}: ${res.error}`);
             showToast(res.error, 'warn');
         }
     });
-    addLog('INFO', `探活完成，返回 ${results.length} 个结果（在线 ${results.filter(r => r.status === 'online').length} 个）`);
+    addLog('INFO', `探活完成，返回 ${list.length} 个结果（在线 ${list.filter(r => r && r.status === 'online').length} 个）`);
 }
 
 async function triggerPingAll() {
@@ -1744,7 +2014,7 @@ async function handleBatchGroup() {
         addLog('SUCCESS', `已将 ${updated} 个节点分组改为 [${group}]`);
         // 分组是节点属性：本地重载节点（分组影响 relay 轮询池，后端已重建配置）
         selectedNodeIds.clear();
-        closeModal('batch-group-modal');
+        closeModal('batch-group-modal', true);   // 提交成功后代码主动关闭
         await loadNodes();
         updateGroupFilterOptions();
         renderDashRelayStatus();
@@ -1890,7 +2160,7 @@ async function handleSaveNodeEdit() {
                 ...(ssPass ? { ssPass } : {})
             })
         });
-        closeModal('edit-modal');
+        closeModal('edit-modal', true);   // 提交成功后代码主动关闭
         addLog('SUCCESS', `修改节点 [${name}] 成功（上游: ${rawProto}://${rawServer}:${rawPort}）`);
         await loadNodes();
         await applyConfigSilent();
@@ -1959,6 +2229,8 @@ async function enableAllDisabledNodes() {
 
 async function disableSelectedNodes() {
     if (selectedNodeIds.size === 0) { showToast('请先勾选要停用的节点', 'warn'); return; }
+    // 危险操作二次确认：停用会让节点退出配置，正在用的连接会断
+    if (!await auraConfirm(`确定停用选中的 ${selectedNodeIds.size} 个节点？停用后这些节点不再出现在配置中，现有连接会断开。`)) return;
     await setNodesEnabled(Array.from(selectedNodeIds), false);
 }
 
@@ -2241,7 +2513,7 @@ async function handleBatchImport() {
             body: JSON.stringify({ nodes: preparedNodes })
         });
         const res = await r.json();
-        closeModal('import-modal');
+        closeModal('import-modal', true);   // 提交成功后代码主动关闭
         let msg = `成功批量导入 ${res.created || 0} 个节点`;
         if (res.skipped) msg += `，跳过 ${res.skipped} 个（重复/端口冲突/已删指纹）`;
         if (res.duplicate) msg += `，重复 ${res.duplicate} 个`;
@@ -2273,7 +2545,7 @@ async function handleConvertEntry() {
             })
         });
         const data = await r.json();
-        closeModal('convert-entry-modal');
+        closeModal('convert-entry-modal', true);   // 提交成功后代码主动关闭
         addLog('SUCCESS', `已批量转换 ${data.converted} 个节点入口协议为 ${direction}`);
         await loadNodes();
     } catch (e) {
@@ -2298,10 +2570,21 @@ function pushTrafficSample(up, down) {
     if (arr.length > TRAFFIC_CHART_MAX_POINTS) arr.shift();
 }
 
-/** 绘制实时曲线：上行=金、下行=绿，双线 + 渐变填充 + 网格 + 当前值标注 */
-function drawTrafficChart() {
+// 图表最多每 2s 重建一次（SSE 每秒推送一条，每秒全量重写 svg.innerHTML 纯浪费）
+const TRAFFIC_CHART_MIN_INTERVAL = 2000;
+let __lastChartDrawAt = 0;
+
+/** 绘制实时曲线：上行=金、下行=绿，双线 + 渐变填充 + 网格 + 当前值标注
+ *  force=true 时跳过节流/可见性检查（切页、回前台需要立刻看到最新曲线） */
+function drawTrafficChart(force) {
     const svg = document.getElementById('traffic-chart-svg');
     if (!svg) return;
+    if (document.hidden) return;   // 后台标签页不重建
+    const dashPage = document.getElementById('dashboard');
+    if (dashPage && !dashPage.classList.contains('active') && !force) return;  // 当前不在仪表盘视图
+    const now = Date.now();
+    if (!force && __lastChartDrawAt && now - __lastChartDrawAt < TRAFFIC_CHART_MIN_INTERVAL) return;
+    __lastChartDrawAt = now;
     const arr = window.__trafficSamples;
     if (arr.length < 2) {
         // 数据太少：画一条平滑的基线提示（黑金呼吸动效由 CSS 控制）
@@ -2367,6 +2650,12 @@ function updateTrafficChart(upRate, downRate) {
     const downEl = document.getElementById('chart-down-rate');
     if (upEl) upEl.textContent = formatRate(upRate);
     if (downEl) downEl.textContent = formatRate(downRate);
+}
+
+/** Traffic 页分组筛选变化：柱状图与下方表格必须同步过滤，否则出现「图变了表没变」 */
+function onTrafficFilterChange() {
+    renderTrafficChart();
+    renderTrafficTable();
 }
 
 function renderTrafficChart() {
@@ -2518,9 +2807,11 @@ function startTrafficSSE() {
                         // 节流刷新节点表/矩阵/统计（SSE 每 1s 一条，2s 一次刷新不卡顿）。
                         // 节点表走增量 syncNodesTable：行不变只 diff 单元格，全表重建会
                         // 让端口输入框失焦 + 行闪烁（生硬感主因之一）
-                        if (!window.__sseRenderTimer) {
+                        if (!window.__sseRenderTimer && !document.hidden) {
                             window.__sseRenderTimer = setTimeout(() => {
                                 window.__sseRenderTimer = null;
+                                // 后台期间攒下的推送不回放渲染，回前台由 visibilitychange 统一补刷
+                                if (document.hidden) return;
                                 renderQuickStats();
                                 renderDashRelayStatus();
                                 renderNodeMatrix();
@@ -2603,8 +2894,14 @@ function renderSubsList() {
             if (s.stale) badge = `<span class="sub-badge sub-badge-fail" title="${escapeHtml(s.lastError || '刷新失败')}">失效</span>`;
             else if (s.degraded) badge = `<span class="sub-badge sub-badge-degraded" title="${escapeHtml(s.lastError || '刷新失败，使用上次快照')}">降级</span>`;
             else badge = `<span class="sub-badge sub-badge-ok">可用 · ${escapeHtml(s.nodeCount ?? s.node_count ?? 0)} 节点</span>`;
+            const enabled = s.enabled !== false;
             return `
             <tr>
+                <td style="text-align: center;">
+                    <input type="checkbox" class="sub-toggle" ${enabled ? 'checked' : ''}
+                        onchange="toggleSubEnabled(${inlineJsArg(s.id)}, this)"
+                        title="${enabled ? '已启用：参与定时刷新' : '已停用：不参与定时刷新'}">
+                </td>
                 <td><strong>${escapeHtml(s.name)}</strong></td>
                 <td style="font-family: var(--font-mono); font-size: 11px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(s.lastError || '')}">${escapeHtml(s.url)}</td>
                 <td><span class="group-tag">${escapeHtml(s.group) || '默认分组'}</span></td>
@@ -2640,6 +2937,30 @@ async function addSubscriptionFromSubsPage() {
         await loadSubs();
     } catch (e) {
         showToast('添加订阅错误: ' + e.message, 'error');
+    }
+}
+
+/** 订阅启用/停用开关：POST /api/subs/{id}/toggle（后端 SubToggleRequest{enabled}） */
+async function toggleSubEnabled(id, el) {
+    const enabled = !!(el && el.checked);
+    if (el) el.disabled = true;
+    try {
+        const r = await api(`/api/subs/${id}/toggle`, {
+            method: 'POST',
+            body: JSON.stringify({ enabled: enabled })
+        });
+        const updated = await r.json().catch(() => null);
+        if (updated && typeof updated === 'object') {
+            const idx = subState.findIndex(s => s.id === id);
+            if (idx >= 0) subState[idx] = Object.assign({}, subState[idx], updated);
+        }
+        addLog('SUCCESS', `订阅已${enabled ? '启用' : '停用'}`);
+        await loadSubs();
+    } catch (e) {
+        if (el) el.checked = !enabled;   // 失败回滚开关状态，避免界面与后端不一致
+        showToast('切换订阅状态失败: ' + e.message, 'error');
+    } finally {
+        if (el) el.disabled = false;
     }
 }
 
@@ -2736,7 +3057,7 @@ async function handleSaveSubEdit() {
             method: 'PATCH',
             body: JSON.stringify({ name, url, group })
         });
-        closeModal('edit-sub-modal');
+        closeModal('edit-sub-modal', true);   // 提交成功后代码主动关闭
         editingSubId = null;
         addLog('SUCCESS', `订阅 [${name}] 已保存`);
         await loadSubs();
@@ -2829,9 +3150,18 @@ async function saveSystemSettings() {
     };
 
     try {
+        // 保存前重新拉取服务端最新 settings 再合并：避免两次保存并发时，后提交者用页面打开时的旧快照覆盖对方字段
+        let current = {};
+        try {
+            const cur = await api('/api/settings');
+            current = (await cur.json().catch(() => ({}))) || {};
+        } catch (e) { current = {}; }
+        const merged = Object.assign({}, current, payload);
+        // relayDomains 以服务端为准：表单不编辑它（域名增删改走独立入口），用旧快照覆盖会丢改动
+        if (Array.isArray(current.relayDomains)) merged.relayDomains = current.relayDomains;
         const r = await api('/api/settings', {
             method: 'PUT',
-            body: JSON.stringify(payload)
+            body: JSON.stringify(merged)
         });
         const data = await r.json().catch(() => ({}));
         settingsSaveRevision++;

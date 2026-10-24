@@ -188,11 +188,28 @@ impl Auth {
         });
     }
 
+    /// 跟踪表满时逐出「最久没有新失败」的 key，而不是拒绝登记新 key。
+    ///
+    /// 旧实现直接 return 会让新 key 永远拿不到失败记录，于是
+    /// `failures.len() >= MAX_FAILURE_KEYS` 长期成立，is_rate_limited 对任何
+    /// 未见过的 key 都返回 true —— 攻击者用 1000 个来源（伪造 X-Forwarded-For 即可）
+    /// 在 60s 内刷满表，就能把管理员一起锁在门外，形成全站登录 DoS。
     fn record_failure_locked(state: &mut State, key: &str) {
         let now = now_secs();
         Self::prune_failures(state, now);
         if !state.failures.contains_key(key) && state.failures.len() >= MAX_FAILURE_KEYS {
-            return;
+            let oldest = state
+                .failures
+                .iter()
+                .min_by(|a, b| {
+                    let la = a.1.last().copied().unwrap_or(f64::MIN);
+                    let lb = b.1.last().copied().unwrap_or(f64::MIN);
+                    la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                state.failures.remove(&oldest);
+            }
         }
         let entry = state.failures.entry(key.to_string()).or_default();
         entry.push(now);
@@ -208,9 +225,8 @@ impl Auth {
         let now = now_secs();
         Self::prune_failures(&mut state, now);
         let recent = state.failures.get(key).cloned().unwrap_or_default();
-        if recent.is_empty() && state.failures.len() >= MAX_FAILURE_KEYS {
-            return true;
-        }
+        // 只按本 key 的失败次数判定：跟踪表容量是被逐出策略约束的内存上限，
+        // 绝不作为「全站限流」的依据（否则表一满就把所有人锁死）。
         if recent.len() >= MAX_FAILURES_PER_KEY {
             return true;
         }
@@ -240,10 +256,8 @@ impl Auth {
         let now = now_secs();
         Self::prune_failures(&mut state, now);
         let recent = state.failures.get(key).cloned().unwrap_or_default();
-        // 两个上限：跟踪的 key 总数过多（全局防刷爆内存），或单 key 失败次数过多。
-        let limited = if (recent.is_empty() && state.failures.len() >= MAX_FAILURE_KEYS)
-            || recent.len() >= MAX_FAILURES_PER_KEY
-        {
+        // 只按本 key 的失败次数判定（key 总数上限只用于约束内存，见 record_failure_locked 的逐出策略）。
+        let limited = if recent.len() >= MAX_FAILURES_PER_KEY {
             true
         } else {
             recent
@@ -510,6 +524,43 @@ mod tests {
             Some("尝试过于频繁，请稍后再试")
         );
         assert!(!auth.is_rate_limited("8.8.8.8"));
+    }
+
+    #[test]
+    fn failure_table_saturation_does_not_lock_out_new_keys() {
+        let (_store, auth) = mk();
+        {
+            let mut st = auth.state.lock().unwrap();
+            for i in 0..MAX_FAILURE_KEYS {
+                Auth::record_failure_locked(&mut st, &format!("flood-{i}"));
+            }
+            assert_eq!(st.failures.len(), MAX_FAILURE_KEYS);
+            // 满表后新 key 必须能登记：逐出最久未失败的 key，而不是被静默丢弃。
+            Auth::record_failure_locked(&mut st, "fresh-key");
+            assert!(st.failures.len() <= MAX_FAILURE_KEYS);
+            assert!(st.failures.contains_key("fresh-key"));
+        }
+        // 未见过的来源不被限流，管理员不会被别人刷满表锁在门外。
+        assert!(!auth.is_rate_limited("admin-home-ip"));
+        let (res, delay) = auth.login_blocking("admin", "admin", "admin-home-ip");
+        assert!(!delay);
+        assert_eq!(res.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn per_key_failures_still_rate_limited_when_table_full() {
+        let (_store, auth) = mk();
+        {
+            let mut st = auth.state.lock().unwrap();
+            for i in 0..MAX_FAILURE_KEYS {
+                Auth::record_failure_locked(&mut st, &format!("flood-{i}"));
+            }
+        }
+        for _ in 0..MAX_FAILURES_PER_KEY {
+            let _ = auth.login_blocking("admin", "wrong", "9.9.9.9");
+        }
+        // 表满不影响单 key 的暴力破解封锁。
+        assert!(auth.is_rate_limited("9.9.9.9"));
     }
 
     #[test]

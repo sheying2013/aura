@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,14 @@ pub const DEFAULT_CLASH_TRIES: usize = 10;
 pub const DEFAULT_CLASH_INTERVAL: Duration = Duration::from_millis(500);
 /// 单次进程操作（start/stop）的超时上限，避免面板线程被卡死。
 pub const PROC_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// clash 端口查询缓存的有效期（<= 1 秒）。
+///
+/// clash 端口处在探活 / 守护热路径上：scheduler 的 guard 每 10 秒调一次
+/// is_running()，每轮探活还要多调几次，而每次读都要 get_setting("system")
+/// 并把整段 system JSON 反序列化。加一层极短缓存把这里的 sqlite 查询压到
+/// 每秒最多一次；用户在设置页改完端口后最多 CLASH_PORT_TTL 就生效（TTL 到期
+/// 自然失效，不需要在别处挂失效回调）。
+pub const CLASH_PORT_TTL: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // 可注入的依赖：设置读写 / 进程控制 / clash 探活
@@ -92,6 +100,15 @@ pub trait DbSettings: Send + Sync {
 pub trait ProcControl: Send + Sync {
     /// sing-box 是否在跑。
     fn is_running(&self) -> bool;
+    /// 是否「应该由崩溃守护拉起」（用户/系统期望它跑着）。
+    ///
+    /// 必须与 is_running() 分开，且故意不给默认实现（每个实现都得表态）：
+    /// 进程被 OOM/段错误杀掉后 is_running() 立刻变 false，但「期望它跑」这件事
+    /// 没有变。scheduler::guard_tick 先看 proc_present 再看 is_running，
+    /// 两者同源就等于「进程一死就判定为用户已停止」，重启分支永远走不到
+    /// （历史 P0：sing-box 崩溃后面板永久停摆）。语义对照 Python 的
+    /// config_manager.get_proc() is not None（_proc 只在 start 赋值、只在 stop 清空）。
+    fn should_run(&self) -> bool;
     /// 用给定配置启动 sing-box（配置已经落盘）。
     fn start(&self, config: &Value) -> Result<()>;
     /// 停止 sing-box。
@@ -130,6 +147,48 @@ impl ClashProbe for NeverReady {
     }
 }
 
+/// clash 端口的极短 TTL 缓存（只缓存 settings.system.clashPort 的解析结果）。
+///
+/// 目的：is_running() 之类的热路径每调一次都要查一次 sqlite，缓存把同一时刻的
+/// 重复查询合并成一次；TTL 到期后自动重新查库，所以设置改动会在 CLASH_PORT_TTL
+/// 内自然生效（不依赖任何失效回调，也不改其它模块）。
+struct ClashPortCache {
+    /// 缓存有效期；为零等价于关闭缓存（测试用）。
+    ttl: Duration,
+    /// 上次查库的时间戳与结果。
+    entry: StdMutex<Option<(Instant, i64)>>,
+}
+
+impl ClashPortCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entry: StdMutex::new(None),
+        }
+    }
+
+    /// 取 clash 端口：缓存未过期直接返回；过期或没有缓存才查库。
+    ///
+    /// now 作为参数注入，方便单测手工推进时间验证 TTL 边界，不必真的 sleep。
+    fn get_at(&self, settings: &dyn DbSettings, now: Instant) -> i64 {
+        let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((stamp, port)) = *entry {
+            // saturating：时钟回拨时按「刚查过」处理，不会 panic。
+            if now.saturating_duration_since(stamp) < self.ttl {
+                return port;
+            }
+        }
+        let port = clash_port_from(settings);
+        *entry = Some((now, port));
+        port
+    }
+
+    /// 同 get_at，用当前时刻。
+    fn get(&self, settings: &dyn DbSettings) -> i64 {
+        self.get_at(settings, Instant::now())
+    }
+}
+
 /// HTTP 探活实现：直接复用 singbox_proc 的裸 TCP /version 探测。
 ///
 /// singbox_proc 不带 Authorization 头（它零 DB 依赖），这里同样先按「端口有
@@ -138,8 +197,10 @@ impl ClashProbe for NeverReady {
 pub struct HttpClashProbe {
     /// 构造时算出的端口（settings 缺失时的回落值）。
     port: u16,
-    /// 设置源；存在时每次探测都重新读 clashPort，跟随用户在设置页的修改。
+    /// 设置源；存在时按 clashPort 动态探测，跟随用户在设置页的修改。
     settings: Option<Arc<dyn DbSettings>>,
+    /// clash 端口缓存：探活每轮都要读端口，避免每次都查库。
+    port_cache: Arc<ClashPortCache>,
 }
 
 impl HttpClashProbe {
@@ -148,6 +209,7 @@ impl HttpClashProbe {
         Self {
             port,
             settings: None,
+            port_cache: Arc::new(ClashPortCache::new(CLASH_PORT_TTL)),
         }
     }
 
@@ -160,13 +222,21 @@ impl HttpClashProbe {
         Self {
             port,
             settings: Some(settings),
+            port_cache: Arc::new(ClashPortCache::new(CLASH_PORT_TTL)),
         }
     }
 
-    /// 探测用的端口（settings 存在时按当前设置算）。
+    /// 测试用：覆盖端口缓存 TTL（生产路径固定用 CLASH_PORT_TTL）。
+    #[cfg(test)]
+    fn with_port_ttl(mut self, ttl: Duration) -> Self {
+        self.port_cache = Arc::new(ClashPortCache::new(ttl));
+        self
+    }
+
+    /// 探测用的端口（settings 存在时按当前设置算，命中缓存就不查库）。
     pub fn port(&self) -> u16 {
         match self.settings.as_ref() {
-            Some(settings) => clash_port_from(settings.as_ref()) as u16,
+            Some(settings) => self.port_cache.get(settings.as_ref()) as u16,
             None => self.port,
         }
     }
@@ -302,6 +372,25 @@ fn wait_child_exit(child: &mut Child, grace: Duration) -> bool {
     }
 }
 
+/// 轮询等进程查找结果变空；返回是否在期限内变空。
+///
+/// 用于「child 句柄丢失、只能按 cmdline 特征找进程」的停止路径：只发 SIGTERM
+/// 就返回的话，紧接着的 start() 会通过 find_singbox_pids 扫到正在退出的旧进程，
+/// 误判「已在运行」而跳过启动 —— 新配置永远不生效，日志却写「应用成功」。
+/// lookup 可注入，便于单测（真实调用方传 singbox_proc::find_singbox_pids）。
+fn wait_pids_gone(lookup: impl Fn() -> Vec<i32>, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if lookup().is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// 真实进程控制：std::process 托管 + singbox_proc 的原语兜底。
 ///
 /// 设计取舍：句柄存在时以句柄为准（能精确收割）；句柄丢失（面板自己重启过、
@@ -310,8 +399,15 @@ fn wait_child_exit(child: &mut Child, grace: Duration) -> bool {
 pub struct StdProcControl {
     paths: ProcPaths,
     clash_port: u16,
-    /// 设置源；存在时 clash 端口每次动态读，跟随设置页的 clashPort 修改。
+    /// 设置源；存在时 clash 端口动态读，跟随设置页的 clashPort 修改。
     settings: Option<Arc<dyn DbSettings>>,
+    /// clash 端口缓存：is_running() 是守护/探活热路径，不能每次都查库。
+    port_cache: ClashPortCache,
+    /// 「期望在跑」标志：只由 start() 置 true、stop() 置 false。
+    ///
+    /// 崩溃后它仍为 true，这样 scheduler 的 proc_present() 就不会把「进程死了」
+    /// 误读成「用户不想跑」，重启分支才走得到。不要用 is_running() 推导它。
+    should_run: AtomicBool,
     child: StdMutex<Option<Child>>,
     log: StdMutex<Option<Arc<StdMutex<LogFile>>>>,
 }
@@ -323,6 +419,8 @@ impl StdProcControl {
             paths,
             clash_port,
             settings: None,
+            port_cache: ClashPortCache::new(CLASH_PORT_TTL),
+            should_run: AtomicBool::new(false),
             child: StdMutex::new(None),
             log: StdMutex::new(None),
         }
@@ -335,9 +433,18 @@ impl StdProcControl {
             paths,
             clash_port,
             settings: Some(settings),
+            port_cache: ClashPortCache::new(CLASH_PORT_TTL),
+            should_run: AtomicBool::new(false),
             child: StdMutex::new(None),
             log: StdMutex::new(None),
         }
+    }
+
+    /// 测试用：覆盖端口缓存 TTL（生产路径固定用 CLASH_PORT_TTL）。
+    #[cfg(test)]
+    fn with_port_ttl(mut self, ttl: Duration) -> Self {
+        self.port_cache = ClashPortCache::new(ttl);
+        self
     }
 
     /// 使用的路径。
@@ -345,10 +452,10 @@ impl StdProcControl {
         &self.paths
     }
 
-    /// clash 端口（settings 存在时按当前设置算）。
+    /// clash 端口（settings 存在时按当前设置算，命中缓存就不查库）。
     pub fn clash_port(&self) -> u16 {
         match self.settings.as_ref() {
-            Some(settings) => clash_port_from(settings.as_ref()) as u16,
+            Some(settings) => self.port_cache.get(settings.as_ref()) as u16,
             None => self.clash_port,
         }
     }
@@ -376,8 +483,15 @@ impl ProcControl for StdProcControl {
         singbox_proc::is_running_with_port(&self.paths, self.clash_port())
     }
 
+    fn should_run(&self) -> bool {
+        self.should_run.load(Ordering::SeqCst)
+    }
+
     fn start(&self, _config: &Value) -> Result<()> {
         if self.is_running() {
+            // 已经在跑也是「期望在跑」：早退不能把守护的期望状态清掉，
+            // 否则下一个 guard_tick 会把它当成用户已停止而不去守护。
+            self.should_run.store(true, Ordering::SeqCst);
             return Ok(());
         }
         let cfg_path = self.paths.config_path();
@@ -414,6 +528,8 @@ impl ProcControl for StdProcControl {
         }
         *self.lock_child() = Some(child);
         *self.lock_log() = Some(log);
+        // 拉起成功 = 进入「应该在跑」状态；此后崩溃由守护负责再拉起。
+        self.should_run.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -440,13 +556,28 @@ impl ProcControl for StdProcControl {
             }
             None => {
                 // 句柄丢了但进程还在（面板重启过 / 被外部拉起）：按 cmdline 特征兜底。
+                // 必须和 Some 分支一样等到进程真的消失再返回：只发 SIGTERM 就返回的话，
+                // 紧接着的 start() 会扫到正在退出的旧进程、误判「已在运行」而跳过启动，
+                // 于是新配置从未生效，旧进程随后退出 → 节点全断，日志却写「应用成功」。
                 if !singbox_proc::find_singbox_pids(&self.paths).is_empty() {
                     singbox_proc::signal_singbox(&self.paths, Signal::Term);
+                    if !wait_pids_gone(|| singbox_proc::find_singbox_pids(&self.paths), STOP_GRACE)
+                    {
+                        // 宽限期到还没退：强杀，再等一个有界窗口确认进程真的消失。
+                        singbox_proc::signal_singbox(&self.paths, Signal::Kill);
+                        let _ = wait_pids_gone(
+                            || singbox_proc::find_singbox_pids(&self.paths),
+                            STOP_GRACE,
+                        );
+                    }
                 }
             }
         }
         // 关掉日志句柄，等同 Python 里取消 _log_task 并置 None。
         *self.lock_log() = None;
+        // 停止成功（Some/None 两条分支都走到这里）= 用户不要它跑了：
+        // 清掉期望状态，guard 之后不再自动拉起（对齐 Python 的 _proc = None）。
+        self.should_run.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -883,6 +1014,55 @@ impl ConfigManager {
         serde_json::from_slice::<Value>(&body).ok()
     }
 
+    /// 把主配置从主位置挪走（config.json.bad-<unix秒>），返回挪到的路径。
+    ///
+    /// 只在「没有上一份好配置可回滚」时调用：坏配置留在主位置会让 guard 的
+    /// start_from_disk() 每轮都把它再拉起来，形成无限重启循环。
+    /// 目标文件已存在时追加序号，避免 rename 在 EEXIST 上失败。
+    fn quarantine_bad_config(&self) -> Option<std::path::PathBuf> {
+        let config_path = self.paths.config_path();
+        if !config_path.exists() {
+            return None;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dir = match config_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => self.paths.data_dir.clone(),
+        };
+        let mut target = dir.join(format!("config.json.bad-{}", stamp));
+        // 同一秒内重复隔离时追加序号；上限只是防止病态情况下无限循环。
+        let mut seq = 1u32;
+        while target.exists() && seq < 100 {
+            seq += 1;
+            target = dir.join(format!("config.json.bad-{}-{}", stamp, seq));
+        }
+        if target.exists() {
+            // 极端情况：宁可删掉同名旧隔离文件，也要把坏配置挪走。
+            let _ = std::fs::remove_file(&target);
+        }
+        match std::fs::rename(&config_path, &target) {
+            Ok(()) => {
+                tracing::warn!(
+                    target: "aura::config_apply",
+                    path = %target.display(),
+                    "没有可回滚的配置，已把坏配置隔离出主位置"
+                );
+                Some(target)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "aura::config_apply",
+                    error = %err,
+                    "隔离坏配置失败（已停止进程，返回值不变）"
+                );
+                None
+            }
+        }
+    }
+
     /// 从数据库聚合并构建配置。
     pub fn build_from_db(&self) -> Result<Value> {
         let nodes = self.settings.list_nodes(None, None, None)?;
@@ -966,10 +1146,15 @@ impl ConfigManager {
 
     /// 停进程。调用方需自行持有 op_lock。
     ///
-    /// 本来就没在跑就直接返回：避免对空进程发信号、也避免把「停止」写进操作日志
-    /// 让运维误以为动过进程（Python 在无 _proc 且探活失败时同样什么都不做）。
+    /// 本来就没在跑（且没有「期望在跑」）就直接返回：避免对空进程发信号、也避免把
+    /// 「停止」写进操作日志让运维误以为动过进程（Python 在无 _proc 且探活失败时同样
+    /// 什么都不做）。唯一例外是崩溃态（should_run=true 但进程已不在）：那时必须走完
+    /// stop()，否则用户的手动停止清不掉期望态、会被守护立刻拉回来。
     async fn stop_locked(&self) -> Result<()> {
-        if !self.ctl.is_running() {
+        // 进程已经不在、也没有「期望在跑」时才是真空转（从未启动 / 已停过）。
+        // 只剩 should_run 为 true 的崩溃态也必须真的调一次 stop()：否则用户点
+        // 「停止」清不掉期望态，guard 下一秒又会把进程拉回来，手停等于没停。
+        if !self.ctl.is_running() && !self.ctl.should_run() {
             return Ok(());
         }
         let ctl = Arc::clone(&self.ctl);
@@ -1125,6 +1310,11 @@ impl ConfigManager {
     async fn rollback_locked(&self, previous: Option<Value>) -> Result<bool> {
         let Some(prev) = previous.or_else(|| self.last_good_config()) else {
             self.stop_locked().await?;
+            // 没有可回滚的配置：刚写坏的 config.json 还留在主位置，而 scheduler 的
+            // guard 每轮都会 start_from_disk() 读它 → 又拉起坏配置 → 失败 → 再来一轮，
+            // 且每轮都白跑 check_config 子进程与端口检测。必须把坏配置挪出主位置。
+            // 隔离失败只记日志，返回值语义不变（仍然 Ok(false)）。
+            self.quarantine_bad_config();
             return Ok(false);
         };
         if self.ctl.is_running() {
@@ -1138,9 +1328,24 @@ impl ConfigManager {
     }
 }
 
+/// 守护宿主实现。
+///
+/// **proc_present 与 is_running 必须不同源**：
+/// * proc_present = 用户/系统是否期望它跑（ctl.should_run()，只由 start/stop 改）
+/// * is_running   = 此刻进程是否真的活着（ctl.is_running()，崩溃后立刻变 false）
+///
+/// scheduler::guard_tick 的顺序是「先 proc_present，再 is_running」：
+/// 两者若都取自 is_running()，一旦 sing-box 崩溃/OOM 被杀，proc_present 也变
+/// false → 直接判 Absent → 重启分支永远走不到，进程死了就永久停摆（历史 P0）。
+/// 语义对齐 Python：config_manager.get_proc() 返回的是 _proc（只在 start 赋值、
+/// 只在 stop 清空），崩进程不会把它变成 None，因此 scheduler 会继续往下判
+/// is_running() 为 false 并重启。
+///
+/// 注意 ConfigManager::get_proc() 是另一回事（APP 层报 pid 用，进程死了就该返回
+/// None），不要把它当成 proc_present 的语义。
 impl GuardHost for ConfigManager {
     fn proc_present(&self) -> bool {
-        self.ctl.is_running()
+        self.ctl.should_run()
     }
 
     fn is_running(&self) -> bool {
@@ -1259,6 +1464,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCtl {
         running: AtomicBool,
+        should_run: AtomicBool,
         fds: AtomicUsize,
         pid: AtomicUsize,
         start_ok: AtomicBool,
@@ -1271,6 +1477,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 running: AtomicBool::new(false),
+                should_run: AtomicBool::new(false),
                 fds: AtomicUsize::new(0),
                 pid: AtomicUsize::new(0),
                 start_ok: AtomicBool::new(true),
@@ -1288,6 +1495,16 @@ mod tests {
             self.running.store(value, Ordering::SeqCst);
         }
 
+        /// 模拟「被守护拉起来之后又崩了」：期望态仍为 true，进程已不在。
+        fn set_crashed(&self) {
+            self.running.store(false, Ordering::SeqCst);
+            self.should_run.store(true, Ordering::SeqCst);
+        }
+
+        fn should_run(&self) -> bool {
+            self.should_run.load(Ordering::SeqCst)
+        }
+
         fn last_config(&self) -> Option<Value> {
             self.last_config
                 .lock()
@@ -1299,6 +1516,10 @@ mod tests {
     impl ProcControl for FakeCtl {
         fn is_running(&self) -> bool {
             self.running.load(Ordering::SeqCst)
+        }
+
+        fn should_run(&self) -> bool {
+            self.should_run.load(Ordering::SeqCst)
         }
 
         fn start(&self, config: &Value) -> Result<()> {
@@ -1315,6 +1536,7 @@ mod tests {
                 .push("start".into());
             *self.last_config.lock().unwrap_or_else(|e| e.into_inner()) = Some(config.clone());
             self.running.store(true, Ordering::SeqCst);
+            self.should_run.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1331,6 +1553,7 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .push("stop".into());
             self.running.store(false, Ordering::SeqCst);
+            self.should_run.store(false, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1417,7 +1640,10 @@ mod tests {
         let settings = Arc::new(FakeSettings::default());
         settings.set(SETTING_SYSTEM, json!({ "clashPort": 19095 }));
 
-        let probe = HttpClashProbe::from_settings(Arc::clone(&settings) as Arc<dyn DbSettings>);
+        // TTL 置零：本用例专测「端口来自设置、不是构造时算死的值」，
+        // 缓存命中/TTL 到期的行为由 clash_port_caches_settings_lookups_within_ttl 覆盖。
+        let probe = HttpClashProbe::from_settings(Arc::clone(&settings) as Arc<dyn DbSettings>)
+            .with_port_ttl(Duration::ZERO);
         assert_eq!(probe.port(), 19095);
 
         settings.set(SETTING_SYSTEM, json!({ "clashPort": 19096 }));
@@ -1426,11 +1652,101 @@ mod tests {
         let ctl = StdProcControl::from_settings(
             ProcPaths::new(unique_dir("port-follow"), "sing-box"),
             Arc::clone(&settings) as Arc<dyn DbSettings>,
-        );
+        )
+        .with_port_ttl(Duration::ZERO);
         assert_eq!(ctl.clash_port(), 19096, "进程兜底探测也要跟随设置");
 
         settings.set(SETTING_SYSTEM, json!({}));
         assert_eq!(ctl.clash_port(), DEFAULT_CLASH_PORT as u16);
+    }
+
+    /// 会计数的设置源：验证 clash 端口缓存有没有把热路径上的查库次数压下去。
+    struct CountingSettings {
+        reads: AtomicUsize,
+        system: StdMutex<Value>,
+    }
+
+    impl CountingSettings {
+        fn new(port: i64) -> Self {
+            Self {
+                reads: AtomicUsize::new(0),
+                system: StdMutex::new(json!({ "clashPort": port })),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn set_port(&self, port: i64) {
+            *self.system.lock().unwrap_or_else(|e| e.into_inner()) = json!({ "clashPort": port });
+        }
+    }
+
+    impl DbSettings for CountingSettings {
+        fn get_setting(&self, key: &str) -> Option<Value> {
+            if key != SETTING_SYSTEM {
+                return None;
+            }
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Some(
+                self.system
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            )
+        }
+
+        fn set_setting(&self, _key: &str, _value: &Value) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// is_running() 每轮探活/守护都要读 clash 端口：TTL 内连续调用只能查一次库，
+    /// TTL 到期后必须重新查库（用户在设置页改完端口要能在 1 秒内生效）。
+    #[test]
+    fn clash_port_caches_settings_lookups_within_ttl() {
+        let settings = Arc::new(CountingSettings::new(19095));
+        let db = Arc::clone(&settings) as Arc<dyn DbSettings>;
+
+        // 1) 进程兜底探测：同一时刻连续 10 次只查一次库（默认 CLASH_PORT_TTL 生效）。
+        let ctl = StdProcControl::from_settings(
+            ProcPaths::new(unique_dir("port-cache"), "sing-box"),
+            Arc::clone(&db),
+        );
+        let base = settings.reads();
+        for _ in 0..10 {
+            assert_eq!(ctl.clash_port(), 19095);
+        }
+        assert_eq!(settings.reads() - base, 1, "TTL 内连续 10 次只应查库一次");
+
+        // 2) 探活端口走同一个缓存语义。
+        let probe = HttpClashProbe::from_settings(Arc::clone(&db));
+        let base = settings.reads();
+        for _ in 0..10 {
+            assert_eq!(probe.port(), 19095);
+        }
+        assert_eq!(settings.reads() - base, 1, "探活端口同样只应查库一次");
+
+        // 3) 手工推进时钟：TTL 未到期命中缓存，到期后重新查库并看到新端口。
+        let cache = ClashPortCache::new(CLASH_PORT_TTL);
+        let now = Instant::now();
+        let base = settings.reads();
+        assert_eq!(cache.get_at(settings.as_ref(), now), 19095);
+        assert_eq!(settings.reads() - base, 1);
+        settings.set_port(19100);
+        assert_eq!(
+            cache.get_at(settings.as_ref(), now + CLASH_PORT_TTL / 2),
+            19095,
+            "TTL 未到期必须返回缓存值"
+        );
+        assert_eq!(settings.reads() - base, 1, "TTL 未到期不应再查库");
+        assert_eq!(
+            cache.get_at(settings.as_ref(), now + CLASH_PORT_TTL),
+            19100,
+            "TTL 到期必须重新查库并跟随新设置"
+        );
+        assert_eq!(settings.reads() - base, 2, "TTL 到期后必须再查一次库");
     }
 
     fn rig(tag: &str) -> Rig {
@@ -1464,6 +1780,101 @@ mod tests {
             "inbounds": [{ "type": "mixed", "tag": "in-mixed", "listen": "0.0.0.0", "listen_port": port }],
             "outbounds": [{ "type": "direct", "tag": "direct" }]
         })
+    }
+
+    // ---- 崩溃守护：proc_present（期望在跑）必须与 is_running（真的在跑）分开 ----
+
+    /// 守护能重启的前提：进程崩了之后「期望在跑」仍为 true。
+    /// 旧实现 proc_present() 直接返回 is_running()，sing-box 一崩就判 Absent，
+    /// guard_tick 的重启分支永远走不到 —— 进程死了永久停摆（P0）。
+    #[tokio::test]
+    async fn proc_present_survives_process_crash() {
+        let rig = rig("guard-present-crash");
+        rig.mgr
+            .start(&sample_config(20040))
+            .await
+            .expect("首次启动");
+        assert!(
+            GuardHost::proc_present(&rig.mgr),
+            "拉起来之后应处于「期望在跑」状态"
+        );
+        assert!(GuardHost::is_running(&rig.mgr));
+
+        // 进程被 OOM / 崩溃杀掉：进程没了，但用户没让停。
+        rig.ctl.set_crashed();
+
+        assert!(!GuardHost::is_running(&rig.mgr), "崩溃后进程确实不在了");
+        assert!(
+            GuardHost::proc_present(&rig.mgr),
+            "崩溃不能清掉「期望在跑」，否则守护会把崩溃当用户停止、永不重启"
+        );
+    }
+
+    /// 手动停止 = 用户不要它跑了：期望态必须清空，否则守护会把它再拉起来。
+    #[tokio::test]
+    async fn proc_present_false_after_manual_stop() {
+        let rig = rig("guard-present-stop");
+        rig.mgr.start(&sample_config(20041)).await.expect("启动");
+        assert!(GuardHost::proc_present(&rig.mgr));
+
+        rig.mgr.stop().await.expect("手动停止");
+
+        assert!(!rig.ctl.should_run(), "手动停止后期望态必须清空");
+        assert!(
+            !GuardHost::proc_present(&rig.mgr),
+            "手动停止之后守护不得再拉起"
+        );
+        assert!(!GuardHost::is_running(&rig.mgr));
+
+        // 崩溃态下手动停止同样必须生效：进程已经被杀了，但期望态还是 true，
+        // 若 stop() 因「没在跑」而空转，guard 下一秒又会把它拉回来。
+        rig.mgr
+            .start(&sample_config(20043))
+            .await
+            .expect("再次启动");
+        rig.ctl.set_crashed();
+        rig.mgr.stop().await.expect("崩溃态下停止");
+        assert!(!rig.ctl.should_run(), "崩溃态下停止也必须清掉期望态");
+        assert!(
+            !GuardHost::proc_present(&rig.mgr),
+            "崩溃态下停止之后守护不得再拉起"
+        );
+    }
+
+    /// 从未启动（面板刚起来、用户没点过启动）→ 守护不干预。
+    #[test]
+    fn proc_present_false_before_first_start() {
+        let rig = rig("guard-present-new");
+        assert!(
+            !GuardHost::proc_present(&rig.mgr),
+            "从未启动过 → proc_present 必须为 false"
+        );
+        assert!(!GuardHost::is_running(&rig.mgr));
+    }
+
+    /// 端到端确认守护真的会重启：present=true & running=false → GuardTick::Restarted。
+    #[tokio::test]
+    async fn guard_tick_restarts_crashed_process() {
+        let rig = rig("guard-tick-restart");
+        rig.mgr.start(&sample_config(20042)).await.expect("启动");
+        rig.ctl.set_crashed();
+
+        let mut core =
+            crate::scheduler::GuardCore::new(crate::scheduler::GuardConfig::new(10.0, 60.0, 3));
+        let mut wd = crate::scheduler::FdWatchdog::default();
+        let tick = crate::scheduler::guard_tick(&rig.mgr, &mut core, &mut wd, 1.0).await;
+
+        assert_eq!(
+            tick,
+            crate::scheduler::GuardTick::Restarted,
+            "进程崩了必须走到重启分支，而不是 Absent"
+        );
+        assert!(GuardHost::is_running(&rig.mgr), "重启后进程应重新在跑");
+        assert_eq!(
+            rig.ctl.calls().last().map(|s| s.as_str()),
+            Some("start"),
+            "守护确实调用过 start"
+        );
     }
 
     #[test]
@@ -1605,6 +2016,56 @@ mod tests {
         assert!(err.to_string().contains("假装停止失败"));
     }
 
+    /// child 句柄丢失（面板重启过）时 stop() 必须等进程真的从查找结果里消失再返回。
+    /// 只发 SIGTERM 就返回的话，紧接着的 start() 会扫到正在退出的旧进程、误判
+    /// 「已在运行」而跳过启动 —— 新配置从未生效，旧进程随后退出，节点全断。
+    #[test]
+    fn stop_without_child_waits_until_pids_gone() {
+        // 模拟「进程要 500ms 后才消失」：必须等到那时才返回 true。
+        let begin = Instant::now();
+        let polls = AtomicUsize::new(0);
+        let gone_after = Duration::from_millis(500);
+        let ok = wait_pids_gone(
+            || {
+                polls.fetch_add(1, Ordering::SeqCst);
+                if begin.elapsed() >= gone_after {
+                    Vec::new()
+                } else {
+                    vec![4242]
+                }
+            },
+            STOP_GRACE,
+        );
+        assert!(ok, "进程消失后必须返回 true（不能无限等）");
+        assert!(
+            begin.elapsed() >= gone_after,
+            "必须真的等到进程退出，不能发完信号立刻返回，实际等了 {:?}",
+            begin.elapsed()
+        );
+        assert!(
+            begin.elapsed() < STOP_GRACE,
+            "消失得比预算早时必须提前返回，实际等了 {:?}",
+            begin.elapsed()
+        );
+        assert!(
+            polls.load(Ordering::SeqCst) >= 5,
+            "应按 50ms 轮询检查而不是忙等/只查一次"
+        );
+
+        // 进程一直不退出：预算耗尽返回 false，交给 SIGKILL 兜底。
+        let begin = Instant::now();
+        let budget = Duration::from_millis(120);
+        assert!(
+            !wait_pids_gone(|| vec![4243], budget),
+            "超预算必须返回 false"
+        );
+        assert!(
+            begin.elapsed() >= budget,
+            "必须等满预算才能判定失败，实际等了 {:?}",
+            begin.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn restart_calls_stop_then_start() {
         let r = rig("restart");
@@ -1736,6 +2197,52 @@ mod tests {
         assert!(r2.mgr.rollback(None).await.unwrap());
         let restored = r2.mgr.load_config_from_disk().unwrap();
         assert_eq!(restored, good);
+    }
+
+    /// 没有可回滚配置时必须把坏配置挪出主位置：否则 scheduler 的 guard 每轮
+    /// start_from_disk() 又会把坏配置拉起来，形成「起不来 → 停 → 再起」的死循环。
+    #[tokio::test]
+    async fn rollback_without_previous_quarantines_bad_config() {
+        let r = rig("rollback-quarantine");
+        // apply 已经原子写过坏配置：此刻磁盘主位置就是坏的那份。
+        let bad = sample_config(20030);
+        r.mgr.write_config_atomic(&bad).unwrap();
+        assert!(r.mgr.paths().config_path().exists());
+        assert!(r.mgr.last_good_config().is_none(), "构造前提：没有好配置");
+
+        assert!(
+            !r.mgr.rollback(None).await.unwrap(),
+            "没有好配置时仍须返回 Ok(false)"
+        );
+        assert!(
+            !r.mgr.paths().config_path().exists(),
+            "坏配置必须从主位置挪走，否则 guard 会反复拉起它"
+        );
+        let bad_files: Vec<String> = std::fs::read_dir(&r.dir)
+            .expect("读数据目录")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("config.json.bad-"))
+            .collect();
+        assert_eq!(
+            bad_files.len(),
+            1,
+            "目录里应恰好有一个 .bad-* 隔离文件: {:?}",
+            bad_files
+        );
+        assert!(
+            r.mgr.load_config_from_disk().is_none(),
+            "主位置与 .bak 都不该再留下可读配置"
+        );
+        assert!(
+            !r.mgr.start_from_disk().await,
+            "拿不到配置时 start_from_disk() 必须返回 false"
+        );
+        assert!(
+            !r.ctl.calls().iter().any(|c| c == "start"),
+            "不该再去启动坏配置: {:?}",
+            r.ctl.calls()
+        );
     }
 
     #[test]

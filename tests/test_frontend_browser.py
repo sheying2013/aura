@@ -270,6 +270,8 @@ def test_checkbox_does_not_replace_rows_and_disabled_search_applies(ui):
     page.evaluate("loadNodes()")
     page.locator("#filter-group").select_option("__DISABLED__")
     page.locator("#search-keyword").fill("n3")
+    # 搜索框有 250ms 防抖，必须等渲染落地后再断言行数（不能立即 count）
+    page.wait_for_function("document.querySelectorAll('#nodes-tbody tr[data-id]').length === 1")
     assert page.locator("#nodes-tbody tr[data-id]").count() == 1
     assert page.locator("#nodes-tbody tr[data-id]").get_attribute("data-id") == "n3"
 
@@ -290,8 +292,11 @@ def test_offline_is_enabled_and_reenable_resets_probe_state(ui):
 def test_bulk_status_reports_partial_failure_instead_of_false_success(ui):
     page, state = ui
     state["responses"]["/api/nodes/n2"] = (409, {"detail": "conflict"})
+    # 批量停用已加危险操作二次确认，这里 stub 成同意并顺带锁定「只问一次」
+    page.evaluate("() => { window.__confirms=0; window.auraConfirm=async()=>{window.__confirms++;return true}; }")
     page.evaluate("selectedNodeIds=new Set(['n1','n2'])")
     page.evaluate("disableSelectedNodes()")
+    assert page.evaluate("window.__confirms") == 1
     logs = page.locator("#system-logs-container").inner_text()
     assert "成功 1 个，失败 1 个" in logs
     assert "conflict" in logs
@@ -577,8 +582,12 @@ def test_stale_settings_fetch_does_not_replace_saved_domain(ui):
     page.evaluate("""() => {
         const originalApi = api;
         window.__releaseSettings = null;
+        window.__stalledSettings = 0;
+        // 只挂起第一次 GET /api/settings（loadSettings 的那次）。
+        // 保存流程本身也会 GET 最新配置再合并，若一并挂起 saveSystemSettings 将永远挂住。
         api = async (path, options = {}) => {
-            if (path === '/api/settings' && !options.method) {
+            if (path === '/api/settings' && !options.method && window.__stalledSettings === 0) {
+                window.__stalledSettings = 1;
                 return new Promise(resolve => { window.__releaseSettings = () => resolve({
                     json: async () => ({exportDomain:'old.example.com'})
                 }); });

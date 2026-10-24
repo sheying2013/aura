@@ -29,6 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::db::{ProbeUpdateRow, UpdateNodeProbeOutcome};
 use crate::types::{Node, PingResultItem};
 use crate::utils::is_ip_address;
 
@@ -402,10 +403,10 @@ pub fn probe_attempts(mode: ProbeMode) -> usize {
     PROBE_DELAY_RETRY + 1 + if mode.counts_failures() { 1 } else { 0 }
 }
 
-/// 结合节点当前状态获取有效探活尝试次数：
-/// 对于已离线或处于连续失败中的节点，后台探活仅尝试 1 次，严禁在死节点上高频重复重试引发连接风暴与挂起 socket 堆积；
-/// 对于在线节点，给予完整重试机会，防抖动误杀。
-pub fn probe_attempts_for_node(mode: ProbeMode, status: &str, fails: i64) -> usize {
+/// 结合节点连续失败次数获取有效探活尝试次数（判据只认 consecutive_fails，不看 status）：
+/// 后台探活对已连续失败 >= 3 次的节点熔断为仅 1 次，严禁在死节点上高频重复重试引发连接风暴与挂起 socket 堆积；
+/// 其余情况（手动测活、或后台连败 < 3 次的在线/抖动节点）给予完整重试机会，防抖动误杀。
+pub fn probe_attempts_for_node(mode: ProbeMode, fails: i64) -> usize {
     if !mode.counts_failures() {
         // 手动测活：始终按完整尝试次数，快速反馈
         probe_attempts(mode)
@@ -415,7 +416,6 @@ pub fn probe_attempts_for_node(mode: ProbeMode, status: &str, fails: i64) -> usi
         1
     } else {
         // 正常在线或初次偶发抖动节点：给予 4 次重试机会（含 8s 缓冲），防误杀
-        let _ = status;
         probe_attempts(mode)
     }
 }
@@ -638,20 +638,14 @@ impl ProbeTracker {
         self.tags.remove(id);
     }
 
-    /// 清理已删节点的记录；仅在记录数明显超出存活节点数时执行（正常轮次零开销）。
+    /// 清理已删节点的记录（hist / failure_since / tags 三个 map 一起 retain）。
+    ///
+    /// 无条件做增量 retain：节点规模只有几百，一轮 O(n) 的 retain 开销可忽略；
+    /// 早先的"超出存活节点数 500 才清"阈值会让已删节点的陈旧条目长期滞留。
     pub fn prune(&mut self, valid: &HashSet<String>) {
-        if self.hist.len() <= valid.len() + 500 {
-            return;
-        }
-        let stale: Vec<String> = self
-            .hist
-            .keys()
-            .filter(|k| !valid.contains(*k))
-            .cloned()
-            .collect();
-        for k in stale {
-            self.reset(&k);
-        }
+        self.hist.retain(|k, _| valid.contains(k));
+        self.failure_since.retain(|k, _| valid.contains(k));
+        self.tags.retain(|k, _| valid.contains(k));
     }
 
     /// 探活 tag 快照（端口 + 协议）。tag 变化 → 旧观测作废。返回是否发生了重置。
@@ -1723,6 +1717,25 @@ impl ProbeEngine {
         }
     }
 
+    /// 批量落库失败时的退路：逐条写，行为等价于修复前的逐节点同步写库。
+    fn write_probe_rows_one_by_one(&self, rows: &[ProbeUpdateRow]) -> Vec<UpdateNodeProbeOutcome> {
+        rows.iter()
+            .map(|r| {
+                self.db
+                    .update_node_probe(
+                        &r.node_id,
+                        r.ping,
+                        &r.status,
+                        r.count_failure,
+                        r.expected_port,
+                        r.expected_protocol.as_deref(),
+                    )
+                    .ok()
+                    .flatten()
+            })
+            .collect()
+    }
+
     async fn probe_inner(
         &self,
         ids: Option<Vec<String>>,
@@ -1830,6 +1843,8 @@ impl ProbeEngine {
         let mut need_rebuild = false;
         let mut to_enrich: Vec<Value> = Vec::new();
         let mut out: Vec<Value> = Vec::new();
+        // 待落库项：循环里只算内存侧 tracker 与占位，循环后一次性批量写库（FIX-B1）。
+        let mut pending: Vec<PendingProbeWrite> = Vec::new();
         for (target, mut item) in selection.targets.iter().zip(results) {
             if self.op.locked() || self.op.generation() != generation {
                 break;
@@ -1867,51 +1882,87 @@ impl ProbeEngine {
                         }
                     }
                 }
+                if item.status == "online" {
+                    if let Some(mut value) = nodes_json.get(&target.id).cloned() {
+                        value["status"] = json!("online");
+                        to_enrich.push(value);
+                    }
+                }
+                out.push(json!(item));
             } else {
-                let count_failure = mode.counts_failures();
-                match self.db.update_node_probe(
-                    &target.id,
-                    item.ping,
-                    &item.status,
-                    count_failure,
-                    Some(target.port),
-                    Some(&target.protocol),
-                ) {
-                    Ok(Some(fails)) => {
-                        if item.status == "online" {
+                // 先占位，等批量落库后按结果回填 status / error。
+                let enrich = if item.status == "online" {
+                    nodes_json.get(&target.id).cloned().map(|mut value| {
+                        value["status"] = json!("online");
+                        value
+                    })
+                } else {
+                    None
+                };
+                out.push(json!(item));
+                pending.push(PendingProbeWrite {
+                    out_idx: out.len() - 1,
+                    row: ProbeUpdateRow::new(
+                        &target.id,
+                        item.ping,
+                        &item.status,
+                        mode.counts_failures(),
+                        Some(target.port),
+                        Some(&target.protocol),
+                    ),
+                    target: target.clone(),
+                    count_failure: mode.counts_failures(),
+                    enrich,
+                });
+            }
+        }
+        // 一轮探活结果一次批量落库（单事务）；批量失败才退回逐条写，保持原有容错语义。
+        if !pending.is_empty() {
+            let rows: Vec<ProbeUpdateRow> = pending.iter().map(|p| p.row.clone()).collect();
+            let outcomes: Vec<UpdateNodeProbeOutcome> = match self.db.update_node_probe_batch(&rows)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "批量写入探活结果失败，退回逐条写入");
+                    self.write_probe_rows_one_by_one(&rows)
+                }
+            };
+            for (p, outcome) in pending.iter().zip(outcomes) {
+                match outcome {
+                    Some(fails) => {
+                        if p.row.status == "online" {
                             let mut tracker = self.tracker.lock().unwrap();
-                            tracker.clear_failure(&target.id);
-                            if count_failure {
-                                tracker.record(&target.id, true);
+                            tracker.clear_failure(&p.row.node_id);
+                            if p.count_failure {
+                                tracker.record(&p.row.node_id, true);
                             }
-                        } else if count_failure {
+                            drop(tracker);
+                            if let Some(value) = p.enrich.clone() {
+                                to_enrich.push(value);
+                            }
+                        } else if p.count_failure {
                             let now = epoch_now();
                             let disable = {
                                 let mut tracker = self.tracker.lock().unwrap();
-                                tracker.record(&target.id, false);
-                                tracker.note_failure(&target.id, now);
-                                tracker.should_disable(&target.id, fails, now)
+                                tracker.record(&p.row.node_id, false);
+                                tracker.note_failure(&p.row.node_id, now);
+                                tracker.should_disable(&p.row.node_id, fails, now)
                             };
-                            if disable && self.try_disable(&target.id, target, fails) {
-                                item.status = "disabled".to_string();
+                            // try_disable 的 CAS 依赖刚写入的 consecutive_fails，
+                            // 因此必须放在批量写之后。
+                            if disable && self.try_disable(&p.row.node_id, &p.target, fails) {
+                                out[p.out_idx]["status"] = json!("disabled");
                                 need_rebuild = true;
                             }
                         }
                     }
-                    _ => {
-                        // CAS 落空：节点状态或 tag 在本轮内被改过，本轮结果作废。
-                        item.status = "unknown".to_string();
-                        item.error = Some(STALE_PROBE_HINT.to_string());
+                    None => {
+                        // CAS 落空/落库失败：节点状态或 tag 在本轮内被改过，本轮结果作废。
+                        out[p.out_idx]["status"] = json!("unknown");
+                        out[p.out_idx]["error"] = json!(STALE_PROBE_HINT);
                     }
                 }
             }
-            if item.status == "online" {
-                if let Some(mut value) = nodes_json.get(&target.id).cloned() {
-                    value["status"] = json!("online");
-                    to_enrich.push(value);
-                }
-            }
-            out.push(json!(item));
         }
         if need_rebuild {
             if let Err(e) = self.cfg.apply(None).await {
@@ -1925,6 +1976,17 @@ impl ProbeEngine {
         out.extend(skipped);
         out
     }
+}
+
+/// 一轮探活里待落库的单条结果（FIX-B1：循环内只收集，循环后一次性批量写）。
+struct PendingProbeWrite {
+    /// 在 out 里的下标：落库后要按结果回填 status/error。
+    out_idx: usize,
+    row: ProbeUpdateRow,
+    target: ProbeTargetNode,
+    count_failure: bool,
+    /// 探活成功时预取的 enrich 快照（最终仍是 online 才推入 to_enrich）。
+    enrich: Option<Value>,
 }
 
 /// inflight 标志的 RAII 复位（含提前 return / panic 路径）。
@@ -1954,7 +2016,7 @@ pub async fn probe_one(
         status: "offline".to_string(),
         error: None,
     };
-    let attempts = probe_attempts_for_node(mode, &node.status, node.consecutive_fails);
+    let attempts = probe_attempts_for_node(mode, node.consecutive_fails);
     for attempt in 0..attempts {
         let backoff = probe_retry_backoff(attempt) * retry_scale;
         if backoff > 0.0 {
@@ -2015,11 +2077,31 @@ impl crate::wire::Prober for ProbeEngine {
 // ===========================================================================
 
 /// relay 随机轮询的候选探活超时（毫秒，Python 里是字符串 "2000"）。
+/// 随机轮询里并发探测候选的上限（FIX-B3）。
+pub const RANDOM_ROTATE_CONCURRENCY: usize = 8;
+
+/// 随机轮询整轮的探测预算（秒）：超预算就用已经拿到的存活结果（FIX-B3）。
+pub const RANDOM_ROTATE_BUDGET: f64 = 30.0;
+
+/// sync_relay_exits_after_probe 里并发拉取各 relay 当前出口的上限（FIX-B2）。
+pub const RELAY_SYNC_CONCURRENCY: usize = 8;
+
 pub const RANDOM_ROTATE_PROBE_TIMEOUT_MS: u64 = 2000;
 /// relay 随机轮询最多试几个候选。
 pub const RANDOM_ROTATE_CANDIDATES: usize = 10;
 /// relay 随机轮询间隔下限（秒）。
 pub const RANDOM_ROTATE_MIN_INTERVAL: f64 = 5.0;
+
+/// 单个 relay 在一轮出口同步里的决策输入（FIX-B2：节点快照只读一次，全部内存过滤）。
+struct RelaySyncPlan {
+    /// 在 relays 里的下标，用于按 relay 原顺序执行切换。
+    idx: usize,
+    rd_tag: String,
+    /// 粘滞期判定用的原始候选（刷新前）。
+    raw_targets: Vec<String>,
+    /// 刷新后（仍合法且仍属该分组）的候选，用于挑最优出口。
+    fresh_targets: Vec<String>,
+}
 
 /// 一轮 relay 出口同步的结果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2067,6 +2149,14 @@ impl ProbeEngine {
                 return report;
             }
         };
+        // FIX-B5：switch_at 只增不减，删掉的 relay 会把陈旧记录一直留着。
+        {
+            let live: HashSet<&str> = relays.iter().map(|rd| rd.id.as_str()).collect();
+            self.switch_at
+                .lock()
+                .unwrap()
+                .retain(|relay_id, _| live.contains(relay_id.as_str()));
+        }
         if relays.is_empty() {
             return report;
         }
@@ -2163,23 +2253,58 @@ impl ProbeEngine {
             }
         }
         let generation = self.op.generation();
-        for rd in &relays {
+        // FIX-B2：候选集合全部基于本轮唯一一次节点快照在内存里算好，循环内不再读库。
+        let mut plans: Vec<RelaySyncPlan> = Vec::new();
+        for (idx, rd) in relays.iter().enumerate() {
             let rd_tag = format!("relay-auto-{}", rd.id);
-            let mut targets: Vec<String> = node_by_tag
+            let raw_targets: Vec<String> = node_by_tag
                 .iter()
                 .filter(|(_, node)| group_matches(rd, node))
                 .map(|(tag, _)| tag.clone())
                 .collect();
-            if targets.is_empty() {
+            if raw_targets.is_empty() {
                 continue;
             }
-            let current = self
-                .clash
-                .current(base.clone(), secret.clone(), rd_tag.clone())
-                .await;
+            // 快照里已过滤过 disabled，这里只需再看一眼分组归属。
+            let fresh_targets = Self::latest_relay_targets(rd, &raw_targets, &node_by_tag);
+            if fresh_targets.is_empty() {
+                continue;
+            }
+            plans.push(RelaySyncPlan {
+                idx,
+                rd_tag,
+                raw_targets,
+                fresh_targets,
+            });
+        }
+        // FIX-B2：各 relay 的当前出口有界并发拉取（串行时单个最长约 12s，R 个会叠加）。
+        let sem = Arc::new(Semaphore::new(RELAY_SYNC_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
+        for (slot_idx, plan) in plans.iter().enumerate() {
+            let clash = self.clash.clone();
+            let base = base.clone();
+            let secret = secret.clone();
+            let rd_tag = plan.rd_tag.clone();
+            let slot = sem.clone();
+            set.spawn(async move {
+                let _permit = slot.acquire().await;
+                (slot_idx, clash.current(base, secret, rd_tag).await)
+            });
+        }
+        let mut currents: Vec<Option<String>> = vec![None; plans.len()];
+        while let Some(joined) = set.join_next().await {
+            if let Ok((slot_idx, current)) = joined {
+                currents[slot_idx] = current;
+            }
+        }
+        // 决策与切换仍按 relay 原顺序执行，语义与串行版一致。
+        for (slot_idx, plan) in plans.iter().enumerate() {
+            let rd = &relays[plan.idx];
+            let rd_tag = plan.rd_tag.clone();
+            let current = currents[slot_idx].clone();
             if sticky_enabled {
                 if let Some(cur) = current.as_deref() {
-                    let in_targets = targets.iter().any(|t| t == cur);
+                    let in_targets = plan.raw_targets.iter().any(|t| t == cur);
                     let last = self
                         .switch_at
                         .lock()
@@ -2196,13 +2321,9 @@ impl ProbeEngine {
             if self.op.locked() || self.op.generation() != generation {
                 return report;
             }
-            // 节点快照可能已被别的操作改掉，按最新库再过滤一遍。
-            targets = self.latest_relay_targets(rd, &targets);
-            if targets.is_empty() {
-                continue;
-            }
+            let targets = &plan.fresh_targets;
             let mut best: Option<(String, i64)> = None;
-            for tag in &targets {
+            for tag in targets {
                 if let Some(Some(d)) = delay.get(tag) {
                     if best.as_ref().map(|(_, bd)| d < bd).unwrap_or(true) {
                         best = Some((tag.clone(), *d));
@@ -2240,25 +2361,14 @@ impl ProbeEngine {
         report
     }
 
-    /// 重新读库，只保留此刻仍合法且仍属于该 relay 分组的 tag。
+    /// 用本轮已加载的节点快照过滤候选，只保留仍属于该 relay 分组的 tag。
+    ///
+    /// FIX-B2：原来每个 relay 都会重新全表 list_nodes（O(R×N)），改为接收内存快照。
     fn latest_relay_targets(
-        &self,
         rd: &crate::types::RelayDomain,
         targets: &[String],
+        fresh: &HashMap<String, Node>,
     ) -> Vec<String> {
-        let nodes = match self.db.list_nodes(None, None, None) {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
-        };
-        let fresh: HashMap<String, Node> = nodes
-            .into_iter()
-            .filter(|n| n.base.status.as_deref() != Some("disabled"))
-            .map(|n| {
-                let tag =
-                    crate::config_manager::outbound_tag(&n.base.protocol, n.base.port.unwrap_or(0));
-                (tag, n)
-            })
-            .collect();
         targets
             .iter()
             .filter(|t| fresh.get(*t).map(|n| group_matches(rd, n)).unwrap_or(false))
@@ -2269,6 +2379,16 @@ impl ProbeEngine {
     /// 手动/定时随机轮询 relay 出口（对齐 _rotate_random_relay）。
     /// 返回本次选中的节点 tag（对齐 Python 的 randomRotateCurrent）。
     pub async fn rotate_random_relay(&self) -> Option<String> {
+        self.rotate_random_relay_with(RANDOM_ROTATE_CONCURRENCY, RANDOM_ROTATE_BUDGET)
+            .await
+    }
+
+    /// rotate 的实现体：并发上限与探测预算可注入（测试用很小的常量收紧）。
+    async fn rotate_random_relay_with(
+        &self,
+        concurrency: usize,
+        budget_secs: f64,
+    ) -> Option<String> {
         let nodes = match self.db.list_nodes(None, None, None) {
             Ok(v) => v,
             Err(e) => {
@@ -2298,58 +2418,83 @@ impl ProbeEngine {
         let relays = self.db.list_relay_domains().unwrap_or_default();
         let base = self.cfg.clash_base();
         let secret = self.cfg.clash_secret();
-        let mut chosen: Option<String> = None;
-        for node in shuffled(&candidates_pool)
-            .into_iter()
+        // 整轮共用一份探测预算：超预算就直接用已经拿到的存活结果。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(budget_secs.max(0.0));
+        // 全局段：洗牌取前 RANDOM_ROTATE_CANDIDATES 个后批量并发探测，
+        // 仍按原顺序取第一个存活的（与串行 break 的语义一致）。
+        let global_tags: Vec<String> = shuffled(&candidates_pool)
+            .iter()
             .take(RANDOM_ROTATE_CANDIDATES)
-        {
-            let tag = crate::config_manager::outbound_tag(
-                &node.base.protocol,
-                node.base.port.unwrap_or(0),
-            );
-            if self
-                .probe_alive(
-                    &base,
-                    &secret,
-                    &tag,
-                    &test_url,
-                    RANDOM_ROTATE_PROBE_TIMEOUT_MS,
-                )
-                .await
-            {
-                chosen = Some(tag);
-                break;
-            }
-        }
+            .map(|n| {
+                crate::config_manager::outbound_tag(&n.base.protocol, n.base.port.unwrap_or(0))
+            })
+            .collect();
+        let global_alive = self
+            .probe_alive_batch(
+                &global_tags,
+                &AliveProbeCtx {
+                    base: &base,
+                    secret: &secret,
+                    url: &test_url,
+                    timeout_ms: RANDOM_ROTATE_PROBE_TIMEOUT_MS,
+                    concurrency,
+                    deadline,
+                },
+            )
+            .await;
+        let chosen = global_tags
+            .into_iter()
+            .zip(global_alive)
+            .find(|(_, alive)| *alive)
+            .map(|(tag, _)| tag);
         let Some(chosen_tag) = chosen else {
             tracing::info!("随机轮询没有任何可用候选，保持当前出口");
             return None;
         };
+        // per-relay 段：先把每个 relay 的候选算好，再把所有候选去重后一次性批量并发探测；
+        // 每个 relay 仍按自己的候选顺序取第一个存活的，否则回退全局 chosen_tag。
+        let mut relay_cands: Vec<(String, Vec<String>)> = Vec::new();
+        let mut all_tags: Vec<String> = Vec::new();
         for rd in &relays {
             let rd_tag = format!("relay-auto-{}", rd.id);
-            let mut target = chosen_tag.clone();
-            let cands: Vec<String> = candidates_pool
+            let tags: Vec<String> = candidates_pool
                 .iter()
                 .filter(|n| group_matches(rd, n))
                 .map(|n| {
                     crate::config_manager::outbound_tag(&n.base.protocol, n.base.port.unwrap_or(0))
                 })
                 .collect();
-            if !cands.is_empty() {
-                for tag in shuffled(&cands).into_iter().take(RANDOM_ROTATE_CANDIDATES) {
-                    if self
-                        .probe_alive(
-                            &base,
-                            &secret,
-                            &tag,
-                            &test_url,
-                            RANDOM_ROTATE_PROBE_TIMEOUT_MS,
-                        )
-                        .await
-                    {
-                        target = tag;
-                        break;
-                    }
+            let cands: Vec<String> = shuffled(&tags)
+                .into_iter()
+                .take(RANDOM_ROTATE_CANDIDATES)
+                .collect();
+            for tag in &cands {
+                if !all_tags.iter().any(|t| t == tag) {
+                    all_tags.push(tag.clone());
+                }
+            }
+            relay_cands.push((rd_tag, cands));
+        }
+        let alive = self
+            .probe_alive_batch(
+                &all_tags,
+                &AliveProbeCtx {
+                    base: &base,
+                    secret: &secret,
+                    url: &test_url,
+                    timeout_ms: RANDOM_ROTATE_PROBE_TIMEOUT_MS,
+                    concurrency,
+                    deadline,
+                },
+            )
+            .await;
+        let alive: HashMap<String, bool> = all_tags.into_iter().zip(alive).collect();
+        for (rd_tag, cands) in relay_cands {
+            let mut target = chosen_tag.clone();
+            for tag in &cands {
+                if alive.get(tag).copied().unwrap_or(false) {
+                    target = tag.clone();
+                    break;
                 }
             }
             if let Err(e) = self
@@ -2370,24 +2515,60 @@ impl ProbeEngine {
         Some(chosen_tag)
     }
 
-    /// 候选是否活着（对齐 _is_alive：只看 delay 是否返回有效值）。
-    async fn probe_alive(
-        &self,
-        base: &str,
-        secret: &Option<String>,
-        tag: &str,
-        url: &str,
-        timeout_ms: u64,
-    ) -> bool {
-        let req = DelayRequest {
-            base: base.to_string(),
-            secret: secret.clone(),
-            tag: tag.to_string(),
-            url: url.to_string(),
-            timeout_ms,
-        };
-        matches!(self.clash.delay(req).await, DelayOutcome::Ok(_))
+    /// 批量探测一批候选是否活着（对齐 _is_alive：只看 delay 是否返回有效值）。
+    ///
+    /// FIX-B3：有界并发（concurrency）+ 整轮共享 deadline；超预算的候选直接算不活，
+    /// 调用方据此使用已经拿到的存活结果。
+    async fn probe_alive_batch(&self, tags: &[String], ctx: &AliveProbeCtx<'_>) -> Vec<bool> {
+        let mut out = vec![false; tags.len()];
+        if tags.is_empty() {
+            return out;
+        }
+        let deadline = ctx.deadline;
+        let timeout_ms = ctx.timeout_ms;
+        let sem = Arc::new(Semaphore::new(ctx.concurrency.max(1)));
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, tag) in tags.iter().enumerate() {
+            let clash = self.clash.clone();
+            let req = DelayRequest {
+                base: ctx.base.to_string(),
+                secret: ctx.secret.clone(),
+                tag: tag.clone(),
+                url: ctx.url.to_string(),
+                timeout_ms,
+            };
+            let slot = sem.clone();
+            set.spawn(async move {
+                if tokio::time::Instant::now() >= deadline {
+                    return (idx, false);
+                }
+                let Ok(_permit) = slot.acquire().await else {
+                    return (idx, false);
+                };
+                if tokio::time::Instant::now() >= deadline {
+                    return (idx, false);
+                }
+                let outcome = tokio::time::timeout_at(deadline, clash.delay(req)).await;
+                (idx, matches!(outcome, Ok(DelayOutcome::Ok(_))))
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((idx, alive)) = joined {
+                out[idx] = alive;
+            }
+        }
+        out
     }
+}
+
+/// 批量探活的公共参数：把固定 6 项收成一个上下文，避免参数过多的告警。
+struct AliveProbeCtx<'a> {
+    base: &'a str,
+    secret: &'a Option<String>,
+    url: &'a str,
+    timeout_ms: u64,
+    concurrency: usize,
+    deadline: tokio::time::Instant,
 }
 
 /// 洗牌（Python 的 random.shuffle）；用 rand::seq::SliceRandom 保持同一语义。
@@ -2514,28 +2695,52 @@ pub async fn enrich_loop(engine: Arc<ProbeEngine>, stop: Arc<tokio::sync::Notify
         if !engine.cfg().is_running() || engine.op().locked() {
             continue;
         }
-        let nodes = match engine.db().list_nodes(None, None, None) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        for node in nodes {
-            if node.base.status.as_deref() == Some("disabled") {
-                continue;
-            }
-            let Ok(value) = serde_json::to_value(&node) else {
-                continue;
-            };
-            let intel = NodeIntel::from_json(&value);
-            if intel.has_full_intel() {
-                continue;
-            }
-            let now = epoch_now();
-            if !matches!(engine.enricher().plan(&value, now), EnrichPlan::Run { .. }) {
-                continue;
-            }
-            engine.enricher().enrich(value).await;
-        }
+        enrich_sweep(&engine).await;
     }
+}
+
+/// 一轮补充查（FIX-B4）：有界并发（ENRICH_CONCURRENCY），不再逐节点串行 await。
+///
+/// 每个节点仍然先过 Enricher::plan：冷却期内 / 已有在飞补查都会被跳过，
+/// 且 Run 已经登记 pending，所以任务里直接走 enrich_planned（不会二次 plan 变成 InFlight）。
+pub async fn enrich_sweep(engine: &Arc<ProbeEngine>) {
+    let nodes = match engine.db().list_nodes(None, None, None) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let mut pending: Vec<Value> = Vec::new();
+    for node in nodes {
+        if node.base.status.as_deref() == Some("disabled") {
+            continue;
+        }
+        let Ok(value) = serde_json::to_value(&node) else {
+            continue;
+        };
+        let intel = NodeIntel::from_json(&value);
+        if intel.has_full_intel() {
+            continue;
+        }
+        let now = epoch_now();
+        if !matches!(engine.enricher().plan(&value, now), EnrichPlan::Run { .. }) {
+            continue;
+        }
+        pending.push(value);
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let enricher = engine.enricher().clone();
+    let sem = Arc::new(Semaphore::new(ENRICH_CONCURRENCY));
+    let mut set = tokio::task::JoinSet::new();
+    for value in pending {
+        let enricher = enricher.clone();
+        let slot = sem.clone();
+        set.spawn(async move {
+            let _permit = slot.acquire().await;
+            enricher.enrich_planned(value).await;
+        });
+    }
+    while set.join_next().await.is_some() {}
 }
 
 #[cfg(test)]
@@ -2875,21 +3080,51 @@ mod tests {
     }
 
     #[test]
-    fn probe_tracker_prunes_deleted_nodes_only_when_far_over() {
+    fn probe_tracker_prune_clears_stale_entries_in_all_maps() {
         let mut tracker = ProbeTracker::new();
-        for i in 0..10 {
-            tracker.record(&format!("n{i}"), true);
+        for i in 0..1000 {
+            let id = format!("n{i}");
+            tracker.record(&id, true);
+            tracker.note_failure(&id, 1.0);
+            tracker.observe_tag(&id, 52001, "shadowsocks");
         }
-        let valid: HashSet<String> = (0..10).map(|i| format!("n{i}")).collect();
-        tracker.prune(&valid);
-        assert_eq!(tracker.hist_len("n0"), 1, "正常量级不做清理（零开销路径）");
+        assert_eq!(tracker.hist.len(), 1000);
+        assert_eq!(tracker.failure_since.len(), 1000);
+        assert_eq!(tracker.tags.len(), 1000);
 
-        for i in 10..800 {
-            tracker.record(&format!("gone{i}"), true);
-        }
-        tracker.prune(&valid);
-        assert_eq!(tracker.hist_len("gone10"), 0, "超量后应清掉已删节点");
-        assert_eq!(tracker.hist_len("n0"), 1, "存活节点必须保留");
+        // 只有 n999 被删：差值 1 远小于旧的 500 阈值，也必须立刻清掉（旧实现会整轮跳过）
+        let valid999: HashSet<String> = (0..999).map(|i| format!("n{i}")).collect();
+        tracker.prune(&valid999);
+        assert_eq!(tracker.hist.len(), 999, "hist 必须清掉已删节点");
+        assert_eq!(
+            tracker.failure_since.len(),
+            999,
+            "failure_since 必须同步清理"
+        );
+        assert_eq!(tracker.tags.len(), 999, "tags 必须同步清理");
+        assert_eq!(tracker.hist_len("n0"), 1, "存活节点的滑窗必须保留");
+        assert_eq!(tracker.failure_since("n0"), Some(1.0));
+        assert_eq!(
+            tracker.tag_of("n0"),
+            Some((52001, "shadowsocks".to_string()))
+        );
+        assert_eq!(tracker.tag_of("n999"), None);
+        assert_eq!(tracker.failure_since("n999"), None);
+
+        // 只剩 1 个有效节点：三个 map 都应收敛到 1 条
+        let valid1: HashSet<String> = std::iter::once("n0".to_string()).collect();
+        tracker.prune(&valid1);
+        assert_eq!(tracker.hist.len(), 1);
+        assert_eq!(tracker.failure_since.len(), 1);
+        assert_eq!(tracker.tags.len(), 1);
+        assert_eq!(tracker.hist_len("n0"), 1);
+        assert_eq!(tracker.hist_len("n1"), 0);
+
+        // 空 valid（节点全删）：三个 map 都清空
+        tracker.prune(&HashSet::new());
+        assert!(tracker.hist.is_empty());
+        assert!(tracker.failure_since.is_empty());
+        assert!(tracker.tags.is_empty());
     }
 
     // ---------- 探活参数 ----------
@@ -3688,33 +3923,17 @@ mod probe_tests {
 
     #[test]
     fn probe_attempts_for_node_logic() {
-        // 手动测活始终保持 3 次尝试
-        assert_eq!(probe_attempts_for_node(ProbeMode::Manual, "online", 0), 3);
-        assert_eq!(probe_attempts_for_node(ProbeMode::Manual, "offline", 10), 3);
+        // 手动测活始终保持 3 次尝试（不论连败次数）
+        assert_eq!(probe_attempts_for_node(ProbeMode::Manual, 0), 3);
+        assert_eq!(probe_attempts_for_node(ProbeMode::Manual, 10), 3);
 
-        // 后台测活：初次离线或抖动节点（fails < 3），提供完整的 4 次尝试机会（防误杀）
-        assert_eq!(
-            probe_attempts_for_node(ProbeMode::Background, "online", 0),
-            4
-        );
-        assert_eq!(
-            probe_attempts_for_node(ProbeMode::Background, "offline", 0),
-            4
-        );
-        assert_eq!(
-            probe_attempts_for_node(ProbeMode::Background, "offline", 2),
-            4
-        );
+        // 后台测活：连败 < 3 的节点（在线或初次抖动），提供完整的 4 次尝试机会（防误杀）
+        assert_eq!(probe_attempts_for_node(ProbeMode::Background, 0), 4);
+        assert_eq!(probe_attempts_for_node(ProbeMode::Background, 2), 4);
 
-        // 后台测活：顽固死节点（fails >= 3），熔断限制为 1 次，防止连接风暴和 TCP 堵塞
-        assert_eq!(
-            probe_attempts_for_node(ProbeMode::Background, "offline", 3),
-            1
-        );
-        assert_eq!(
-            probe_attempts_for_node(ProbeMode::Background, "offline", 20),
-            1
-        );
+        // 后台测活：顽固死节点（连败 >= 3），熔断限制为 1 次，防止连接风暴和 TCP 堵塞
+        assert_eq!(probe_attempts_for_node(ProbeMode::Background, 3), 1);
+        assert_eq!(probe_attempts_for_node(ProbeMode::Background, 20), 1);
     }
 
     #[tokio::test]
@@ -3747,6 +3966,51 @@ mod probe_tests {
         ProbeEngine::new(db, FakeCfg::new(true), reqwest::Client::new())
             .with_enricher(Arc::new(enricher))
             .with_retry_scale(0.0)
+    }
+
+    /// 桩：抓出口 IP 时记在飞数并睡一会儿（FIX-B4 观测补查并发度）。
+    #[derive(Default)]
+    struct SlowFetcher {
+        inflight: AtomicUsize,
+        max_inflight: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl ExitIpFetcher for SlowFetcher {
+        fn fetch_exit_ip(&self, _node: Value) -> BoxFuture<'_, Option<String>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_inflight.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                None
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn enrich_sweep_runs_with_bounded_concurrency() {
+        let db = mem_db();
+        for i in 0..12 {
+            add_node(&db, &format!("n{i}"), 10001 + i, "online");
+        }
+        let fetcher = Arc::new(SlowFetcher::default());
+        let enricher = Enricher::new(db.clone(), reqwest::Client::new(), fetcher.clone())
+            .with_lookup(Arc::new(FakeIntel::default()));
+        let engine = Arc::new(engine_with_enricher(db.clone(), enricher));
+        enrich_sweep(&engine).await;
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            12,
+            "缺情报节点都要补一次"
+        );
+        let max = fetcher.max_inflight.load(Ordering::SeqCst);
+        assert!(max > 1, "补查应当并发进行，实际最大在飞数 {max}");
+        assert!(
+            max <= ENRICH_CONCURRENCY,
+            "在飞数 {max} 超过并发上限 {ENRICH_CONCURRENCY}"
+        );
     }
 
     #[tokio::test]
@@ -3938,6 +4202,189 @@ mod probe_tests {
         assert_eq!(clash.request_count(), 1);
     }
 
+    /// 唯一域名/端口/id 的 relay（relay_domains 的 port 是 UNIQUE，同端口行会被跳过）。
+    fn relay_n(i: usize) -> crate::types::RelayDomain {
+        let mut rd = relay(&format!("rc{i}"), vec!["ALL"]);
+        rd.domain = format!("relay{i}.example.com");
+        rd.port = 44000 + i as i64;
+        rd
+    }
+
+    /// 建一个带自定义 ClashApi 桩的引擎（FIX-B2 测试要可观测的 current 实现）。
+    fn engine_with_clash(db: Arc<crate::db::Db>, clash: Arc<dyn ClashApi>) -> ProbeEngine {
+        let enricher = Arc::new(Enricher::new(
+            db.clone(),
+            reqwest::Client::new(),
+            FakeFetcher::returning(None),
+        ));
+        ProbeEngine::new(db, FakeCfg::new(true), reqwest::Client::new())
+            .with_clash(clash)
+            .with_op(FakeOp::new())
+            .with_enricher(enricher)
+            .with_retry_scale(0.0)
+    }
+
+    /// 桩：第一次 current 时把低延迟节点 n2 停用，模拟同步期间库被改。
+    /// 三个 relay 仍然都选中 n2 → 证明循环里没有重新 list_nodes（快照只读了一次）。
+    ///
+    /// 说明：Db 是具体类型，没有注入计数桩的入口，也不允许改 Cargo.toml 打开
+    /// rusqlite 的 hooks/trace 特性，因此用「循环内改库对后续 relay 不可见」等价证明
+    /// list_nodes 不再是每个 relay 一次（修复前是 O(R) 次）。
+    struct SnapshotProbeClash {
+        db: Arc<crate::db::Db>,
+        current_calls: AtomicUsize,
+        selects: Mutex<Vec<(String, String)>>,
+    }
+
+    impl ClashApi for SnapshotProbeClash {
+        fn delay(&self, _req: DelayRequest) -> BoxFuture<'_, DelayOutcome> {
+            Box::pin(async move { DelayOutcome::Ok(20) })
+        }
+
+        fn current(
+            &self,
+            _base: String,
+            _secret: Option<String>,
+            _tag: String,
+        ) -> BoxFuture<'_, Option<String>> {
+            Box::pin(async move {
+                if self.current_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.db
+                        .with_conn(|c| {
+                            c.execute("UPDATE nodes SET status='disabled' WHERE id='n2'", [])
+                        })
+                        .expect("disable n2");
+                }
+                None
+            })
+        }
+
+        fn select(
+            &self,
+            _base: String,
+            _secret: Option<String>,
+            tag: String,
+            name: String,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.selects.lock().unwrap().push((tag, name));
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_sync_uses_single_node_snapshot_for_all_relays() {
+        let db = mem_db();
+        add_node(&db, "n1", 10001, "online");
+        add_node(&db, "n2", 10002, "online");
+        db.upsert_relay_domains(&[relay_n(1), relay_n(2), relay_n(3)])
+            .unwrap();
+        let clash = Arc::new(SnapshotProbeClash {
+            db: db.clone(),
+            current_calls: AtomicUsize::new(0),
+            selects: Mutex::new(Vec::new()),
+        });
+        let engine = engine_with_clash(db.clone(), clash.clone());
+        let results = vec![
+            json!({ "id": "n1", "tag": "out-trojan-10001", "ping": 300, "status": "online" }),
+            json!({ "id": "n2", "tag": "out-trojan-10002", "ping": 40, "status": "online" }),
+        ];
+        let report = engine.sync_relay_exits_after_probe(&results).await;
+        assert_eq!(report.switched, 3);
+        assert_eq!(clash.current_calls.load(Ordering::SeqCst), 3);
+        let selects = clash.selects.lock().unwrap().clone();
+        assert_eq!(selects.len(), 3);
+        for (tag, name) in selects {
+            assert!(tag.starts_with("relay-auto-rc"), "意外的 relay tag: {tag}");
+            assert_eq!(name, "out-trojan-10002");
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_sync_drops_switch_at_entries_of_deleted_relays() {
+        let db = mem_db();
+        add_node(&db, "n1", 10001, "online");
+        db.upsert_relay_domains(&[relay("rc1", vec!["ALL"])])
+            .unwrap();
+        let clash = FakeClash::with(vec![]);
+        let engine = engine_with(db.clone(), FakeCfg::new(true), clash.clone(), FakeOp::new());
+        {
+            let mut map = engine.switch_at.lock().unwrap();
+            map.insert("rc1".to_string(), 1.0);
+            map.insert("gone-1".to_string(), 2.0);
+            map.insert("gone-2".to_string(), 3.0);
+            assert_eq!(map.len(), 3);
+        }
+        let results =
+            vec![json!({ "id": "n1", "tag": "out-trojan-10001", "ping": 30, "status": "online" })];
+        let report = engine.sync_relay_exits_after_probe(&results).await;
+        assert_eq!(report.switched, 1);
+        let map = engine.switch_at.lock().unwrap();
+        assert_eq!(map.len(), 1, "只应保留仍存在的 relay");
+        assert!(map.contains_key("rc1"));
+    }
+
+    /// 桩：记录 current 的最大在飞数。
+    struct ConcurrentClash {
+        inflight: AtomicUsize,
+        max_inflight: AtomicUsize,
+    }
+
+    impl ClashApi for ConcurrentClash {
+        fn delay(&self, _req: DelayRequest) -> BoxFuture<'_, DelayOutcome> {
+            Box::pin(async move { DelayOutcome::Ok(20) })
+        }
+
+        fn current(
+            &self,
+            _base: String,
+            _secret: Option<String>,
+            _tag: String,
+        ) -> BoxFuture<'_, Option<String>> {
+            Box::pin(async move {
+                let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_inflight.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                None
+            })
+        }
+
+        fn select(
+            &self,
+            _base: String,
+            _secret: Option<String>,
+            _tag: String,
+            _name: String,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_sync_fetches_current_concurrently() {
+        let db = mem_db();
+        add_node(&db, "n1", 10001, "online");
+        let relays: Vec<crate::types::RelayDomain> = (1..=6).map(relay_n).collect();
+        db.upsert_relay_domains(&relays).unwrap();
+        let clash = Arc::new(ConcurrentClash {
+            inflight: AtomicUsize::new(0),
+            max_inflight: AtomicUsize::new(0),
+        });
+        let engine = engine_with_clash(db.clone(), clash.clone());
+        let results =
+            vec![json!({ "id": "n1", "tag": "out-trojan-10001", "ping": 30, "status": "online" })];
+        let report = engine.sync_relay_exits_after_probe(&results).await;
+        assert_eq!(report.switched, 6);
+        let max = clash.max_inflight.load(Ordering::SeqCst);
+        assert!(max >= 2, "current 应当并发发起，实际最大在飞数 {max}");
+        assert!(
+            max <= RELAY_SYNC_CONCURRENCY,
+            "在飞数 {max} 超过并发上限 {RELAY_SYNC_CONCURRENCY}"
+        );
+    }
+
     #[tokio::test]
     async fn rotate_random_relay_persists_current_tag() {
         let db = mem_db();
@@ -3957,6 +4404,129 @@ mod probe_tests {
         );
         let settings = db.get_setting("system").unwrap();
         assert_eq!(settings["randomRotateCurrent"], json!("out-trojan-10001"));
+    }
+
+    /// 桩：所有 delay 都挂住 5s 再按超时返回，用来验证整轮探测预算。
+    struct HangingClash {
+        calls: AtomicUsize,
+    }
+
+    impl ClashApi for HangingClash {
+        fn delay(&self, _req: DelayRequest) -> BoxFuture<'_, DelayOutcome> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                DelayOutcome::Unreachable("hang".to_string())
+            })
+        }
+
+        fn current(
+            &self,
+            _base: String,
+            _secret: Option<String>,
+            _tag: String,
+        ) -> BoxFuture<'_, Option<String>> {
+            Box::pin(async move { None })
+        }
+
+        fn select(
+            &self,
+            _base: String,
+            _secret: Option<String>,
+            _tag: String,
+            _name: String,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_random_relay_probes_are_bounded_by_budget_and_concurrency() {
+        let db = mem_db();
+        for i in 0..6 {
+            add_node(&db, &format!("n{i}"), 10001 + i, "online");
+        }
+        db.upsert_relay_domains(&(1..=5).map(relay_n).collect::<Vec<_>>())
+            .unwrap();
+        let clash = Arc::new(HangingClash {
+            calls: AtomicUsize::new(0),
+        });
+        let engine = engine_with_clash(db.clone(), clash.clone());
+        let started = std::time::Instant::now();
+        // 并发 3、预算 0.2s 注入：不这样做测试要等 30s。
+        let chosen = engine.rotate_random_relay_with(3, 0.2).await;
+        let elapsed = started.elapsed();
+        assert!(chosen.is_none(), "候选全超时应当返回 None");
+        let calls = clash.calls.load(Ordering::SeqCst);
+        assert!(
+            calls <= 4,
+            "delay 调用次数 {calls} 应受并发上限(3)约束，超预算的候选不该再发请求"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "整轮耗时 {elapsed:?} 超出预算约束"
+        );
+    }
+
+    /// 桩：只有指定 tag 活着。
+    struct OneAliveClash {
+        alive_tag: String,
+        selects: Mutex<Vec<(String, String)>>,
+    }
+
+    impl ClashApi for OneAliveClash {
+        fn delay(&self, req: DelayRequest) -> BoxFuture<'_, DelayOutcome> {
+            let alive = req.tag == self.alive_tag;
+            Box::pin(async move {
+                if alive {
+                    DelayOutcome::Ok(15)
+                } else {
+                    DelayOutcome::Unreachable("down".to_string())
+                }
+            })
+        }
+
+        fn current(
+            &self,
+            _base: String,
+            _secret: Option<String>,
+            _tag: String,
+        ) -> BoxFuture<'_, Option<String>> {
+            Box::pin(async move { None })
+        }
+
+        fn select(
+            &self,
+            _base: String,
+            _secret: Option<String>,
+            tag: String,
+            name: String,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.selects.lock().unwrap().push((tag, name));
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_random_relay_picks_the_alive_candidate() {
+        let db = mem_db();
+        for i in 0..3 {
+            add_node(&db, &format!("n{i}"), 10001 + i, "online");
+        }
+        db.upsert_relay_domains(&[relay_n(1)]).unwrap();
+        let clash = Arc::new(OneAliveClash {
+            alive_tag: "out-trojan-10002".to_string(),
+            selects: Mutex::new(Vec::new()),
+        });
+        let engine = engine_with_clash(db.clone(), clash.clone());
+        let chosen = engine.rotate_random_relay().await;
+        assert_eq!(chosen.as_deref(), Some("out-trojan-10002"));
+        assert_eq!(
+            clash.selects.lock().unwrap().clone(),
+            vec![("relay-auto-rc1".to_string(), "out-trojan-10002".to_string())]
+        );
     }
 
     // ---------- 循环与接口 ----------
