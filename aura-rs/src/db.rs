@@ -732,15 +732,18 @@ impl Db {
         if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
             return Ok(RenameGroupResult::default());
         }
-        let conn = self.lock();
+        let mut conn = self.lock();
+        // 节点分组、relay_domains.groups、settings.system.relayDomains 三处必须一起成功，
+        // 否则中途失败会留下「节点已改名、中转域名仍是旧组」的撕裂状态。
+        let tx = conn.transaction()?;
         let now = now_ms();
-        let updated = conn.execute(
+        let updated = tx.execute(
             "UPDATE nodes SET \"group\"=?, updated_at=? WHERE \"group\"=?",
             params![new_name, now, old_name],
         )?;
         let mut relay_updated = 0usize;
         let rows: Vec<(String, Option<String>)> = {
-            let mut st = conn.prepare("SELECT id, groups FROM relay_domains")?;
+            let mut st = tx.prepare("SELECT id, groups FROM relay_domains")?;
             let it = st.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
             })?;
@@ -760,7 +763,7 @@ impl Db {
                         *g = new_name.to_string();
                     }
                 }
-                conn.execute(
+                tx.execute(
                     "UPDATE relay_domains SET groups=? WHERE id=?",
                     params![serde_json::to_string(&groups)?, id],
                 )?;
@@ -769,7 +772,7 @@ impl Db {
         }
         // settings.relayDomains 同步更新（否则前端下次全量保存会用旧分组名回退）。
         if relay_updated > 0 {
-            if let Some(raw) = setting_raw(&conn, "system")? {
+            if let Some(raw) = setting_raw(&tx, "system")? {
                 let mut s: Value =
                     serde_json::from_str(&raw).unwrap_or_else(|_| Value::Object(Map::new()));
                 let mut changed = false;
@@ -795,13 +798,14 @@ impl Db {
                     }
                 }
                 if changed {
-                    conn.execute(
+                    tx.execute(
                         "UPDATE settings SET value=? WHERE key='system'",
                         params![serde_json::to_string(&s)?],
                     )?;
                 }
             }
         }
+        tx.commit()?;
         Ok(RenameGroupResult {
             updated,
             relay_updated,
@@ -3685,6 +3689,43 @@ mod tests {
         }])
         .unwrap();
         assert_eq!(d.rename_group("ALL", "Z").unwrap().relay_updated, 0);
+    }
+
+    // 分组重命名必须原子：节点分组 / relay_domains.groups / settings 三处不能出现撕裂
+    #[test]
+    fn rename_group_rolls_back_when_a_later_step_fails() {
+        let d = db();
+        let mut n = node_json("a", 52001);
+        n["group"] = json!("旧组");
+        d.create_node_batch_json(&[n], false).unwrap();
+        d.upsert_relay_domains(&[RelayDomain {
+            id: "r1".into(),
+            domain: "x.example".into(),
+            port: 30001,
+            auth_user: None,
+            auth_pass: None,
+            groups: vec!["旧组".into()],
+        }])
+        .unwrap();
+        d.set_setting(
+            "system",
+            &json!({"relayDomains": [{"id": "r1", "groups": ["旧组"]}], "reservedPorts": []}),
+        )
+        .unwrap();
+        // 让 relay_domains 的更新必定失败，模拟重命名中途出错
+        d.execute(
+            "CREATE TRIGGER rename_boom BEFORE UPDATE ON relay_domains BEGIN SELECT RAISE(ABORT,'boom'); END",
+            &[],
+        )
+        .unwrap();
+        assert!(d.rename_group("旧组", "新组").is_err());
+        // 第一条 UPDATE nodes 已随事务回滚，节点分组必须仍是旧组
+        assert_eq!(d.list_nodes(None, Some("旧组"), None).unwrap().len(), 1);
+        assert_eq!(d.list_nodes(None, Some("新组"), None).unwrap().len(), 0);
+        assert_eq!(
+            d.get_setting("system").unwrap()["relayDomains"][0]["groups"][0],
+            json!("旧组")
+        );
     }
 
     // 节点入口切换：保持已有密码或新生成

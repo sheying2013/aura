@@ -1751,7 +1751,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 复用 ipinfo 的缓存串行锁，跨 await 持锁是有意的
     async fn exit_ip_returns_probed_ip() {
+        // 这个用例会真的走 ipinfo::lookup 并写进程级缓存，必须与 ipinfo 的用例串行。
+        let _serial = crate::ipinfo::test_serial_lock();
         let (router, db, _cfg) = build();
         let node: NodeCreate = serde_json::from_value(json!({
             "name": "n1", "protocol": "socks5", "port": 52120,

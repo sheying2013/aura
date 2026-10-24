@@ -793,6 +793,19 @@ pub async fn lookup_ippure_nodes(client: &Client, ip: &str, nodes: &[ProxyNode])
     json!({})
 }
 
+/// 测试用全局缓存串行锁。ipinfo 的 CACHE/PING0_CACHE/IPPURE_CACHE 是进程级静态量，
+/// 任何会触发 `lookup` 的用例（含 `app` 里打 `/api/nodes/:id/exit-ip` 的用例）都必须先拿到它，
+/// 否则并行执行时会互相清空/追加条目，让 `cache_len` 断言随机失败。
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)] // 测试用全局缓存串行锁，跨 await 持锁是有意的
+pub(crate) fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    match M.get_or_init(|| std::sync::Mutex::new(())).lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)] // 测试用全局缓存串行锁，跨 await 持锁是有意的
 mod tests {
@@ -801,12 +814,9 @@ mod tests {
     use tokio::net::TcpListener;
 
     /// 全局缓存是所有用例共享的静态量，凡碰缓存的用例串行执行，避免互相清空。
+    /// 与 `crate::ipinfo::test_serial_lock` 是同一把锁（其它模块的用例也共用它）。
     fn test_lock() -> MutexGuard<'static, ()> {
-        static M: OnceLock<Mutex<()>> = OnceLock::new();
-        match M.get_or_init(|| Mutex::new(())).lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        super::test_serial_lock()
     }
 
     // ---------- 纯函数：国旗 / 中文名 / 评分 / 类型 ----------
