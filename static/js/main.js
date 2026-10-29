@@ -1520,7 +1520,7 @@ function _nodeActionsHtml(node) {
     const btnStyle = 'min-width:24px; padding:2px 6px;';
     return `
         <div style="display:flex; gap:3px; justify-content:center; align-items:center; flex-wrap: wrap;">
-            <button class="btn-action" style="${btnStyle}" onclick="pingSingleNode(${inlineJsArg(node.id)})" data-probe-id="${esc(node.id)}" title="探活：立即测试该节点延迟" aria-label="探活" ${pinging ? 'disabled' : ''}>${pinging ? '…' : '⏱ 探活'}</button>
+            <button class="btn-action probe-action ${pinging ? 'is-probing' : ''}" style="${btnStyle}" onclick="pingSingleNode(${inlineJsArg(node.id)})" data-probe-id="${esc(node.id)}" title="${pinging ? '正在测活，请稍候' : '探活：立即测试该节点延迟'}" aria-label="${pinging ? '测活中' : '探活'}" aria-busy="${pinging ? 'true' : 'false'}" ${pinging ? 'disabled' : ''}>${pinging ? '<span class="probe-spinner" aria-hidden="true"></span><span>测活中</span>' : '⏱ 探活'}</button>
             <button class="btn-action" style="${btnStyle}" onclick="openEditNodeModal(${inlineJsArg(node.id)})" title="编辑节点参数" aria-label="编辑">✎ 编辑</button>
             <button class="btn-action" style="${btnStyle}" onclick="exportSingleNode(${inlineJsArg(node.id)})" title="导出该节点链接" aria-label="导出">⤓ 导出</button>
             <button class="btn-action ${!isDisabled ? 'danger' : ''}" style="${btnStyle}" onclick="toggleNodeEnable(${inlineJsArg(node.id)})" title="${!isDisabled ? '停用该节点（不再分发到配置）' : '启用该节点'}" aria-label="${!isDisabled ? '停用' : '启用'}">${!isDisabled ? '⏸ 停用' : '▶ 启用'}</button>
@@ -1706,13 +1706,26 @@ function syncProbeButtons() {
     document.querySelectorAll('[data-probe-id]').forEach(btn => {
         const busy = bulkProbeRunning || pendingProbeIds.has(btn.dataset.probeId);
         btn.disabled = busy;
-        // 行内操作列已改为图标按钮（title 提供文案），这里同步图标态而不是写回英文长文案
-        btn.textContent = busy ? '…' : '⏱';
-        btn.title = busy ? '正在探活…' : '探活：立即测试该节点延迟';
+        btn.classList.toggle('is-probing', busy);
+        btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+        btn.setAttribute('aria-label', busy ? '测活中' : '探活');
+        const markup = busy
+            ? '<span class="probe-spinner" aria-hidden="true"></span><span>测活中</span>'
+            : '⏱ 探活';
+        if (btn.innerHTML !== markup) btn.innerHTML = markup;
+        btn.title = busy ? '正在测活，请稍候' : '探活：立即测试该节点延迟';
     });
     document.querySelectorAll('[data-probe-all]').forEach(btn => {
         btn.disabled = bulkProbeRunning || pendingProbeIds.size > 0;
-        btn.textContent = bulkProbeRunning ? '批量探活中…' : L('Probe All');
+        btn.classList.toggle('is-probing', bulkProbeRunning);
+        btn.setAttribute('aria-busy', bulkProbeRunning ? 'true' : 'false');
+        if (bulkProbeRunning) {
+            const markup = '<span class="probe-spinner" aria-hidden="true"></span><span>批量探活中…</span>';
+            if (btn.innerHTML !== markup) btn.innerHTML = markup;
+        } else {
+            const label = L('Probe All');
+            if (btn.textContent !== label) btn.textContent = label;
+        }
     });
 }
 
@@ -1732,6 +1745,20 @@ function reportProbeResults(results) {
         }
     });
     addLog('INFO', `探活完成，返回 ${list.length} 个结果（在线 ${list.filter(r => r && r.status === 'online').length} 个）`);
+}
+
+function showSingleProbeResult(id, results) {
+    const list = Array.isArray(results) ? results : (results && Array.isArray(results.items) ? results.items : null);
+    const result = list && list.find(item => item && item.id === id);
+    if (!result || result.error) return;
+    if (result.status === 'online') {
+        const ping = Number(result.ping);
+        const latency = Number.isFinite(ping) && ping > 0 ? ' · ' + ping + ' ms' : '';
+        showToast('测活完成：在线' + latency, 'success', 2600);
+        return;
+    }
+    const statusText = result.status === 'disabled' ? '已停用' : '离线';
+    showToast('测活完成：' + statusText, 'warn', 2600);
 }
 
 async function triggerPingAll() {
@@ -1765,10 +1792,13 @@ async function pingSingleNode(id) {
             method: 'POST',
             body: JSON.stringify({ ids: [id], all: false, includeDisabled: true, manual: true })
         });
-        reportProbeResults(await r.json());
+        const results = await r.json();
+        reportProbeResults(results);
+        showSingleProbeResult(id, results);
         await loadNodes();
     } catch (e) {
         addLog('ERROR', '节点探活失败: ' + e.message);
+        showToast('节点探活失败：' + e.message, 'warn');
     } finally {
         pendingProbeIds.delete(id);
         syncProbeButtons();

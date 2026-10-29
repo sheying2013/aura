@@ -599,6 +599,7 @@
         }
         /* 节点表行高压缩：一屏看更多节点 */
         .data-table tbody tr td { line-height: 1.3; }
+        #nodes .data-table td[data-cell="name"] strong { font-size: 12px; font-weight: 500; }
         .data-table tbody tr td:first-child { padding-left: 10px; }
         .data-table tbody tr td:last-child { padding-right: 10px; }
         .data-table .btn-action {
@@ -607,6 +608,23 @@
             letter-spacing: 0;
             line-height: 1.4;
             white-space: nowrap;
+        }
+        .data-table .btn-action.probe-action { display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
+        .data-table .btn-action.probe-action.is-probing,
+        #nodes [data-probe-all].is-probing { color: var(--rock); opacity: 1; }
+        .probe-spinner {
+            display: inline-block;
+            width: 11px;
+            height: 11px;
+            flex: 0 0 11px;
+            border: 1.5px solid currentColor;
+            border-right-color: transparent;
+            border-radius: 50%;
+            animation: auraProbeSpin .8s linear infinite;
+        }
+        @keyframes auraProbeSpin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) {
+            .probe-spinner { animation: none; opacity: .65; }
         }
         .data-table .port-input {
             padding: 1px 4px;

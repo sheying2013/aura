@@ -241,15 +241,37 @@ def test_single_probe_survives_replacement_deduplicates_and_unlocks(ui):
     assert page.evaluate("window.__probeRequests[0].manual") is True
     page.evaluate("loadNodes()")
     button = page.locator('[data-probe-id="n1"]')
+    name = page.locator('#nodes-tbody tr[data-id="n1"] td[data-cell="name"] strong')
+    assert name.evaluate("el => getComputedStyle(el).fontSize") == "12px"
     sync_api.expect(button).to_be_disabled()
+    assert button.get_attribute("aria-busy") == "true"
+    assert "测活中" in button.inner_text()
+    assert button.locator(".probe-spinner").count() == 1
+    assert "is-probing" in (button.get_attribute("class") or "")
+    assert button.locator(".probe-spinner").evaluate("el => getComputedStyle(el).animationName") == "auraProbeSpin"
     sync_api.expect(page.locator('[data-probe-all]')).to_be_disabled()
     page.evaluate("""() => {
         window.__resolveProbe(new Response(JSON.stringify([]), {status:200,
             headers:{'Content-Type':'application/json'}})); return window.__probeJob;
     }""")
     sync_api.expect(button).to_be_enabled()
+    assert button.get_attribute("aria-busy") == "false"
+    assert "测活中" not in button.inner_text()
     sync_api.expect(page.locator('[data-probe-all]')).to_be_enabled()
     assert "后台测活繁忙" in page.locator("#aura-toast-box").inner_text()
+
+
+def test_single_probe_shows_online_completion_toast(ui):
+    page, _ = ui
+    defer_probes(page)
+    page.evaluate("() => { window.__probeJob=pingSingleNode('n1'); }")
+    page.evaluate("""() => {
+        window.__resolveProbe(new Response(JSON.stringify([
+            {id:'n1',tag:'out-socks5-52001',ping:126,status:'online',error:null}
+        ]), {status:200, headers:{'Content-Type':'application/json'}}));
+        return window.__probeJob;
+    }""")
+    assert "测活完成：在线 · 126 ms" in page.locator("#aura-toast-box").inner_text()
 
 
 def test_bulk_probe_locks_current_rows_and_unlocks_on_error(ui):
@@ -261,12 +283,18 @@ def test_bulk_probe_locks_current_rows_and_unlocks_on_error(ui):
     }""")
     assert page.evaluate("window.__probeRequests.length") == 1
     page.evaluate("loadNodes()")
+    bulk_button = page.locator('[data-probe-all]')
     assert page.locator("[data-probe-id]:enabled").count() == 0
+    sync_api.expect(bulk_button).to_be_disabled()
+    assert bulk_button.get_attribute("aria-busy") == "true"
+    assert "批量探活中" in bulk_button.inner_text()
+    assert bulk_button.locator(".probe-spinner").count() == 1
     page.evaluate("""() => {
         window.__resolveProbe(new Response(JSON.stringify({detail:'busy'}), {status:409,
             headers:{'Content-Type':'application/json'}})); return window.__probeJob;
     }""")
     assert page.locator("[data-probe-id]:disabled").count() == 0
+    assert bulk_button.get_attribute("aria-busy") == "false"
     assert "busy" in page.locator("#system-logs-container").inner_text()
 
 
