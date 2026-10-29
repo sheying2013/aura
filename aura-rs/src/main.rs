@@ -34,6 +34,21 @@ fn periodic(period: Duration) -> tokio::time::Interval {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("panel-config") {
+        let result = match args.next() {
+            Some(port) if args.next().is_none() => print_panel_config(Some(&port)),
+            None => print_panel_config(None),
+            Some(_) => Err(anyhow::anyhow!("用法: aura panel-config [PORT]")),
+        };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("读取面板配置失败: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -47,6 +62,34 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn print_panel_config(port_override: Option<&str>) -> anyhow::Result<()> {
+    let data_dir = std::env::var("AURA_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let data_path = std::path::PathBuf::from(data_dir);
+    let config_path = data_path.join("panel.conf");
+    let mut panel = PanelConfig::load_from(&config_path);
+    if !panel.panel_path.starts_with('/') || panel.panel_path.chars().any(char::is_whitespace) {
+        anyhow::bail!("面板登录路径不合法");
+    }
+    if let Some(raw) = port_override {
+        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            anyhow::bail!("面板端口不合法，应为 1-65535 的整数");
+        }
+        panel.port = raw
+            .parse()
+            .map_err(|_| anyhow::anyhow!("面板端口不合法，应为 1-65535 的整数"))?;
+        if !(1..=65535).contains(&panel.port) {
+            anyhow::bail!("面板端口不合法，应为 1-65535 的整数");
+        }
+        panel.save_to(&config_path)?;
+    }
+    let port = panel.port;
+    if !(1..=65535).contains(&port) {
+        anyhow::bail!("面板端口不合法，应为 1-65535 的整数");
+    }
+    println!("{port}\n{}", panel.panel_path);
+    Ok(())
 }
 
 async fn run() -> anyhow::Result<()> {

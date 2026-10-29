@@ -377,6 +377,12 @@ impl Auth {
         let mut state = self.state.lock().unwrap();
         state.tokens.remove(&token_hash);
     }
+
+    /// 签发有效内存令牌（测试与内部通道共用）。
+    pub fn issue_token(&self) -> String {
+        let mut state = self.state.lock().unwrap();
+        Self::issue_token_locked(&mut state)
+    }
 }
 #[cfg(test)]
 mod tests {

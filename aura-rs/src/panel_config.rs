@@ -41,9 +41,29 @@ impl PanelConfig {
     /// 从指定路径读取；文件缺失/损坏时回落默认值（与 Python 版行为一致）。
     pub fn load_from(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str::<Self>(&s).unwrap_or_default(),
+            Ok(s) => Self::parse(&s).unwrap_or_default(),
             Err(_) => Self::default(),
         }
+    }
+
+    /// 解析JSON配置，并按默认配置补齐缺失字段，与Python panel_config._load保持一致。
+    pub fn parse(raw: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        if !value.is_object() {
+            return None;
+        }
+        let mut out = Self::default();
+        let obj = value.as_object()?;
+        if let Some(v) = obj.get("port").filter(|v| !v.is_null()) {
+            out.port = v.as_i64()?;
+        }
+        if let Some(v) = obj.get("panel_path").filter(|v| !v.is_null()) {
+            out.panel_path = v.as_str()?.to_string();
+        }
+        if let Some(v) = obj.get("username").filter(|v| !v.is_null()) {
+            out.username = v.as_str()?.to_string();
+        }
+        Some(out)
     }
 
     /// 原子写入：先写 .tmp 再 rename，避免半截文件。
@@ -83,6 +103,22 @@ mod tests {
         assert_eq!(back.port, 19123);
         assert!(!dir.join("panel.conf.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_defaults_null_missing_fields_and_ignores_unknown_fields() {
+        let c =
+            PanelConfig::parse(r#"{"port":19123,"panel_path":null,"unknown":"ignored"}"#).unwrap();
+        assert_eq!(c.port, 19123);
+        assert_eq!(c.panel_path, DEFAULT_PANEL_PATH);
+        assert_eq!(c.username, DEFAULT_USERNAME);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_types_for_known_fields() {
+        assert!(PanelConfig::parse(r#"{"port":"19123"}"#).is_none());
+        assert!(PanelConfig::parse(r#"{"panel_path":123}"#).is_none());
+        assert!(PanelConfig::parse(r#"{"username":false}"#).is_none());
     }
 
     #[test]

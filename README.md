@@ -26,9 +26,11 @@ Aura 是一个基于 **sing-box 内核** 的节点中转管理面板。它把外
 
 | 方式 | 适合场景 |
 |---|---|
-| [Docker 安装](#-docker-安装) | 有 Docker 的服务器，最省事 |
-| [一键脚本安装](#-一键脚本安装) | Linux / macOS，自动装内核 + 依赖 |
-| [手动安装](#-手动安装) | 想自己掌控每一步 |
+| [Docker 安装](#-docker-安装) | **推荐生产使用**，运行 Rust 后端，支持 amd64 / arm64 |
+| [一键脚本安装](#-一键脚本安装) | 旧版 Linux / macOS 裸机 Python 安装路径 |
+| [手动安装](#-手动安装) | 旧版 Python 裸机运行路径 |
+
+> 生产推荐 Docker/Rust。`install.sh` 与手动安装章节仍描述旧 Python 裸机方式，不属于 Docker 生产运行链。
 
 安装后访问：`http://<服务器IP>:19001/admin`
 
@@ -36,10 +38,10 @@ Aura 是一个基于 **sing-box 内核** 的节点中转管理面板。它把外
 
 | 项目 | 默认值 | 修改方式 |
 |---|---|---|
-| 面板端口 | `19001` | 一键脚本安装时交互设置，或终端输入 `aura` 配置 |
-| 网页登录路径 | `/admin` | 一键脚本安装时交互设置，或终端输入 `aura` 配置 |
-| 登录账号 | `admin` | 一键脚本安装时交互设置，或终端输入 `aura` 配置 |
-| 登录密码 | `admin` | **首次登录强制修改**，或终端输入 `aura` 配置 |
+| 面板端口 | `19001` | Legacy 裸机安装可用 `aura` 配置；Docker 更新可传 `AURA_PORT` |
+| 网页登录路径 | `/admin` | Legacy 裸机安装的 `aura` 配置命令 |
+| 登录账号 | `admin` | Legacy 裸机安装的 `aura` 配置命令 |
+| 登录密码 | `admin` | **首次登录强制修改**；Legacy 裸机安装可用 `aura` 配置 |
 
 > **一键脚本安装时全部交互式引导设置**（端口/路径/账号/密码），并配置开机自启。安装后终端输入 `aura` 可随时调出交互式配置界面（改端口/路径/账号/密码/更新面板/服务控制）。
 
@@ -47,7 +49,7 @@ Aura 是一个基于 **sing-box 内核** 的节点中转管理面板。它把外
 
 ## 🐳 Docker 安装
 
-需要 Docker 19.03+（`docker compose` 命令，或 `docker-compose`）。
+需要 Docker 19.03+（`docker compose` 命令，或 `docker-compose`）。Dockerfile 从 `aura-rs/` 编译 Rust 后端，镜像运行 `/app/backend/aura`；`backend/*.py` 不参与容器生产运行。
 
 ### 1. 获取代码
 
@@ -102,7 +104,7 @@ curl -fsSL https://raw.githubusercontent.com/sheying2013/aura/main/deploy.sh | b
 
 ## 🖥️ 一键脚本安装
 
-适合没有 Docker 的 Linux 服务器（自动装 sing-box 内核 + Python 依赖 + **交互式设置面板端口/路径/账号/密码** + systemd 开机自启 + 安装 `aura` 配置命令）。
+**Legacy Python 裸机安装方式**：适合暂时继续使用旧版 Python 部署的 Linux/macOS 环境（安装 sing-box 内核、Python 依赖、systemd 服务及 `aura` 配置命令）。生产主路径请使用上方 Docker/Rust 安装。
 
 > **架构支持**：x86_64/amd64 与 arm64/aarch64（Apple Silicon、Oracle ARM、树莓派 64 位等）全支持。macOS 也支持（Intel 和 Apple Silicon），自动下载对应架构的 sing-box，并解除 macOS Gatekeeper 隔离。
 
@@ -156,7 +158,9 @@ AURA_PORT=8080 AURA_USERNAME=mine AURA_PASSWORD='x9Kd@w' AURA_SKIP_INPUT=1 bash 
 
 ---
 
-## 🛠️ 手动安装
+## 🛠️ 手动安装（Legacy Python）
+
+> 本节为旧版裸机 Python 运行流程；当前 Docker 生产镜像运行 Rust 后端。
 
 ### 前置要求
 
@@ -292,32 +296,26 @@ sudo systemctl enable --now aura.service
 ```text
 index.html                 页面编辑源
 static/js/main.js          前端逻辑编辑源（含订阅界面）
-backend/static/            后端托管副本
-backend/app.py             API 与静态文件入口
-backend/auth.py            登录认证
-backend/db.py              SQLite 存储
-backend/config_manager.py  sing-box 配置与进程管理
-backend/scheduler.py       探活、自动复活与每 3 小时订阅刷新
-backend/subs_proxy.py      服务端订阅解析与导入
-backend/subscription_fetch.py 订阅下载与目标地址检查
-backend/stats.py           流量采集
-backend/start.sh           统一启动入口
-install.sh                 Linux/macOS 安装入口
-Dockerfile                 镜像打包入口
-tests/                     离线回归测试
+backend/static/            Docker镜像内的静态资源副本
+aura-rs/src/               Rust API、数据层与进程管理（Docker生产后端）
+backend/*.py               Legacy Python参考/裸机运行实现
+backend/start.sh           Legacy Python启动入口
+install.sh                 Legacy Python裸机安装入口
+Dockerfile                 构建并运行Rust后端的多架构镜像
+tests/                     Rust/Python/浏览器离线回归测试
 ```
 
-前端以仓库根的 `index.html` 与 `static/js/` 为权威源，修改这两处即可。`install.sh` 和 `backend/start.sh` 会刷新 `backend/static/` 副本；Dockerfile 直接复制根目录前端资源到镜像里的 `backend/static/`，容器无需保留根目录前端源文件。
+前端以仓库根的 `index.html` 与 `static/js/` 为权威源，修改后同步 `backend/static/` 副本。Dockerfile 将根目录前端资源复制到镜像，并运行 `aura-rs` 编译生成的 Rust 后端。`install.sh` 与 `backend/start.sh` 仍服务于旧版 Python 裸机流程。
 
-在仓库根执行离线检查（Python 依赖需已安装）：
+本地离线检查：
 
 ```bash
-bash -n install.sh
-bash -n backend/start.sh
-python3 -m unittest discover -s tests -v
+cd aura-rs && cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --lib
+cd ..
+python3 -m pytest -q
 ```
 
-本地开发启动使用 `bash backend/start.sh`；直接运行 uvicorn 时，需要先按手动安装步骤同步前端资源。
+当前本地开发/生产主后端为 Rust；`bash backend/start.sh` 与直接运行 uvicorn 仅用于旧版 Python 路径。
 
 ---
 

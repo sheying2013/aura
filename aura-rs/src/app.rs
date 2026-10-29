@@ -27,10 +27,7 @@ use axum::{
 };
 use futures_util::stream;
 use serde_json::{json, Map, Value};
-use tower_http::{
-    cors::{Any, CorsLayer},
-    services::ServeDir,
-};
+use tower_http::services::ServeDir;
 
 use crate::auth::Auth;
 use crate::db::Db;
@@ -207,7 +204,8 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 取 token：优先 Authorization: Bearer，其次 ?token=。
+/// 取 token：优先 Authorization: Bearer；
+/// 仅针对 SSE 流端点（/api/stats/stream）兼容 ?token=（浏览器 EventSource 无法自定义 Request Headers）。
 fn extract_token(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
     if let Some(raw) = headers
         .get(header::AUTHORIZATION)
@@ -223,6 +221,9 @@ fn extract_token(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
                 return Some(token.to_string());
             }
         }
+    }
+    if uri.path() != "/api/stats/stream" {
+        return None;
     }
     let query = uri.query()?;
     for pair in query.split('&') {
@@ -1068,6 +1069,24 @@ async fn relay_current_exits(st: &AppState) -> Value {
     Value::Object(out)
 }
 
+const ALLOWED_SETTING_KEYS: &[&str] = &[
+    "inboundPort",
+    "clashPort",
+    "probeInterval",
+    "logLevel",
+    "listenIp",
+    "exportDomain",
+    "testUrl",
+    "reservedPorts",
+    "stickyEnabled",
+    "stickyTimeout",
+    "randomRotateEnabled",
+    "randomRotateInterval",
+    "randomRotateCurrent",
+    "autoRefresh",
+    "relayDomains",
+];
+
 async fn get_settings(State(st): State<AppState>) -> Json<Value> {
     let mut system = st
         .db
@@ -1075,6 +1094,14 @@ async fn get_settings(State(st): State<AppState>) -> Json<Value> {
         .unwrap_or_else(|_| json!({}));
     if !system.is_object() {
         system = json!({});
+    }
+    if let Some(obj) = system.as_object_mut() {
+        if !obj.contains_key("clashPort") {
+            if let Some(legacy) = obj.get("clash_port").cloned() {
+                obj.insert("clashPort".to_string(), legacy);
+            }
+        }
+        obj.retain(|key, _| ALLOWED_SETTING_KEYS.contains(&key.as_str()));
     }
     let exits = relay_current_exits(&st).await;
     set_field(&mut system, "relayExits", exits);
@@ -1086,20 +1113,57 @@ async fn put_settings(State(st): State<AppState>, Json(raw): Json<Value>) -> Api
         return Err(ApiError::unprocessable("设置必须是对象"));
     }
     let mut body = raw;
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("relayExits");
+    let obj = body
+        .as_object_mut()
+        .ok_or_else(|| ApiError::unprocessable("设置必须是对象"))?;
+    obj.remove("relayExits");
+
+    // 白名单预检：拒绝未知配置项，防止脏数据注入
+    for k in obj.keys() {
+        if !ALLOWED_SETTING_KEYS.contains(&k.as_str()) {
+            return Err(ApiError::unprocessable(format!("未知配置项: {}", k)));
+        }
     }
-    if let Some(v) = body.get("exportDomain").cloned() {
+
+    if let Some(v) = obj.get("exportDomain").cloned() {
         let normalized = normalize_export_domain(&v)?;
-        set_field(&mut body, "exportDomain", Value::String(normalized));
+        obj.insert("exportDomain".to_string(), Value::String(normalized));
     }
-    if let Some(Value::String(u)) = body.get("testUrl").cloned() {
+    if let Some(v) = obj.get("testUrl") {
+        if !v.is_null() && !v.is_string() {
+            return Err(ApiError::unprocessable("testUrl 必须是字符串"));
+        }
+    }
+    if let Some(Value::String(u)) = obj.get("testUrl").cloned() {
         if let Some(rest) = u.strip_prefix("http://") {
-            set_field(
-                &mut body,
-                "testUrl",
+            obj.insert(
+                "testUrl".to_string(),
                 Value::String(format!("https://{}", rest)),
             );
+        }
+    }
+    for key in ["logLevel", "listenIp", "stickyTimeout"] {
+        if let Some(v) = obj.get(key) {
+            if !v.is_null() && !v.is_string() {
+                return Err(ApiError::unprocessable(format!("{} 必须是字符串", key)));
+            }
+        }
+    }
+    for key in ["stickyEnabled", "randomRotateEnabled", "autoRefresh"] {
+        if let Some(v) = obj.get(key) {
+            if !v.is_null() && !v.is_boolean() {
+                return Err(ApiError::unprocessable(format!("{} 必须是布尔值", key)));
+            }
+        }
+    }
+    if let Some(v) = obj.get("randomRotateCurrent") {
+        if !v.is_null() && !v.is_string() {
+            return Err(ApiError::unprocessable("randomRotateCurrent 必须是字符串"));
+        }
+    }
+    if let Some(v) = obj.get("reservedPorts") {
+        if !v.is_null() && !v.is_array() {
+            return Err(ApiError::unprocessable("reservedPorts 必须是列表"));
         }
     }
     let previous = st
@@ -1330,10 +1394,7 @@ pub fn build_router(st: AppState) -> Router {
     let public = Router::new().route("/api/auth/login", post(auth_login));
     let api = public.merge(protected);
     let static_service = ServeDir::new(static_dir).append_index_html_on_directories(true);
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // WebUI由本Router同源提供；省略CORS层，避免管理API向任意Origin开放。
     Router::new()
         .route("/", get(root_redirect))
         .route(&panel_path, get(root_redirect))
@@ -1342,7 +1403,6 @@ pub fn build_router(st: AppState) -> Router {
             &format!("{}/", panel_path.trim_end_matches('/')),
             static_service,
         )
-        .layer(cors)
         .with_state(st)
 }
 
@@ -1497,7 +1557,7 @@ mod tests {
         }
     }
 
-    fn build() -> (Router, Arc<Db>, Arc<FakeConfig>) {
+    fn build_with_auth(auth_disabled: bool) -> (Router, Arc<Db>, Arc<FakeConfig>, Arc<Auth>) {
         let db = Arc::new(Db::open_in_memory().expect("mem db"));
         db.init_db().expect("init_db");
         let auth = Arc::new(Auth::new(Arc::new(FakeAuthStore::new("admin"))));
@@ -1505,7 +1565,7 @@ mod tests {
         let cfg = Arc::new(FakeConfig::default());
         let state = AppState::new(
             db.clone(),
-            auth,
+            auth.clone(),
             stats,
             cfg.clone(),
             Arc::new(FakeProber),
@@ -1513,8 +1573,13 @@ mod tests {
         )
         .with_panel_path("/admin")
         .with_static_dir("static")
-        .with_auth_disabled(true);
-        (build_router(state), db, cfg)
+        .with_auth_disabled(auth_disabled);
+        (build_router(state), db, cfg, auth)
+    }
+
+    fn build() -> (Router, Arc<Db>, Arc<FakeConfig>) {
+        let (router, db, cfg, _) = build_with_auth(true);
+        (router, db, cfg)
     }
 
     async fn call(
@@ -1900,5 +1965,187 @@ mod tests {
         let applied = cfg.applied.lock().unwrap().clone();
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].as_ref().unwrap()["log"]["level"], json!("debug"));
+    }
+
+    #[tokio::test]
+    async fn token_query_param_allowed_only_for_sse() {
+        let (router, _db, _cfg, auth) = build_with_auth(false);
+        let token = auth.issue_token();
+
+        // 1. 常规接口（如 GET /api/nodes）通过 ?token= 访问应被拒绝（401）
+        let req_query = Request::builder()
+            .method("GET")
+            .uri(format!("/api/nodes?token={}", token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req_query).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. 常规接口通过 Authorization: Bearer <token> 正常放行（200）
+        let req_bearer = Request::builder()
+            .method("GET")
+            .uri("/api/nodes")
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req_bearer).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 3. SSE 端点（GET /api/stats/stream）通过 ?token= 允许放行
+        let req_sse = Request::builder()
+            .method("GET")
+            .uri(format!("/api/stats/stream?token={}", token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req_sse).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cross_origin_requests_do_not_receive_cors_permission() {
+        let (router, _db, _cfg) = build();
+        for method in ["OPTIONS", "GET"] {
+            let req = Request::builder()
+                .method(method)
+                .uri("/api/nodes")
+                .header("Origin", "http://evil.example")
+                .header("Access-Control-Request-Method", "GET")
+                .header(
+                    "Access-Control-Request-Headers",
+                    "authorization,content-type",
+                )
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert!(!resp.headers().contains_key("access-control-allow-origin"));
+            assert!(!resp
+                .headers()
+                .contains_key("access-control-allow-credentials"));
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_put_rejects_unknown_and_nested_keys() {
+        let (router, _db, _cfg) = build();
+
+        // 1. 拒绝未知标量键
+        let (status, body) = call(
+            router.clone(),
+            "PUT",
+            "/api/settings",
+            Some(json!({ "unknownKey": "malicious" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["detail"].as_str().unwrap().contains("未知配置项"));
+
+        // 2. 拒绝未知嵌套键
+        let (status, body) = call(
+            router.clone(),
+            "PUT",
+            "/api/settings",
+            Some(json!({ "nested": { "deep": 123 } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["detail"].as_str().unwrap().contains("未知配置项"));
+
+        // 3. 拒绝类型不合法的字段（如 logLevel 传入数字）
+        let (status, body) = call(
+            router.clone(),
+            "PUT",
+            "/api/settings",
+            Some(json!({ "logLevel": 12345 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("logLevel 必须是字符串"));
+
+        // 4. 拒绝类型不合法的布尔字段
+        let (status, body) = call(
+            router.clone(),
+            "PUT",
+            "/api/settings",
+            Some(json!({ "stickyEnabled": "not-bool" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("stickyEnabled 必须是布尔值"));
+
+        // 5. 拒绝 reservedPorts 非数组
+        let (status, body) = call(
+            router.clone(),
+            "PUT",
+            "/api/settings",
+            Some(json!({ "reservedPorts": 8080 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("reservedPorts 必须是列表"));
+    }
+
+    #[tokio::test]
+    async fn settings_put_accepts_whitelisted_keys() {
+        let (router, db, _cfg) = build();
+        let payload = json!({
+            "inboundPort": 2080,
+            "clashPort": 9095,
+            "probeInterval": 30,
+            "logLevel": "info",
+            "listenIp": "0.0.0.0",
+            "stickyEnabled": true,
+            "stickyTimeout": "5m",
+            "randomRotateEnabled": false,
+            "randomRotateInterval": 30,
+            "autoRefresh": true,
+            "reservedPorts": [2080, 9095],
+            "relayExits": { "fake": "should_be_stripped" }
+        });
+        let (status, body) = call(router, "PUT", "/api/settings", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["configApplied"], json!(true));
+        let saved = db.get_setting_or("system", json!({})).unwrap();
+        assert_eq!(saved["logLevel"], json!("info"));
+        assert_eq!(saved["stickyEnabled"], json!(true));
+        assert!(saved.get("relayExits").is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_get_normalizes_legacy_port_and_roundtrips_cleanly() {
+        let (router, db, _cfg) = build();
+        db.set_setting(
+            "system",
+            &json!({
+                "clash_port": 9096,
+                "probeInterval": 30,
+                "legacyOption": "preserve-in-storage-but-hide"
+            }),
+        )
+        .unwrap();
+
+        let (status, settings) = call(router.clone(), "GET", "/api/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settings["clashPort"], json!(9096));
+        assert!(settings.get("clash_port").is_none());
+        assert!(settings.get("legacyOption").is_none());
+        assert_eq!(settings["probeInterval"], json!(30));
+
+        let (status, body) = call(router, "PUT", "/api/settings", Some(settings)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let stored = db.get_setting_or("system", json!({})).unwrap();
+        assert_eq!(
+            stored["legacyOption"],
+            json!("preserve-in-storage-but-hide")
+        );
+        assert_eq!(stored["clash_port"], json!(9096));
     }
 }

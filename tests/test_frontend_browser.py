@@ -184,6 +184,25 @@ def test_api_non_2xx_has_detail_and_no_false_delete_success(ui, status):
     assert not requests(state, "/api/config/apply")
 
 
+def test_port_update_failure_refocuses_without_scroll(ui):
+    page, state = ui
+    page.locator('.nav-item[data-target="nodes"]').click()
+    state["responses"]["/api/nodes/n1/port"] = (409, {"detail": "port conflict"})
+    page.evaluate("""() => {
+        window.__portFocusOptions = [];
+        const originalFocus = HTMLElement.prototype.focus;
+        HTMLElement.prototype.focus = function(options) {
+            if (this.matches('.port-input')) window.__portFocusOptions.push(options || null);
+            return originalFocus.call(this, options);
+        };
+        return window.updateNodePort('n1', '59999');
+    }""")
+    assert page.evaluate("window.__portFocusOptions.some(value => value && value.preventScroll === true)")
+    assert page.evaluate("document.activeElement.matches('.port-input')")
+    assert page.locator('#nodes-tbody tr[data-id="n1"] .port-input').input_value() == "52001"
+    assert "port conflict" in page.locator("#system-logs-container").inner_text()
+
+
 def test_config_apply_checks_body_ok_and_401_logs_out(ui):
     page, state = ui
     state["responses"]["/api/config/apply"] = (200, {"ok": False, "message": "reload rejected"})

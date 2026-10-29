@@ -1190,6 +1190,7 @@ function renderNodeMatrix() {
         });
         return;
     }
+    const prevScrollTop = grid.scrollTop;
     grid.innerHTML = '';
     nodeState.forEach(n => {
         const dot = document.createElement('div');
@@ -1197,6 +1198,7 @@ function renderNodeMatrix() {
         dot.title = `${n.name} (${n.port}) - ${n.status || 'offline'} [${n.ping || 0}ms]`;
         grid.appendChild(dot);
     });
+    if (prevScrollTop) grid.scrollTop = prevScrollTop;
 }
 
 /** 节点三态归一：disabled 独立一态，online 仅 status==='online'，其余都算 offline */
@@ -1421,6 +1423,13 @@ function renderNodesTable() {
     const tbody = document.getElementById('nodes-tbody');
     if (!tbody) return;
     syncSortCaret();   // 重建后恢复排序箭头（SSE 增量重建也不会丢状态）
+
+    const scrollY = window.scrollY || document.documentElement.scrollTop;
+    const scrollX = window.scrollX || document.documentElement.scrollLeft;
+    const wrapper = tbody.closest('.panel-wrapper');
+    const wrapperLeft = wrapper ? wrapper.scrollLeft : 0;
+    const wrapperTop = wrapper ? wrapper.scrollTop : 0;
+
     tbody.innerHTML = '';
 
     const groupSelect = document.getElementById('filter-group');
@@ -1430,6 +1439,11 @@ function renderNodesTable() {
         tbody.innerHTML = `<tr><td colspan="11" style="text-align: center; color: var(--rock); padding: 24px;">暂无节点数据</td></tr>`;
         syncNodeSelection();
         syncProbeButtons();
+        if (wrapper) {
+            wrapper.scrollLeft = wrapperLeft;
+            wrapper.scrollTop = wrapperTop;
+        }
+        window.scrollTo(scrollX, scrollY);
         return;
     }
 
@@ -1487,6 +1501,12 @@ function renderNodesTable() {
 
     syncNodeSelection();
     syncProbeButtons();
+
+    if (wrapper) {
+        wrapper.scrollLeft = wrapperLeft;
+        wrapper.scrollTop = wrapperTop;
+    }
+    window.scrollTo(scrollX, scrollY);
 }
 
 /** 节点行操作按钮列 HTML（renderNodesTable / syncNodesTable 共用，状态切换时局部重建） */
@@ -1580,7 +1600,16 @@ function syncNodesTable() {
 /** 行内端口编辑：PATCH 端口并重建配置；失败恢复原值 */
 async function updateNodePort(id, val) {
     const port = parseInt(val, 10);
-    if (!port || port < 1024 || port > 65535) { addLog('WARN', '端口无效（1024-65535）'); renderNodesTable(); return; }
+    if (!port || port < 1024 || port > 65535) {
+        addLog('WARN', '端口无效（1024-65535）');
+        renderNodesTable();
+        const input = document.querySelector(`tr[data-id="${id}"] .port-input`);
+        if (input) {
+            input.focus({ preventScroll: true });
+            input.select();
+        }
+        return;
+    }
     try {
         await api(`/api/nodes/${id}/port`, {
             method: 'PUT',
@@ -1592,6 +1621,11 @@ async function updateNodePort(id, val) {
     } catch (e) {
         addLog('ERROR', '端口更新失败: ' + e.message);
         renderNodesTable();
+        const input = document.querySelector(`tr[data-id="${id}"] .port-input`);
+        if (input) {
+            input.focus({ preventScroll: true });
+            input.select();
+        }
     }
 }
 
@@ -3109,7 +3143,7 @@ async function loadSettings() {
 
         setVal('setting-inbound-port', s.inboundPort || 2080);
         setVal('setting-clash-port', s.clashPort || 9095);
-        setVal('setting-probe-interval', s.probeInterval || 30);
+        setVal('setting-probe-interval', Math.max(10, s.probeInterval || 30));
         setVal('setting-log-level', s.logLevel || 'info');
         setVal('setting-listen-ip', s.listenIp || '0.0.0.0');
         setVal('setting-export-domain', savedExportDomain);
@@ -3134,7 +3168,7 @@ async function saveSystemSettings() {
     const payload = {
         inboundPort: parseInt(getVal('setting-inbound-port')) || 2080,
         clashPort: parseInt(getVal('setting-clash-port')) || 9095,
-        probeInterval: parseInt(getVal('setting-probe-interval')) || 30,
+        probeInterval: Math.max(10, parseInt(getVal('setting-probe-interval')) || 30),
         logLevel: getVal('setting-log-level') || 'info',
         listenIp: getVal('setting-listen-ip') || '0.0.0.0',
         exportDomain: getVal('setting-export-domain').trim(),
