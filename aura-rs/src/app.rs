@@ -1073,6 +1073,7 @@ const ALLOWED_SETTING_KEYS: &[&str] = &[
     "inboundPort",
     "clashPort",
     "probeInterval",
+    "offlineGraceFails",
     "logLevel",
     "listenIp",
     "exportDomain",
@@ -1187,6 +1188,7 @@ async fn put_settings(State(st): State<AppState>, Json(raw): Json<Value>) -> Api
         "inboundPort",
         "probeInterval",
         "randomRotateInterval",
+        "offlineGraceFails",
     ] {
         let Some(v) = current.get(key).cloned() else {
             continue;
@@ -1212,6 +1214,15 @@ async fn put_settings(State(st): State<AppState>, Json(raw): Json<Value>) -> Api
             "probeInterval" => {
                 if n < 10 {
                     return Err(ApiError::unprocessable(format!("{} 间隔过短", key)));
+                }
+                n
+            }
+            "offlineGraceFails" => {
+                if !(1..=10).contains(&n) {
+                    return Err(ApiError::unprocessable(format!(
+                        "{} 必须在 1..=10 范围内",
+                        key
+                    )));
                 }
                 n
             }
@@ -1880,6 +1891,59 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["detail"], json!("probeInterval 间隔过短"));
+    }
+
+    #[tokio::test]
+    async fn settings_put_rejects_invalid_offline_grace_fails() {
+        let (router, _db, _cfg) = build();
+        let (status, body) = call(
+            router.clone(),
+            "PUT",
+            "/api/settings",
+            Some(json!({ "offlineGraceFails": 0 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["detail"],
+            json!("offlineGraceFails 必须在 1..=10 范围内")
+        );
+
+        let (status, body) = call(
+            router,
+            "PUT",
+            "/api/settings",
+            Some(json!({ "offlineGraceFails": 11 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["detail"],
+            json!("offlineGraceFails 必须在 1..=10 范围内")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_offline_grace_fails_get_put_roundtrip() {
+        let (router, db, _cfg) = build();
+        let (status, body) = call(
+            router.clone(),
+            "PUT",
+            "/api/settings",
+            Some(json!({ "offlineGraceFails": 3 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["configApplied"], json!(true));
+
+        let (status, settings) = call(router.clone(), "GET", "/api/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settings["offlineGraceFails"], json!(3));
+
+        let (status, body) = call(router, "PUT", "/api/settings", Some(settings)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let stored = db.get_setting_or("system", json!({})).unwrap();
+        assert_eq!(stored["offlineGraceFails"], json!(3));
     }
 
     #[tokio::test]

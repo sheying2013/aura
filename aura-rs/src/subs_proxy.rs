@@ -331,6 +331,20 @@ fn parse_port(value: &str) -> Option<i64> {
 
 /// 解析一行订阅链接；任何畸形输入返回 None（绝不 panic）。
 pub fn parse_link(line: &str) -> Option<SubParseNode> {
+    let original = line.trim().to_string();
+    let mut node = parse_link_inner(line)?;
+    // 原始链接持久化：前端「导出原始节点」直接复用，不再依赖字段重建。
+    if let Value::Object(mut map) = node.raw_config.clone() {
+        if !map.contains_key("uri") {
+            map.insert("uri".to_string(), json!(original));
+        }
+        node.raw_config = Value::Object(map);
+    }
+    Some(node)
+}
+
+/// 各协议分支的真实解析入口；对外统一走 parse_link 以便补写 uri。
+fn parse_link_inner(line: &str) -> Option<SubParseNode> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -2010,6 +2024,23 @@ mod tests {
         assert_eq!(raw["method"], json!("aes-256-cfb"));
         assert_eq!(raw["obfs"], json!("plain"));
         assert_eq!(raw["password"], json!("pw-ssr"));
+    }
+
+    #[test]
+    fn parse_link_persists_original_uri_in_raw_config() {
+        for link in [
+            "ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#节点A",
+            "trojan://pass@example.com:443?sni=example.com#节点B",
+            "socks5://user:pw@5.6.7.8:1080#节点C",
+        ] {
+            let node = parse_link(link).expect("应能解析");
+            let raw = node.raw_config.as_object().expect("rawConfig 必须是对象");
+            assert_eq!(
+                raw.get("uri").and_then(|v| v.as_str()),
+                Some(link),
+                "原始链接必须原样落到 rawConfig.uri"
+            );
+        }
     }
 
     #[test]

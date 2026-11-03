@@ -581,6 +581,9 @@ fn row_to_sub_row(row: &Row<'_>) -> rusqlite::Result<SubRow> {
 ///
 /// 拆成结构体只为把一轮探活结果攒起来一次性落库；单条语义（CAS 条件、
 /// consecutive_fails 递增、port/protocol 变更处理）与逐条调用完全相同。
+/// 后台探活判定离线的连续失败容差阈值默认值（2 次）。
+pub const DEFAULT_OFFLINE_GRACE_FAILS: i64 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeUpdateRow {
     pub node_id: String,
@@ -589,6 +592,7 @@ pub struct ProbeUpdateRow {
     pub count_failure: bool,
     pub expected_port: Option<i64>,
     pub expected_protocol: Option<String>,
+    pub offline_grace_fails: Option<i64>,
 }
 
 impl ProbeUpdateRow {
@@ -607,7 +611,14 @@ impl ProbeUpdateRow {
             count_failure,
             expected_port,
             expected_protocol: expected_protocol.map(|s| s.to_string()),
+            offline_grace_fails: None,
         }
+    }
+
+    /// 设置离线确认容差阈值（未达阈值保持原 status 与 ping）。
+    pub fn with_grace_fails(mut self, grace: impl Into<Option<i64>>) -> Self {
+        self.offline_grace_fails = grace.into();
+        self
     }
 }
 
@@ -1611,7 +1622,11 @@ impl Db {
     // ---------- 探活落库（全部是 CAS，过期结果必须丢弃） ----------
 
     /// 原子落库探活结果；手动失败不计数，成功清零。
+    /// 后台失败且提供了 offline_grace_fails（>1）时：未达阈值保持原 status 与 ping，仅累计 consecutive_fails。
     /// 节点已停用/删除/tag 变化时返回 None，调用方必须丢弃过期结果。
+    // 探活落库要同时表达「结果 / 是否计数 / 端口与协议 CAS / 离线容差」，
+    // 拆结构体会让逐条与批量两条路径更难保持等价，故保留平铺参数。
+    #[allow(clippy::too_many_arguments)]
     pub fn update_node_probe(
         &self,
         node_id: &str,
@@ -1620,23 +1635,39 @@ impl Db {
         count_failure: bool,
         expected_port: Option<i64>,
         expected_protocol: Option<&str>,
+        offline_grace_fails: Option<i64>,
     ) -> Result<Option<i64>> {
         let conn = self.lock();
-        let mut sql = String::from("UPDATE nodes SET ping=?, status=?, consecutive_fails=");
+        let grace = offline_grace_fails.unwrap_or(1).max(1);
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut sql = String::from("UPDATE nodes SET ");
         if status == "online" {
-            sql.push('0');
+            sql.push_str("ping=?, status=?, consecutive_fails=0");
+            bound.push(Box::new(ping));
+            bound.push(Box::new(status.to_string()));
         } else if count_failure {
-            sql.push_str("consecutive_fails+1");
+            if grace > 1 {
+                // 离线容差：连败未达阈值时保持原 status 与原 ping，仅累计失败次数
+                sql.push_str(
+                    "status = CASE WHEN consecutive_fails + 1 >= ? THEN ? ELSE status END,                      ping = CASE WHEN consecutive_fails + 1 >= ? THEN ? ELSE ping END,                      consecutive_fails = consecutive_fails + 1",
+                );
+                bound.push(Box::new(grace));
+                bound.push(Box::new(status.to_string()));
+                bound.push(Box::new(grace));
+                bound.push(Box::new(ping));
+            } else {
+                sql.push_str("ping=?, status=?, consecutive_fails=consecutive_fails+1");
+                bound.push(Box::new(ping));
+                bound.push(Box::new(status.to_string()));
+            }
         } else {
-            sql.push_str("consecutive_fails");
+            sql.push_str("ping=?, status=?, consecutive_fails=consecutive_fails");
+            bound.push(Box::new(ping));
+            bound.push(Box::new(status.to_string()));
         }
         sql.push_str(", updated_at=? WHERE id=? AND status!='disabled'");
-        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(ping),
-            Box::new(status.to_string()),
-            Box::new(now_ms()),
-            Box::new(node_id.to_string()),
-        ];
+        bound.push(Box::new(now_ms()));
+        bound.push(Box::new(node_id.to_string()));
         if let Some(p) = expected_port {
             sql.push_str(" AND port=?");
             bound.push(Box::new(p));
@@ -1676,21 +1707,36 @@ impl Db {
         {
             for item in items {
                 // 以下 SQL 构造与 update_node_probe 逐字等价（改这里必须同步那里）。
-                let mut sql = String::from("UPDATE nodes SET ping=?, status=?, consecutive_fails=");
+                let grace = item.offline_grace_fails.unwrap_or(1).max(1);
+                let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                let mut sql = String::from("UPDATE nodes SET ");
                 if item.status == "online" {
-                    sql.push('0');
+                    sql.push_str("ping=?, status=?, consecutive_fails=0");
+                    bound.push(Box::new(item.ping));
+                    bound.push(Box::new(item.status.clone()));
                 } else if item.count_failure {
-                    sql.push_str("consecutive_fails+1");
+                    if grace > 1 {
+                        // 离线容差：连败未达阈值时保持原 status 与原 ping，仅累计失败次数
+                        sql.push_str(
+                            "status = CASE WHEN consecutive_fails + 1 >= ? THEN ? ELSE status END,                              ping = CASE WHEN consecutive_fails + 1 >= ? THEN ? ELSE ping END,                              consecutive_fails = consecutive_fails + 1",
+                        );
+                        bound.push(Box::new(grace));
+                        bound.push(Box::new(item.status.clone()));
+                        bound.push(Box::new(grace));
+                        bound.push(Box::new(item.ping));
+                    } else {
+                        sql.push_str("ping=?, status=?, consecutive_fails=consecutive_fails+1");
+                        bound.push(Box::new(item.ping));
+                        bound.push(Box::new(item.status.clone()));
+                    }
                 } else {
-                    sql.push_str("consecutive_fails");
+                    sql.push_str("ping=?, status=?, consecutive_fails=consecutive_fails");
+                    bound.push(Box::new(item.ping));
+                    bound.push(Box::new(item.status.clone()));
                 }
                 sql.push_str(", updated_at=? WHERE id=? AND status!='disabled'");
-                let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                    Box::new(item.ping),
-                    Box::new(item.status.clone()),
-                    Box::new(now_ms()),
-                    Box::new(item.node_id.clone()),
-                ];
+                bound.push(Box::new(now_ms()));
+                bound.push(Box::new(item.node_id.clone()));
                 if let Some(p) = item.expected_port {
                     sql.push_str(" AND port=?");
                     bound.push(Box::new(p));
@@ -2317,7 +2363,8 @@ pub fn update_node_probe(
             status,
             count_failure,
             expected_port,
-            expected_protocol
+            expected_protocol,
+            None
         ),
         None,
         "探活落库失败"
@@ -2788,7 +2835,8 @@ mod tests {
                 "offline",
                 true,
                 Some(port),
-                Some("shadowsocks")
+                Some("shadowsocks"),
+                None
             )
             .unwrap(),
             Some(1)
@@ -2800,7 +2848,8 @@ mod tests {
                 "offline",
                 false,
                 Some(port),
-                Some("shadowsocks")
+                Some("shadowsocks"),
+                None
             )
             .unwrap(),
             Some(1)
@@ -2812,7 +2861,8 @@ mod tests {
                 "online",
                 true,
                 Some(port),
-                Some("shadowsocks")
+                Some("shadowsocks"),
+                None
             )
             .unwrap(),
             Some(0)
@@ -2843,7 +2893,8 @@ mod tests {
                 "online",
                 true,
                 Some(port),
-                Some("shadowsocks")
+                Some("shadowsocks"),
+                None
             )
             .unwrap(),
             None
@@ -2855,7 +2906,8 @@ mod tests {
                 "offline",
                 false,
                 Some(port),
-                Some("shadowsocks")
+                Some("shadowsocks"),
+                None
             )
             .unwrap(),
             None
@@ -2881,14 +2933,23 @@ mod tests {
                 "online",
                 true,
                 Some(port + 1),
-                Some("shadowsocks")
+                Some("shadowsocks"),
+                None
             )
             .unwrap(),
             None
         );
         assert_eq!(
-            d.update_node_probe(&node.id, 24, "online", true, Some(port), Some("vless"))
-                .unwrap(),
+            d.update_node_probe(
+                &node.id,
+                24,
+                "online",
+                true,
+                Some(port),
+                Some("vless"),
+                None
+            )
+            .unwrap(),
             None
         );
         let after = d.get_node(&node.id).unwrap().unwrap();
@@ -2897,6 +2958,68 @@ mod tests {
 
     // 14b. 批量落库与逐条落库完全等价（success / 失败递增 / port 变化 /
     //      protocol 变化 / offline 恢复 online / 不存在节点 / 大批量混合）
+    #[test]
+    fn update_node_probe_grace_keeps_online_until_threshold() {
+        let d = db();
+        let node = d
+            .create_node_batch_json(&[node_json("g", 53001)], false)
+            .unwrap()
+            .items[0]
+            .clone();
+        let id = node.id.clone();
+        d.update_node_probe(
+            &id,
+            12,
+            "online",
+            true,
+            Some(53001),
+            Some("shadowsocks"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            d.get_node(&id).unwrap().unwrap().base.status.as_deref(),
+            Some("online")
+        );
+
+        // 容差 3：前两次失败保持 online 与原 ping，只累计失败次数
+        for expect_fails in 1..=2 {
+            let fails = d
+                .update_node_probe(
+                    &id,
+                    0,
+                    "offline",
+                    true,
+                    Some(53001),
+                    Some("shadowsocks"),
+                    Some(3),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(fails, expect_fails);
+            let n = d.get_node(&id).unwrap().unwrap();
+            assert_eq!(n.base.status.as_deref(), Some("online"));
+            assert_eq!(n.base.ping, Some(12));
+        }
+        // 第三次失败达到阈值：翻 offline 并写入失败 ping
+        let fails = d
+            .update_node_probe(
+                &id,
+                0,
+                "offline",
+                true,
+                Some(53001),
+                Some("shadowsocks"),
+                Some(3),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fails, 3);
+        let n = d.get_node(&id).unwrap().unwrap();
+        assert_eq!(n.base.status.as_deref(), Some("offline"));
+        assert_eq!(n.base.ping, Some(0));
+    }
+
     #[test]
     fn update_node_probe_batch_matches_single_row_semantics() {
         use std::collections::HashMap;
@@ -3025,6 +3148,20 @@ mod tests {
                 }),
             ),
             (
+                "容差后台失败保持 online",
+                Box::new(|ids| {
+                    vec![ProbeUpdateRow::new(
+                        ids["a"].clone(),
+                        0,
+                        "offline",
+                        true,
+                        Some(52001),
+                        Some("shadowsocks"),
+                    )
+                    .with_grace_fails(3)]
+                }),
+            ),
+            (
                 "offline 恢复 online（清零）",
                 Box::new(|ids| {
                     vec![ProbeUpdateRow::new(
@@ -3053,6 +3190,7 @@ mod tests {
                             r.count_failure,
                             r.expected_port,
                             r.expected_protocol.as_deref(),
+                            r.offline_grace_fails,
                         )
                         .unwrap()
                 })
@@ -3089,7 +3227,8 @@ mod tests {
                 2 | 3 | 5 => assert_eq!(got, vec![None]),
                 4 => assert_eq!(got, vec![Some(0)]),
                 6 => assert_eq!(got, vec![Some(0), Some(1), Some(3)]),
-                7 => assert_eq!(got, vec![Some(0)]),
+                // 已离线节点在容差内只累计失败次数，状态保持 offline
+                7 => assert_eq!(got, vec![Some(4)]),
                 _ => {}
             }
         }
@@ -3204,7 +3343,7 @@ mod tests {
     fn missing_node_probe_returns_none() {
         let d = db();
         assert_eq!(
-            d.update_node_probe("node-dead", 12, "online", true, None, None)
+            d.update_node_probe("node-dead", 12, "online", true, None, None, None)
                 .unwrap(),
             None
         );
@@ -3212,6 +3351,108 @@ mod tests {
             d.revive_node_probe("node-dead", 12, 52001, "shadowsocks")
                 .unwrap(),
             None
+        );
+    }
+
+    // 15b. 后台探活容差：未达阈值保持 online/旧 ping，达到阈值才 offline；手动探活即时 offline
+    #[test]
+    fn update_node_probe_with_grace_keeps_status_and_ping_until_threshold() {
+        let d = db();
+        let node = d
+            .create_node_batch_json(&[node_json("a", 52001)], false)
+            .unwrap()
+            .items[0]
+            .clone();
+        let port = node.base.port.unwrap();
+
+        // 初始设为 online, ping=50, consecutive_fails=0
+        d.update_node_probe(
+            &node.id,
+            50,
+            "online",
+            true,
+            Some(port),
+            Some("shadowsocks"),
+            None,
+        )
+        .unwrap();
+        let n0 = d.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(n0.base.status.as_deref(), Some("online"));
+        assert_eq!(n0.base.ping, Some(50));
+        assert_eq!(n0.base.consecutive_fails, Some(0));
+
+        // 第 1 次后台失败，grace=2：未达阈值（consecutive_fails+1 = 1 < 2），保持 online 与 ping=50，consecutive_fails=1
+        let fails1 = d
+            .update_node_probe(
+                &node.id,
+                0,
+                "offline",
+                true,
+                Some(port),
+                Some("shadowsocks"),
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(fails1, Some(1));
+        let n1 = d.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(
+            n1.base.status.as_deref(),
+            Some("online"),
+            "未达阈值应保持 online"
+        );
+        assert_eq!(n1.base.ping, Some(50), "未达阈值应保留原 ping");
+        assert_eq!(n1.base.consecutive_fails, Some(1));
+
+        // 第 2 次后台失败，grace=2：达到阈值（consecutive_fails+1 = 2 >= 2），写 offline 与 ping=0，consecutive_fails=2
+        let fails2 = d
+            .update_node_probe(
+                &node.id,
+                0,
+                "offline",
+                true,
+                Some(port),
+                Some("shadowsocks"),
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(fails2, Some(2));
+        let n2 = d.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(
+            n2.base.status.as_deref(),
+            Some("offline"),
+            "达到阈值应标记 offline"
+        );
+        assert_eq!(n2.base.ping, Some(0));
+        assert_eq!(n2.base.consecutive_fails, Some(2));
+
+        // 手动探活失败（count_failure=false），即使带 grace 也即时 offline
+        d.update_node_probe(
+            &node.id,
+            60,
+            "online",
+            true,
+            Some(port),
+            Some("shadowsocks"),
+            None,
+        )
+        .unwrap();
+        let fails_manual = d
+            .update_node_probe(
+                &node.id,
+                0,
+                "offline",
+                false,
+                Some(port),
+                Some("shadowsocks"),
+                Some(5),
+            )
+            .unwrap();
+        assert_eq!(fails_manual, Some(0));
+        let nm = d.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(
+            nm.base.status.as_deref(),
+            Some("offline"),
+            "手动探活失败应即时写 offline"
         );
     }
 

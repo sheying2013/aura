@@ -719,3 +719,162 @@ def test_edit_raw_upstream_node_modal_and_patch(ui):
     assert page.locator("#edit-raw-user").input_value() == "u88"
     assert page.locator("#edit-raw-pass").input_value() == "p88"
     assert "成功解析" in page.locator("#edit-raw-link-msg").inner_text()
+
+def test_batch_import_modal_datalist_contains_existing_groups(ui):
+    page, state = ui
+    state["nodes"] = [
+        node("n1", group="香港专线"),
+        node("n2", group="日本专线"),
+        node("n3", group="美国BGP"),
+    ]
+    page.evaluate("loadNodes()")
+
+    # 验证页面内联 datalist 包含所有已有分组（排除 ALL）
+    inline_options = page.locator("#import-group-list option").evaluate_all(
+        "opts => opts.map(o => o.value)"
+    )
+    assert "香港专线" in inline_options
+    assert "日本专线" in inline_options
+    assert "美国BGP" in inline_options
+    assert "ALL" not in inline_options
+
+    # 打开批量导入 modal
+    page.evaluate("openModal('import-modal')")
+    assert page.locator("#import-modal").evaluate("el => el.classList.contains('active')")
+
+    # 验证 modal 内 datalist 包含所有已有分组
+    modal_options = page.locator("#modal-import-group-list option").evaluate_all(
+        "opts => opts.map(o => o.value)"
+    )
+    assert "香港专线" in modal_options
+    assert "日本专线" in modal_options
+    assert "美国BGP" in modal_options
+    assert "ALL" not in modal_options
+
+
+def test_batch_import_submits_selected_group(ui):
+    page, state = ui
+    state["nodes"] = [
+        node("n1", group="香港专线"),
+        node("n2", group="日本专线"),
+    ]
+    page.evaluate("loadNodes()")
+
+    # 打开批量导入 modal
+    page.evaluate("openModal('import-modal')")
+
+    # 输入/选中已有分组 "日本专线"
+    page.locator("#modal-import-group").fill("日本专线")
+    page.locator("#modal-import-text").fill("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#TestNode")
+
+    state["requests"].clear()
+    state["responses"]["/api/nodes/batch"] = (200, {"created": 1, "skipped": 0, "duplicate": 0, "failed": 0})
+
+    page.evaluate("handleBatchImport()")
+
+    # 拦截 /api/nodes/batch 请求并断言提交 payload 的 group 等于所选分组
+    batch_req = next(r for r in state["requests"] if r[0] == "POST" and r[1] == "/api/nodes/batch")
+    payload = batch_req[2]
+    assert len(payload["nodes"]) == 1
+    assert payload["nodes"][0]["group"] == "日本专线"
+
+
+def test_export_original_reconstructs_links_from_raw_config(ui):
+    page, state = ui
+    # 对 ss / vmess / vless / trojan / socks5 各造一个只有 rawConfig、没有 uri 的节点
+    n_ss = node("n_ss", protocol="ss", name="SS-Test", group="GroupA", rawConfig={
+        "server": "1.1.1.1",
+        "server_port": 8388,
+        "method": "aes-256-gcm",
+        "password": "testpassword"
+    })
+    n_vmess = node("n_vmess", protocol="vmess", name="VMess-Test", group="GroupA", rawConfig={
+        "server": "2.2.2.2",
+        "server_port": 443,
+        "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+        "alterId": 0,
+        "security": "auto",
+        "transport": {"type": "ws", "path": "/ws"},
+        "tls": {"enabled": True, "server_name": "vmess.example.com"}
+    })
+    n_vless = node("n_vless", protocol="vless", name="VLESS-Test", group="GroupB", rawConfig={
+        "server": "3.3.3.3",
+        "server_port": 443,
+        "uuid": "a831381d-6324-4d53-ad4f-8cda48b30822",
+        "flow": "xtls-rprx-vision",
+        "tls": {
+            "enabled": True,
+            "server_name": "vless.example.com",
+            "reality": {"enabled": True, "public_key": "test_public_key", "short_id": "test_sid"}
+        }
+    })
+    n_trojan = node("n_trojan", protocol="trojan", name="Trojan-Test", group="GroupB", rawConfig={
+        "server": "4.4.4.4",
+        "server_port": 443,
+        "password": "trojan_secret_password",
+        "tls": {"server_name": "trojan.example.com"}
+    })
+    n_socks5 = node("n_socks5", protocol="socks5", name="Socks5-Test", group="GroupA", rawConfig={
+        "server": "5.5.5.5",
+        "server_port": 1080,
+        "username": "socksuser",
+        "password": "sockspassword"
+    })
+    # 额外加入一个缺少必须字段无法重建的节点（例如缺少 server_port），验证跳过与提示机制
+    n_broken = node("n_broken", protocol="vmess", name="Broken-Node", group="GroupA", rawConfig={
+        "server": "6.6.6.6"
+    })
+
+    state["nodes"] = [n_ss, n_vmess, n_vless, n_trojan, n_socks5, n_broken]
+    page.evaluate("loadNodes()")
+
+    page.locator('.nav-item[data-target="export"]').click()
+    page.locator("#export-type-select").select_option("original")
+    page.evaluate("generateExportText()")
+
+    export_text = page.locator("#export-text-area").input_value()
+    assert "# 原始节点链接导出" in export_text
+
+    # 验证提示栏展示 1 个节点无可用原始链接已跳过
+    skip_hint = page.locator("#export-skip-hint")
+    sync_api.expect(skip_hint).to_be_visible()
+    assert "1 个节点无可用原始链接，已跳过" in skip_hint.inner_text()
+
+    # 提取导出的链接行（忽略以 # 开头的注释行和空行）
+    link_lines = [l.strip() for l in export_text.splitlines() if l.strip() and not l.strip().startswith("#")]
+    assert len(link_lines) == 5
+
+    # 验证各协议前缀和关键字段
+    ss_line = next(l for l in link_lines if l.startswith("ss://"))
+    assert "@1.1.1.1:8388" in ss_line
+    assert "#SS-Test" in ss_line
+
+    vmess_line = next(l for l in link_lines if l.startswith("vmess://"))
+    import base64
+    b64_part = vmess_line.split("vmess://", 1)[1]
+    vmess_json = json.loads(base64.b64decode(b64_part + "=" * (-len(b64_part) % 4)).decode())
+    assert vmess_json["add"] == "2.2.2.2"
+    assert vmess_json["port"] == 443
+    assert vmess_json["id"] == "b831381d-6324-4d53-ad4f-8cda48b30811"
+    assert vmess_json["net"] == "ws"
+    assert vmess_json["path"] == "/ws"
+    assert vmess_json["sni"] == "vmess.example.com"
+    assert vmess_json["tls"] == "tls"
+
+    vless_line = next(l for l in link_lines if l.startswith("vless://"))
+    assert "a831381d-6324-4d53-ad4f-8cda48b30822@3.3.3.3:443" in vless_line
+    assert "security=reality" in vless_line
+    assert "pbk=test_public_key" in vless_line
+    assert "sid=test_sid" in vless_line
+    assert "sni=vless.example.com" in vless_line
+    assert "flow=xtls-rprx-vision" in vless_line
+    assert "#VLESS-Test" in vless_line
+
+    trojan_line = next(l for l in link_lines if l.startswith("trojan://"))
+    assert "trojan_secret_password@4.4.4.4:443" in trojan_line
+    assert "sni=trojan.example.com" in trojan_line
+    assert "#Trojan-Test" in trojan_line
+
+    socks5_line = next(l for l in link_lines if l.startswith("socks5://"))
+    assert "socksuser:sockspassword@5.5.5.5:1080" in socks5_line
+    assert "#Socks5-Test" in socks5_line

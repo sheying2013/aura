@@ -26,17 +26,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rand::Rng;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
-use crate::db::{ProbeUpdateRow, UpdateNodeProbeOutcome};
+use crate::db::{ProbeUpdateRow, UpdateNodeProbeOutcome, DEFAULT_OFFLINE_GRACE_FAILS};
 use crate::types::{Node, PingResultItem};
 use crate::utils::is_ip_address;
 
 // ---------- 周期常量（与 Python 版逐一对应） ----------
 
-/// 后台探活默认间隔（秒）；系统设置 probeInterval 可覆盖，下限 10s。
-pub const PING_INTERVAL: f64 = 60.0;
+/// 后台探活默认间隔（秒，上调为适合 1 核小机的值 180s）；系统设置 probeInterval 可覆盖，下限 10s。
+pub const PING_INTERVAL: f64 = 180.0;
 /// 订阅刷新间隔（秒，3 小时）。
 pub const SUB_REFRESH_INTERVAL: f64 = 3.0 * 60.0 * 60.0;
 /// 崩溃守护巡检间隔（秒）。
@@ -47,6 +48,14 @@ pub const GUARD_WINDOW: f64 = 60.0;
 pub const MAX_RESTARTS_PER_MIN: usize = 3;
 /// 探活间隔下限（秒），防系统设置误配成 1s。
 pub const MIN_PROBE_INTERVAL: f64 = 10.0;
+/// 后台探活连续失败离线确认容差阈值（默认 2 次连败才写 offline）。
+pub const OFFLINE_GRACE_FAILS: i64 = DEFAULT_OFFLINE_GRACE_FAILS;
+pub const MIN_OFFLINE_GRACE_FAILS: i64 = 1;
+pub const MAX_OFFLINE_GRACE_FAILS: i64 = 10;
+/// 自动探活周期的随机抖动比例（±10%）。
+pub const PROBE_JITTER_RATIO: f64 = 0.10;
+/// 自动探活稳定节点分批轮转批数（默认 2 批，2 轮全覆盖）。
+pub const PROBE_BATCH_PARTS: usize = 2;
 
 /// fd 泄漏阈值：健康态约 20 个 fd，58 个入站节点时 1200 已是 20 倍余量。
 pub const FD_LIMIT: u64 = 1200;
@@ -437,12 +446,101 @@ pub fn probe_retry_backoff(attempt: usize) -> f64 {
     (attempt as f64).min(PROBE_RETRY_BACKOFF_CAP) * PROBE_RETRY_BACKOFF_BASE
 }
 
-/// 探活间隔：取系统设置并夹到下限 10s；未设置回落默认 60s。
+/// 自动探活最长间隔（秒）：稳定期与大批量节点叠加后的上限。
+pub const MAX_PROBE_DELAY: f64 = 900.0;
+/// 连续稳定轮次对应的间隔放大倍数（0 轮=1x，1 轮=1.5x，2 轮=2x，3 轮及以上封顶 3x）。
+pub fn probe_backoff_factor(healthy_rounds: u32) -> f64 {
+    match healthy_rounds {
+        0 => 1.0,
+        1 => 1.5,
+        2 => 2.0,
+        _ => 3.0,
+    }
+}
+
+/// 节点规模系数：节点越多，单轮代价越高，间隔按 1x~2x 线性放大（400 个封顶）。
+pub fn probe_load_factor(node_count: usize) -> f64 {
+    1.0 + (node_count.min(400) as f64) / 400.0
+}
+
+/// 自动探活的实际等待时长 = 基础间隔 × 稳定系数 × 规模系数，夹在 [10s, 900s]。
+pub fn next_probe_delay(base: f64, healthy_rounds: u32, node_count: usize) -> f64 {
+    let base = base.max(MIN_PROBE_INTERVAL);
+    (base * probe_backoff_factor(healthy_rounds) * probe_load_factor(node_count))
+        .clamp(MIN_PROBE_INTERVAL, MAX_PROBE_DELAY)
+}
+
+/// 给等待时长叠加 ±10%（PROBE_JITTER_RATIO）抖动，避免多实例同刻探活。
+pub fn jitter_probe_delay(delay: f64) -> f64 {
+    jitter_probe_delay_with(delay, rand::thread_rng().gen_range(-1.0..=1.0))
+}
+
+pub fn jitter_probe_delay_with(delay: f64, factor: f64) -> f64 {
+    let clamped_factor = factor.clamp(-1.0, 1.0);
+    (delay * (1.0 + PROBE_JITTER_RATIO * clamped_factor)).clamp(MIN_PROBE_INTERVAL, MAX_PROBE_DELAY)
+}
+
+/// 探活间隔：取系统设置并夹到下限 10s；未设置回落默认 180s。
 pub fn probe_interval(configured: Option<i64>) -> f64 {
     match configured {
         Some(v) => (v as f64).max(MIN_PROBE_INTERVAL),
         None => PING_INTERVAL,
     }
+}
+
+/// 离线确认容差阈值：从 settings 解析并校验范围 1..=10，非法或未设置回落默认 2。
+pub fn parse_offline_grace_fails(val: Option<&Value>) -> i64 {
+    match val {
+        Some(Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                if (MIN_OFFLINE_GRACE_FAILS..=MAX_OFFLINE_GRACE_FAILS).contains(&i) {
+                    return i;
+                }
+            }
+            OFFLINE_GRACE_FAILS
+        }
+        Some(Value::String(s)) => {
+            if let Ok(i) = s.trim().parse::<i64>() {
+                if (MIN_OFFLINE_GRACE_FAILS..=MAX_OFFLINE_GRACE_FAILS).contains(&i) {
+                    return i;
+                }
+            }
+            OFFLINE_GRACE_FAILS
+        }
+        _ => OFFLINE_GRACE_FAILS,
+    }
+}
+
+/// 为一轮后台自动探活选择目标节点 ID。
+///
+/// 策略：
+/// 1. 不稳定节点（consecutive_fails > 0 或非 online 状态）每轮必测，确保换 IP 或故障感知不滞后；
+/// 2. 稳定 online 节点按排序后索引对总批数取模分批轮转，保证 N 轮内全覆盖，保护 1 核小机资源。
+pub fn select_batch_probe_plan(nodes: &[Node], round: usize, parts: usize) -> Vec<String> {
+    if parts <= 1 || nodes.len() <= 1 {
+        return nodes.iter().map(|n| n.id.clone()).collect();
+    }
+    let mut sorted_nodes: Vec<&Node> = nodes.iter().collect();
+    sorted_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut selected = Vec::new();
+    let mut stable_index = 0usize;
+
+    for node in sorted_nodes {
+        let is_online = node.base.status.as_deref() == Some("online");
+        let fails = node.base.consecutive_fails.unwrap_or(0);
+        let is_stable = is_online && fails == 0;
+
+        if !is_stable {
+            selected.push(node.id.clone());
+        } else {
+            if stable_index % parts == round % parts {
+                selected.push(node.id.clone());
+            }
+            stable_index += 1;
+        }
+    }
+    selected
 }
 
 /// 测试 URL 归一化：非 https:// 一律回落默认值
@@ -486,6 +584,7 @@ pub struct ProbeTargetNode {
     pub port: i64,
     pub protocol: String,
     pub consecutive_fails: i64,
+    pub ping: Option<i64>,
 }
 
 impl ProbeTargetNode {
@@ -497,11 +596,17 @@ impl ProbeTargetNode {
             port,
             protocol: protocol.to_string(),
             consecutive_fails: 0,
+            ping: None,
         }
     }
 
     pub fn with_fails(mut self, fails: i64) -> Self {
         self.consecutive_fails = fails;
+        self
+    }
+
+    pub fn with_ping(mut self, ping: Option<i64>) -> Self {
+        self.ping = ping;
         self
     }
 
@@ -1729,6 +1834,7 @@ impl ProbeEngine {
                         r.count_failure,
                         r.expected_port,
                         r.expected_protocol.as_deref(),
+                        r.offline_grace_fails,
                     )
                     .ok()
                     .flatten()
@@ -1763,6 +1869,8 @@ impl ProbeEngine {
         self.tracker.lock().unwrap().prune(&valid);
         let settings = self.db.get_setting("system").unwrap_or_else(|_| json!({}));
         let test_url = normalize_test_url(settings.get("testUrl").and_then(|v| v.as_str()));
+        // 离线容差：连续失败未达该次数时保留原状态，避免动态 IP 切换被误判离线。
+        let offline_grace = parse_offline_grace_fails(settings.get("offlineGraceFails"));
         let base = self.cfg.clash_base();
         let secret = self.cfg.clash_secret();
         let idset: Option<HashSet<String>> = if all {
@@ -1781,6 +1889,7 @@ impl ProbeEngine {
                     &n.base.protocol,
                 )
                 .with_fails(n.base.consecutive_fails.unwrap_or(0))
+                .with_ping(n.base.ping)
             })
             .collect();
         let by_id: HashMap<String, ProbeTargetNode> =
@@ -1909,7 +2018,12 @@ impl ProbeEngine {
                         mode.counts_failures(),
                         Some(target.port),
                         Some(&target.protocol),
-                    ),
+                    )
+                    .with_grace_fails(if mode.counts_failures() {
+                        Some(offline_grace)
+                    } else {
+                        None
+                    }),
                     target: target.clone(),
                     count_failure: mode.counts_failures(),
                     enrich,
@@ -1930,6 +2044,23 @@ impl ProbeEngine {
             for (p, outcome) in pending.iter().zip(outcomes) {
                 match outcome {
                     Some(fails) => {
+                        if p.count_failure
+                            && p.row.status != "online"
+                            && p.target.status == "online"
+                            && offline_grace > 1
+                            && fails < offline_grace
+                        {
+                            // 容差内：数据库里仍是原状态（在线），对外也保持一致，
+                            // 保留旧 ping 与在线状态，只标注本轮失败次数，避免面板闪成离线。
+                            out[p.out_idx]["status"] = json!("online");
+                            if let Some(old_ping) = p.target.ping {
+                                out[p.out_idx]["ping"] = json!(old_ping);
+                            }
+                            out[p.out_idx]["error"] = json!(format!(
+                                "连续失败 {} 次，未达离线容差 {} 次，保持在线",
+                                fails, offline_grace
+                            ));
+                        }
                         if p.row.status == "online" {
                             let mut tracker = self.tracker.lock().unwrap();
                             tracker.clear_failure(&p.row.node_id);
@@ -2598,23 +2729,57 @@ pub async fn sleep_or_stop(stop: &tokio::sync::Notify, secs: f64) -> bool {
 
 /// 对应 scheduler.py 的 _probe_loop：按 probeInterval 周期批量探活（不计失败）。
 pub async fn probe_loop(engine: Arc<ProbeEngine>, stop: Arc<tokio::sync::Notify>) {
+    // 稳定轮次与节点规模共同决定下一轮等待时长：全在线时逐轮拉长，出现离线立即回到基础间隔。
+    let mut healthy_rounds: u32 = 0;
+    let mut node_count: usize = 0;
+    let mut round: usize = 0;
     loop {
         let settings = engine
             .db()
             .get_setting("system")
             .unwrap_or_else(|_| json!({}));
-        let interval = probe_interval(settings.get("probeInterval").and_then(|v| v.as_i64()));
-        if !sleep_or_stop(&stop, interval).await {
+        let base = probe_interval(settings.get("probeInterval").and_then(|v| v.as_i64()));
+        let delay = jitter_probe_delay(next_probe_delay(base, healthy_rounds, node_count));
+        if !sleep_or_stop(&stop, delay).await {
             return;
         }
         if !engine.cfg().is_running() {
             continue;
         }
-        let results =
-            <ProbeEngine as crate::wire::Prober>::probe(&engine, None, true, false, false).await;
+        let all_nodes = match engine.db().list_nodes(None, None, None) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let active_candidates: Vec<Node> = all_nodes
+            .into_iter()
+            .filter(|n| {
+                !n.base.disabled_auto.unwrap_or(false)
+                    && n.base.status.as_deref() != Some("disabled")
+            })
+            .collect();
+        let target_ids = select_batch_probe_plan(&active_candidates, round, PROBE_BATCH_PARTS);
+        round = round.wrapping_add(1);
+
+        if target_ids.is_empty() {
+            continue;
+        }
+        let results = <ProbeEngine as crate::wire::Prober>::probe(
+            &engine,
+            Some(target_ids),
+            false,
+            false,
+            false,
+        )
+        .await;
+        node_count = active_candidates.len();
         let has_offline = results
             .iter()
             .any(|r| r.get("status").and_then(|v| v.as_str()) == Some("offline"));
+        healthy_rounds = if has_offline {
+            0
+        } else {
+            healthy_rounds.saturating_add(1)
+        };
         if has_offline && engine.op().locked() {
             // 配置正在重载，给 sing-box 一点稳定期再继续。
             if !sleep_or_stop(&stop, GUARD_INTERVAL).await {
@@ -3155,6 +3320,22 @@ mod tests {
     }
 
     #[test]
+    fn probe_throttle_scales_with_stability_and_node_count() {
+        assert_eq!(next_probe_delay(60.0, 0, 0), 60.0);
+        assert_eq!(next_probe_delay(60.0, 1, 0), 90.0);
+        assert_eq!(next_probe_delay(60.0, 2, 0), 120.0);
+        assert_eq!(next_probe_delay(60.0, 3, 0), 180.0);
+        // 400 个节点：规模系数封顶 2x
+        assert_eq!(next_probe_delay(60.0, 0, 400), 120.0);
+        // 稳定第 3 轮 + 大批量：62.5% 之上继续放大，最终被 900s 上限夹住
+        assert_eq!(next_probe_delay(300.0, 3, 400), MAX_PROBE_DELAY);
+        // 低于下限的配置夹到 10s
+        assert_eq!(next_probe_delay(1.0, 0, 0), MIN_PROBE_INTERVAL);
+        let d = jitter_probe_delay(100.0);
+        assert!((MIN_PROBE_INTERVAL..=MAX_PROBE_DELAY).contains(&d));
+    }
+
+    #[test]
     fn probe_interval_and_test_url_normalization() {
         assert_eq!(probe_interval(None), PING_INTERVAL);
         assert_eq!(probe_interval(Some(1)), MIN_PROBE_INTERVAL);
@@ -3183,6 +3364,89 @@ mod tests {
             MIN_STICKY_SECONDS,
             "不得小于 5s"
         );
+    }
+
+    #[test]
+    fn offline_grace_fails_parsing() {
+        assert_eq!(parse_offline_grace_fails(Some(&json!(1))), 1);
+        assert_eq!(parse_offline_grace_fails(Some(&json!(2))), 2);
+        assert_eq!(parse_offline_grace_fails(Some(&json!(10))), 10);
+        assert_eq!(parse_offline_grace_fails(Some(&json!("5"))), 5);
+        // 超出范围 1..=10 或非法类型回落默认 2
+        assert_eq!(
+            parse_offline_grace_fails(Some(&json!(0))),
+            OFFLINE_GRACE_FAILS
+        );
+        assert_eq!(
+            parse_offline_grace_fails(Some(&json!(11))),
+            OFFLINE_GRACE_FAILS
+        );
+        assert_eq!(
+            parse_offline_grace_fails(Some(&json!(-1))),
+            OFFLINE_GRACE_FAILS
+        );
+        assert_eq!(
+            parse_offline_grace_fails(Some(&json!("abc"))),
+            OFFLINE_GRACE_FAILS
+        );
+        assert_eq!(
+            parse_offline_grace_fails(Some(&json!(true))),
+            OFFLINE_GRACE_FAILS
+        );
+        assert_eq!(parse_offline_grace_fails(None), OFFLINE_GRACE_FAILS);
+    }
+
+    #[test]
+    fn probe_interval_jitter_and_batch_rotation() {
+        // 抖动范围测试：±10%
+        assert!((jitter_probe_delay_with(180.0, 0.0) - 180.0).abs() < 1e-6);
+        assert!((jitter_probe_delay_with(180.0, 1.0) - 198.0).abs() < 1e-6);
+        assert!((jitter_probe_delay_with(180.0, -1.0) - 162.0).abs() < 1e-6);
+        // 下限夹紧到 10s
+        assert_eq!(jitter_probe_delay_with(5.0, -1.0), MIN_PROBE_INTERVAL);
+
+        // 构造 4 个稳定节点和 1 个不稳定节点
+        let make_node = |id: &str, status: &str, fails: i64| -> Node {
+            Node {
+                id: id.to_string(),
+                base: crate::types::NodeCreate {
+                    status: Some(status.to_string()),
+                    consecutive_fails: Some(fails),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+        let nodes = vec![
+            make_node("n1", "online", 0),
+            make_node("n2", "online", 0),
+            make_node("n3", "online", 0),
+            make_node("n4", "online", 0),
+            make_node("n5_unstable", "online", 1),
+        ];
+
+        let r0 = select_batch_probe_plan(&nodes, 0, 2);
+        let r1 = select_batch_probe_plan(&nodes, 1, 2);
+
+        // 不稳定节点每轮必测
+        assert!(r0.contains(&"n5_unstable".to_string()));
+        assert!(r1.contains(&"n5_unstable".to_string()));
+
+        // 稳定节点轮转：两轮合集覆盖全部 4 个稳定节点，且单轮不全量测试稳定节点
+        let mut all_stable = HashSet::new();
+        for id in &r0 {
+            if id != "n5_unstable" {
+                all_stable.insert(id.clone());
+            }
+        }
+        for id in &r1 {
+            if id != "n5_unstable" {
+                all_stable.insert(id.clone());
+            }
+        }
+        assert_eq!(all_stable.len(), 4);
+        assert!(r0.len() < nodes.len());
+        assert!(r1.len() < nodes.len());
     }
 
     #[test]
@@ -3427,7 +3691,9 @@ mod tests {
 
     #[test]
     fn constants_match_python_contract() {
-        assert_eq!(PING_INTERVAL, 60.0);
+        // 自动探活默认间隔已上调到 180s（用户反馈过于频繁）；Python 侧仍是 60s，
+        // Rust 侧再叠加稳定系数与规模系数节流。
+        assert_eq!(PING_INTERVAL, 180.0);
         assert_eq!(SUB_REFRESH_INTERVAL, 10800.0);
         assert_eq!(GUARD_INTERVAL, 10.0);
         assert_eq!(GUARD_WINDOW, 60.0);
@@ -3445,6 +3711,9 @@ mod tests {
         assert_eq!(ENRICH_COOLDOWN, 300.0);
         assert_eq!(REVIVE_INTERVAL, 600.0);
         assert_eq!(RANDOM_ROTATE_DEFAULT_INTERVAL, 30.0);
+        assert_eq!(OFFLINE_GRACE_FAILS, 2);
+        assert_eq!(PROBE_JITTER_RATIO, 0.10);
+        assert_eq!(PROBE_BATCH_PARTS, 2);
     }
 }
 
@@ -3878,7 +4147,7 @@ mod probe_tests {
         add_node(&db, "n1", 10001, "offline");
         // db 层自带 20 次连败硬闸，这里先垫到 19 次，让本轮探活刚好越线。
         for _ in 0..19 {
-            db.update_node_probe("n1", 0, "offline", true, Some(10001), Some("trojan"))
+            db.update_node_probe("n1", 0, "offline", true, Some(10001), Some("trojan"), None)
                 .expect("seed failure");
         }
         assert_eq!(
@@ -3942,7 +4211,7 @@ mod probe_tests {
         add_node(&db, "n1", 10001, "offline");
         // 垫入 3 次失败，使其达到顽固死节点阈值
         for _ in 0..3 {
-            db.update_node_probe("n1", 0, "offline", true, Some(10001), Some("trojan"))
+            db.update_node_probe("n1", 0, "offline", true, Some(10001), Some("trojan"), None)
                 .expect("seed failure");
         }
         let cfg = FakeCfg::new(true);
@@ -4556,5 +4825,97 @@ mod probe_tests {
         let usable =
             json!({ "id": "n2", "protocol": "trojan", "port": 10001, "entryProto": "mixed" });
         assert!(crate::wire::Prober::diagnose(&engine, &usable).is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_round_background_grace_keeps_online_until_threshold() {
+        let db = mem_db();
+        add_node(&db, "n1", 10001, "online");
+        // 设置初始 ping 为 88
+        db.update_node_probe("n1", 88, "online", false, Some(10001), Some("trojan"), None)
+            .expect("init probe");
+        db.set_setting("system", &json!({ "offlineGraceFails": 2 }))
+            .expect("set offlineGraceFails");
+
+        // 模拟所有探活失败（重试均返回超时）
+        let clash = Arc::new(FakeClash {
+            delays: Mutex::new(
+                (0..10)
+                    .map(|_| DelayOutcome::Retry("timeout".to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        let engine = engine_with(db.clone(), FakeCfg::new(true), clash, FakeOp::new());
+
+        // 第 1 轮后台探活失败：容差期内，应保持 online，旧 ping=88 保留，consecutive_fails 累计为 1
+        let res1 = <ProbeEngine as crate::wire::Prober>::probe(
+            &engine,
+            Some(vec!["n1".to_string()]),
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(res1.len(), 1);
+        assert_eq!(res1[0]["status"], json!("online"));
+        assert_eq!(res1[0]["ping"], json!(88));
+
+        let node_after_1 = db.get_node("n1").expect("get node").expect("node exists");
+        assert_eq!(node_after_1.base.status.as_deref(), Some("online"));
+        assert_eq!(node_after_1.base.ping, Some(88));
+        assert_eq!(node_after_1.base.consecutive_fails, Some(1));
+
+        // 第 2 轮后台探活失败：达到离线确认阈值 2，应转为 offline
+        let res2 = <ProbeEngine as crate::wire::Prober>::probe(
+            &engine,
+            Some(vec!["n1".to_string()]),
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(res2.len(), 1);
+        assert_eq!(res2[0]["status"], json!("offline"));
+
+        let node_after_2 = db.get_node("n1").expect("get node").expect("node exists");
+        assert_eq!(node_after_2.base.status.as_deref(), Some("offline"));
+        assert_eq!(node_after_2.base.consecutive_fails, Some(2));
+    }
+
+    #[tokio::test]
+    async fn probe_round_manual_probe_offline_immediately() {
+        let db = mem_db();
+        add_node(&db, "n2", 10002, "online");
+        db.update_node_probe("n2", 99, "online", false, Some(10002), Some("trojan"), None)
+            .expect("init probe");
+        db.set_setting("system", &json!({ "offlineGraceFails": 3 }))
+            .expect("set offlineGraceFails");
+
+        // 模拟探活失败（重试均返回超时）
+        let clash = Arc::new(FakeClash {
+            delays: Mutex::new(
+                (0..5)
+                    .map(|_| DelayOutcome::Retry("manual fail".to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        let engine = engine_with(db.clone(), FakeCfg::new(true), clash, FakeOp::new());
+
+        // 手动探活失败（manual = true）：不享受后台容差，立即标为 offline
+        let res = <ProbeEngine as crate::wire::Prober>::probe(
+            &engine,
+            Some(vec!["n2".to_string()]),
+            false,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0]["status"], json!("offline"));
+
+        let node_after = db.get_node("n2").expect("get node").expect("node exists");
+        assert_eq!(node_after.base.status.as_deref(), Some("offline"));
     }
 }

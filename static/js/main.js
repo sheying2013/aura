@@ -9,8 +9,11 @@ function openModal(id) {
         modalFocusStack.push({ id: id, el: document.activeElement });
     }
     el.classList.add('active');
-    // 打开导入弹窗时初始化 ss 密码框显隐联动
-    if (id === 'import-modal') toggleImportPassField();
+    // 打开导入弹窗时初始化 ss 密码框显隐联动与分组 datalist
+    if (id === 'import-modal') {
+        toggleImportPassField();
+        updateGroupFilterOptions();
+    }
     if (id === 'edit-modal') toggleEditEntryPassField();
     // 打开后把焦点送进第一个可编辑控件，键盘用户无需 Tab 找输入框
     const first = el.querySelector('input:not([type="hidden"]):not([disabled]), textarea:not([disabled]), select:not([disabled])');
@@ -1091,6 +1094,19 @@ function updateGroupFilterOptions() {
         const optionValues = new Set(Array.from(select.options, option => option.value));
         select.value = optionValues.has(currentVal) ? currentVal : 'ALL';
     });
+
+    // 填充批量导入（内联与弹窗）的分组 datalist，支持选择已有分组或输入新分组
+    ['import-group-list', 'modal-import-group-list'].forEach(id => {
+        const dl = document.getElementById(id);
+        if (!dl) return;
+        dl.innerHTML = '';
+        groups.forEach(g => {
+            if (g === 'ALL') return;
+            const opt = document.createElement('option');
+            opt.value = g;
+            dl.appendChild(opt);
+        });
+    });
 }
 
 /** 仪表盘 Relay Exit Status：渲染全部轮询域名入口（域名:端口 徽标） */
@@ -1640,9 +1656,12 @@ async function exportSingleNode(nodeId) {
     if (uriLines.length === 0) {
         showToast(`节点 [${node.name}] 没有可导出的原始链接`, 'warn');
         addLog('WARN', `节点 [${node.name}] 没有可导出的原始链接`);
+        updateExportSkipHint(1, exportType);
         return;
     }
-    const text = `# 节点: ${node.name.replace(/[\r\n]+/g, ' ')} | 协议: ${(node.protocol || '').toUpperCase()}${exportType === 'original' ? ' | 原始链接' : ''}\n${uriLines.join('\n')}`;
+    updateExportSkipHint(0, exportType);
+    const headerPrefix = exportType === 'original' ? '# 原始节点链接导出\n' : '';
+    const text = `${headerPrefix}# 节点: ${node.name.replace(/[\r\n]+/g, ' ')} | 协议: ${(node.protocol || '').toUpperCase()}${exportType === 'original' ? ' | 原始链接' : ''}\n${uriLines.join('\n')}`;
     const area = document.getElementById('export-text-area');
     if (area) {
         area.value = text;
@@ -2396,27 +2415,268 @@ function exportLinkLines(node, vpsIp, protoSel) {
     return lines;
 }
 
+/** 安全 base64 编码（支持 UTF-8 字符） */
+function safeBtoa(str) {
+    try {
+        const bytes = new TextEncoder().encode(str);
+        return btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''));
+    } catch (_) {
+        return '';
+    }
+}
+
+/** 从 rawConfig 重建原始节点链接（uri 缺失时的反序列化降级） */
+function reconstructOriginalUri(node) {
+    if (!node) return null;
+    const raw = (node.rawConfig && typeof node.rawConfig === 'object') ? node.rawConfig : {};
+    const host = (raw.server || raw.address || '').trim();
+    const port = parseInt(raw.server_port || raw.port, 10);
+    if (!host || !port || isNaN(port) || port <= 0 || port > 65535) {
+        return null;
+    }
+    const proto = (node.protocol || raw.type || raw.protocol || '').toLowerCase();
+    const name = (node.name || '').trim();
+    const tag = name ? `#${encodeURIComponent(name)}` : '';
+    const formattedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+
+    // 1. Shadowsocks (SIP002: ss://base64(method:password)@host:port#name)
+    if (proto === 'shadowsocks' || proto === 'ss') {
+        const method = (raw.method || raw.cipher || '').trim();
+        const password = (raw.password || '').trim();
+        if (!method || !password) return null;
+        const userinfo = safeBtoa(`${method}:${password}`).replace(/=/g, '');
+        return `ss://${userinfo}@${formattedHost}:${port}${tag}`;
+    }
+
+    // 2. VMess (vmess://base64(JSON))
+    if (proto === 'vmess') {
+        const uuid = (raw.uuid || raw.id || '').trim();
+        if (!uuid) return null;
+        const tlsObj = raw.tls && typeof raw.tls === 'object' ? raw.tls : null;
+        const transport = raw.transport && typeof raw.transport === 'object' ? raw.transport : null;
+        const tlsEnabled = (tlsObj && (tlsObj.enabled === true || tlsObj.enabled === 'true')) || !!raw.sni;
+        const vmessData = {
+            v: '2',
+            ps: name,
+            add: host,
+            port: port,
+            id: uuid,
+            aid: parseInt(raw.alterId || raw.aid || 0, 10) || 0,
+            scy: (raw.security || raw.method || 'auto').trim(),
+            net: (transport && transport.type) || raw.network || 'tcp',
+            type: (transport && transport.headerType) || 'none',
+            host: (transport && transport.headers && transport.headers.Host) ||
+                  (transport && transport.service_name) ||
+                  (transport && Array.isArray(transport.host) ? transport.host[0] : (transport && transport.host)) || '',
+            path: (transport && transport.path) || '',
+            tls: tlsEnabled ? 'tls' : '',
+            sni: (tlsObj && tlsObj.server_name) || raw.sni || '',
+            alpn: (tlsObj && Array.isArray(tlsObj.alpn) ? tlsObj.alpn.join(',') : (tlsObj && tlsObj.alpn)) || '',
+            fp: (tlsObj && tlsObj.utls && tlsObj.utls.fingerprint) || ''
+        };
+        return `vmess://${safeBtoa(JSON.stringify(vmessData))}`;
+    }
+
+    // 3. VLESS (vless://uuid@host:port?query#name)
+    if (proto === 'vless') {
+        const uuid = (raw.uuid || raw.id || '').trim();
+        if (!uuid) return null;
+        const params = [];
+        params.push('encryption=none');
+        const tlsObj = raw.tls && typeof raw.tls === 'object' ? raw.tls : null;
+        const transport = raw.transport && typeof raw.transport === 'object' ? raw.transport : null;
+
+        let security = 'none';
+        if (tlsObj && tlsObj.reality && (tlsObj.reality.enabled === true || tlsObj.reality.public_key)) {
+            security = 'reality';
+        } else if (tlsObj && (tlsObj.enabled === true || tlsObj.enabled === 'true')) {
+            security = 'tls';
+        } else if (raw.security) {
+            security = raw.security;
+        }
+        if (security && security !== 'none') {
+            params.push(`security=${encodeURIComponent(security)}`);
+        }
+        if (security === 'reality') {
+            const pbk = (tlsObj && tlsObj.reality && tlsObj.reality.public_key) || raw.pbk || '';
+            const sid = (tlsObj && tlsObj.reality && tlsObj.reality.short_id) || raw.sid || '';
+            if (pbk) params.push(`pbk=${encodeURIComponent(pbk)}`);
+            if (sid) params.push(`sid=${encodeURIComponent(sid)}`);
+        }
+        const sni = (tlsObj && tlsObj.server_name) || raw.sni || '';
+        if (sni) params.push(`sni=${encodeURIComponent(sni)}`);
+        const fp = (tlsObj && tlsObj.utls && tlsObj.utls.fingerprint) || raw.fp || (security === 'reality' ? 'chrome' : '');
+        if (fp) params.push(`fp=${encodeURIComponent(fp)}`);
+        const alpn = (tlsObj && Array.isArray(tlsObj.alpn) ? tlsObj.alpn.join(',') : (tlsObj && tlsObj.alpn)) || '';
+        if (alpn) params.push(`alpn=${encodeURIComponent(alpn)}`);
+        if (tlsObj && (tlsObj.insecure === true || tlsObj.insecure === 'true')) {
+            params.push('insecure=1');
+        }
+        if (raw.flow) {
+            params.push(`flow=${encodeURIComponent(raw.flow)}`);
+        }
+        const transportType = (transport && transport.type) || 'tcp';
+        if (transportType && transportType !== 'tcp') {
+            params.push(`type=${encodeURIComponent(transportType)}`);
+        }
+        if (transport && transport.headerType) {
+            params.push(`headerType=${encodeURIComponent(transport.headerType)}`);
+        }
+        if (transport && transport.path) {
+            params.push(`path=${encodeURIComponent(transport.path)}`);
+        }
+        const transportHost = (transport && transport.headers && transport.headers.Host) ||
+                              (transport && Array.isArray(transport.host) ? transport.host[0] : (transport && transport.host)) || '';
+        if (transportHost) {
+            params.push(`host=${encodeURIComponent(transportHost)}`);
+        }
+        if (transport && transport.service_name) {
+            params.push(`serviceName=${encodeURIComponent(transport.service_name)}`);
+        }
+        const qs = params.length > 0 ? `?${params.join('&')}` : '';
+        return `vless://${encodeURIComponent(uuid)}@${formattedHost}:${port}${qs}${tag}`;
+    }
+
+    // 4. Trojan (trojan://password@host:port?query#name)
+    if (proto === 'trojan') {
+        const password = (raw.password || '').trim();
+        if (!password) return null;
+        const params = [];
+        const tlsObj = raw.tls && typeof raw.tls === 'object' ? raw.tls : null;
+        const transport = raw.transport && typeof raw.transport === 'object' ? raw.transport : null;
+        const sni = (tlsObj && tlsObj.server_name) || raw.sni || '';
+        if (sni) params.push(`sni=${encodeURIComponent(sni)}`);
+        const alpn = (tlsObj && Array.isArray(tlsObj.alpn) ? tlsObj.alpn.join(',') : (tlsObj && tlsObj.alpn)) || '';
+        if (alpn) params.push(`alpn=${encodeURIComponent(alpn)}`);
+        const fp = (tlsObj && tlsObj.utls && tlsObj.utls.fingerprint) || '';
+        if (fp) params.push(`fp=${encodeURIComponent(fp)}`);
+        if (tlsObj && (tlsObj.insecure === true || tlsObj.insecure === 'true')) {
+            params.push('allowInsecure=1');
+        }
+        const transportType = (transport && transport.type) || '';
+        if (transportType && transportType !== 'tcp') {
+            params.push(`type=${encodeURIComponent(transportType)}`);
+        }
+        if (transport && transport.path) {
+            params.push(`path=${encodeURIComponent(transport.path)}`);
+        }
+        const transportHost = (transport && transport.headers && transport.headers.Host) ||
+                              (transport && Array.isArray(transport.host) ? transport.host[0] : (transport && transport.host)) || '';
+        if (transportHost) {
+            params.push(`host=${encodeURIComponent(transportHost)}`);
+        }
+        if (transport && transport.service_name) {
+            params.push(`serviceName=${encodeURIComponent(transport.service_name)}`);
+        }
+        const qs = params.length > 0 ? `?${params.join('&')}` : '';
+        return `trojan://${encodeURIComponent(password)}@${formattedHost}:${port}${qs}${tag}`;
+    }
+
+    // 5. Hysteria2 (hysteria2://password@host:port?query#name)
+    if (proto === 'hysteria2' || proto === 'hy2') {
+        const password = (raw.password || raw.auth || '').trim();
+        if (!password) return null;
+        const params = [];
+        const sni = (raw.sni || (raw.tls && raw.tls.server_name) || '').trim();
+        if (sni) params.push(`sni=${encodeURIComponent(sni)}`);
+        if (raw.insecure || (raw.tls && raw.tls.insecure)) {
+            params.push('insecure=1');
+        }
+        if (raw.obfs) {
+            params.push(`obfs=${encodeURIComponent(raw.obfs)}`);
+        }
+        const obfsPassword = raw.obfsPassword || raw['obfs-password'];
+        if (obfsPassword) {
+            params.push(`obfs-password=${encodeURIComponent(obfsPassword)}`);
+        }
+        const qs = params.length > 0 ? `?${params.join('&')}` : '';
+        return `hysteria2://${encodeURIComponent(password)}@${formattedHost}:${port}${qs}${tag}`;
+    }
+
+    // 6. TUIC (tuic://uuid:password@host:port?query#name)
+    if (proto === 'tuic') {
+        const uuid = (raw.uuid || '').trim();
+        const password = (raw.password || '').trim();
+        if (!uuid || !password) return null;
+        const params = [];
+        const sni = (raw.sni || (raw.tls && raw.tls.server_name) || '').trim();
+        if (sni) params.push(`sni=${encodeURIComponent(sni)}`);
+        const qs = params.length > 0 ? `?${params.join('&')}` : '';
+        return `tuic://${encodeURIComponent(uuid)}:${encodeURIComponent(password)}@${formattedHost}:${port}${qs}${tag}`;
+    }
+
+    // 7. SSR (ssr://base64(host:port:protocol:method:obfs:base64(password)/?params))
+    if (proto === 'ssr') {
+        const password = (raw.password || '').trim();
+        if (!password) return null;
+        const ssrProtocol = raw.protocol || 'origin';
+        const ssrMethod = raw.method || raw.cipher || 'aes-256-cfb';
+        const ssrObfs = raw.obfs || 'plain';
+        const b64pass = safeBtoa(password).replace(/=/g, '');
+        const remarksParam = name ? `remarks=${safeBtoa(name).replace(/=/g, '')}` : '';
+        const body = `${host}:${port}:${ssrProtocol}:${ssrMethod}:${ssrObfs}:${b64pass}${remarksParam ? '/?' + remarksParam : ''}`;
+        return `ssr://${safeBtoa(body).replace(/=/g, '')}`;
+    }
+
+    // 8. SOCKS5 / HTTP (proto://[user:pass@]host:port#name)
+    if (proto === 'socks5' || proto === 'socks' || proto === 'http' || proto === 'https') {
+        const scheme = (proto === 'http' || proto === 'https') ? 'http' : 'socks5';
+        const username = (raw.username || raw.user || '').trim();
+        const password = (raw.password || raw.pass || '').trim();
+        const auth = username ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@` : '';
+        return `${scheme}://${auth}${formattedHost}:${port}${tag}`;
+    }
+
+    return null;
+}
+
+/** 提示跳过的无法重建原始链接的节点数量 */
+function updateExportSkipHint(skippedCount, exportType) {
+    const hintEl = document.getElementById('export-skip-hint');
+    if (!hintEl) return;
+    if (exportType === 'original' && skippedCount > 0) {
+        hintEl.textContent = `${skippedCount} 个节点无可用原始链接，已跳过`;
+        hintEl.style.display = 'block';
+    } else {
+        hintEl.textContent = '';
+        hintEl.style.display = 'none';
+    }
+}
+
 /** 按导出类型取节点链接行：converted=本机转换后入口，original=原始链接 */
 function exportNodeLines(node, vpsIp, protoSel, exportType) {
     if (exportType === 'original') {
         const uri = node.rawConfig && node.rawConfig.uri;
-        if (!uri) return [];
-        // 原始链接原样透出，但消毒换行符——否则节点名/URI 内嵌 \n 会截断导出行
-        // （converted 走 encodeURIComponent 天然安全；original 必须显式消毒）
-        return [uri.replace(/[\r\n]+/g, ' ')];
+        if (uri) {
+            // 原始链接原样透出，但消毒换行符——否则节点名/URI 内嵌 \n 会截断导出行
+            return [uri.replace(/[\r\n]+/g, ' ')];
+        }
+        const reconstructed = reconstructOriginalUri(node);
+        if (reconstructed) {
+            return [reconstructed.replace(/[\r\n]+/g, ' ')];
+        }
+        return [];
     }
     return exportLinkLines(node, vpsIp, protoSel);
 }
 
 function buildNodeExportText(nodes, vpsIp, protoSel, exportType) {
     const lines = [];
+    let skippedCount = 0;
     nodes.forEach(n => {
         const uriLines = exportNodeLines(n, vpsIp, protoSel, exportType);
-        if (uriLines.length === 0) return;
+        if (uriLines.length === 0) {
+            skippedCount++;
+            return;
+        }
         lines.push(`# 节点: ${(n.name || '').replace(/[\r\n]+/g, ' ')} | 协议: ${n.protocol} | 分组: ${(n.group || '').replace(/[\r\n]+/g, ' ')}${exportType === 'original' ? ' | 原始链接' : ''}`);
         lines.push(...uriLines);
         lines.push('');
     });
+    if (exportType === 'original' && lines.length > 0) {
+        lines.unshift('# 原始节点链接导出\n');
+    }
+    updateExportSkipHint(skippedCount, exportType);
     return lines.join('\n');
 }
 
