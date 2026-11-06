@@ -3,6 +3,12 @@
 # 供 systemd 服务 / 手动启动 / aura CLI 重启 统一使用
 set -e
 cd "$(dirname "$0")"
+
+# 优先使用自身目录 .venv/bin，确保 venv 生效
+if [ -d .venv/bin ]; then
+  export PATH="$(pwd)/.venv/bin:$PATH"
+fi
+
 PORT=$(python3 -c "import panel_config; print(panel_config.get('port') or 19001)" 2>/dev/null || echo 19001)
 mkdir -p data static/js
 # 仓库根的前端资源为权威源；Docker 已在构建时复制，容器内无需根文件。

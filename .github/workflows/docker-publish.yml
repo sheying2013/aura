@@ -13,11 +13,46 @@ on:
       - 'backend/**'
       - 'aura-rs/**'
       - 'index.html'
-      - 'subs.js'
+      - 'static/**'
   workflow_dispatch:
 
 jobs:
+  rust-test:
+    name: Rust Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aura-rs -> target
+      - name: cargo test
+        working-directory: aura-rs
+        run: cargo test --lib
+
+  python-test:
+    name: Python Regression Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-subtests pytest-asyncio
+      - name: Run Python regressions (exclude browser)
+        env:
+          PYTHONPATH: .
+        run: |
+          pytest -v --ignore=tests/test_frontend_browser.py
+
   build-push:
+    name: Build & Push Image
+    needs: [rust-test, python-test]
     runs-on: ubuntu-latest
     permissions:
       contents: read

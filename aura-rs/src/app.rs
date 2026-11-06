@@ -518,6 +518,20 @@ async fn update_node_port(
     }
 }
 
+fn apply_outcome(result: Result<Value, String>) -> (bool, String) {
+    match result {
+        Ok(applied) => (
+            applied.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+            applied
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+        Err(error) => (false, error),
+    }
+}
+
 async fn convert_entry(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult<Response> {
     let req: EntryConvertRequest = parse_body(body)?;
     let entry = req.entry_proto.trim().to_string();
@@ -565,13 +579,15 @@ async fn convert_entry(State(st): State<AppState>, Json(body): Json<Value>) -> A
             }
         }
     }
-    let _ = st.cfg.apply(None).await;
+    let (config_applied, config_message) = apply_outcome(st.cfg.apply(None).await);
     Ok(Json(json!({
         "ok": true,
         "converted": converted,
         "failed": failed,
         "errors": errors,
         "items": items,
+        "configApplied": config_applied,
+        "configMessage": config_message,
     }))
     .into_response())
 }
@@ -623,24 +639,14 @@ async fn batch_group(State(st): State<AppState>, Json(body): Json<Value>) -> Api
         return Err(ApiError::bad_request("group 不能为空"));
     }
     let updated = st.db.update_nodes_group(&ids, &group).map_err(db_err)?;
-    match st.cfg.apply(None).await {
-        Ok(applied) => {
-            let ok = applied.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-            let message = applied
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            Ok(Json(json!({
-                "ok": true,
-                "updated": updated,
-                "configApplied": ok,
-                "configMessage": message,
-            }))
-            .into_response())
-        }
-        Err(_) => Ok(Json(json!({})).into_response()),
-    }
+    let (config_applied, config_message) = apply_outcome(st.cfg.apply(None).await);
+    Ok(Json(json!({
+        "ok": true,
+        "updated": updated,
+        "configApplied": config_applied,
+        "configMessage": config_message,
+    }))
+    .into_response())
 }
 
 async fn rename_group(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult<Response> {
@@ -663,11 +669,13 @@ async fn rename_group(State(st): State<AppState>, Json(body): Json<Value>) -> Ap
     if r.updated == 0 && r.relay_updated == 0 {
         return Err(ApiError::not_found(format!("分组 [{}] 不存在", old)));
     }
-    let _ = st.cfg.apply(None).await;
+    let (config_applied, config_message) = apply_outcome(st.cfg.apply(None).await);
     Ok(Json(json!({
         "ok": true,
         "updated": r.updated,
         "relayUpdated": r.relay_updated,
+        "configApplied": config_applied,
+        "configMessage": config_message,
     }))
     .into_response())
 }
@@ -783,12 +791,12 @@ async fn config_start(State(st): State<AppState>) -> ApiResult<Response> {
 }
 
 async fn config_stop(State(st): State<AppState>) -> ApiResult<Response> {
-    let _ = st.cfg.stop().await;
+    st.cfg.stop().await.map_err(ApiError::internal)?;
     Ok(Json(json!({ "running": false })).into_response())
 }
 
 async fn config_restart(State(st): State<AppState>) -> ApiResult<Response> {
-    let _ = st.cfg.stop().await;
+    st.cfg.stop().await.map_err(ApiError::internal)?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let running = st.cfg.start().await.map_err(ApiError::internal)?;
     Ok(Json(json!({ "running": running })).into_response())
@@ -1289,13 +1297,13 @@ async fn put_settings(State(st): State<AppState>, Json(raw): Json<Value>) -> Api
             changed.insert(k);
         }
     }
-    st.db.set_setting("system", &current).map_err(db_err)?;
     let export_domain = current
         .get("exportDomain")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     if changed.len() == 1 && changed.contains("exportDomain") {
+        st.db.set_setting("system", &current).map_err(db_err)?;
         return Ok(Json(json!({
             "ok": true,
             "configApplied": true,
@@ -1305,32 +1313,26 @@ async fn put_settings(State(st): State<AppState>, Json(raw): Json<Value>) -> Api
         }))
         .into_response());
     }
-    if let Some(arr) = current.get("relayDomains").and_then(|v| v.as_array()) {
-        if let Ok(domains) = serde_json::from_value::<Vec<RelayDomain>>(Value::Array(arr.clone())) {
-            if let Err(e) = st.db.upsert_relay_domains(&domains) {
-                tracing::error!("upsert_relay_domains 失败: {e}");
-            }
-        }
-    }
-    match st.cfg.apply(None).await {
-        Ok(applied) => {
-            let ok = applied.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-            let message = applied
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            Ok(Json(json!({
-                "ok": true,
-                "configApplied": ok,
-                "configReloaded": ok,
-                "configMessage": message,
-                "exportDomain": export_domain,
-            }))
-            .into_response())
-        }
-        Err(_) => Ok(Json(json!({})).into_response()),
-    }
+    let domains = current
+        .get("relayDomains")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            serde_json::from_value::<Vec<RelayDomain>>(Value::Array(arr.clone()))
+                .map_err(|e| ApiError::unprocessable(format!("轮询入口格式无效: {e}")))
+        })
+        .transpose()?;
+    st.db
+        .set_system_settings(&current, domains.as_deref())
+        .map_err(db_err)?;
+    let (config_applied, config_message) = apply_outcome(st.cfg.apply(None).await);
+    Ok(Json(json!({
+        "ok": true,
+        "configApplied": config_applied,
+        "configReloaded": config_applied,
+        "configMessage": config_message,
+        "exportDomain": export_domain,
+    }))
+    .into_response())
 }
 
 // ===================== 路由 =====================
@@ -1475,6 +1477,8 @@ mod tests {
         running: AtomicBool,
         applied: Mutex<Vec<Option<Value>>>,
         fail_apply: AtomicBool,
+        fail_stop: AtomicBool,
+        start_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl ConfigService for FakeConfig {
@@ -1500,12 +1504,16 @@ mod tests {
         }
         fn start(&self) -> BoxFut<'_, Result<bool, String>> {
             Box::pin(async move {
+                self.start_calls.fetch_add(1, Ordering::SeqCst);
                 self.running.store(true, Ordering::SeqCst);
                 Ok(true)
             })
         }
         fn stop(&self) -> BoxFut<'_, Result<(), String>> {
             Box::pin(async move {
+                if self.fail_stop.load(Ordering::SeqCst) {
+                    return Err("stop failed".to_string());
+                }
                 self.running.store(false, Ordering::SeqCst);
                 Ok(())
             })
@@ -1987,6 +1995,121 @@ mod tests {
         );
         assert_eq!(saved["probeInterval"], json!(60));
         assert_eq!(cfg.applied.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settings_relay_write_failure_rolls_back_and_skips_apply() {
+        let (router, db, cfg) = build();
+        db.execute(
+            "INSERT INTO relay_domains (id,domain,port,auth_user,auth_pass,groups) VALUES (?,?,?,?,?,?)",
+            rusqlite::params!["old", "old.example", 33440, "u", "p", "[\"ALL\"]"],
+        ).unwrap();
+        db.set_setting("system", &json!({"probeInterval":30}))
+            .unwrap();
+        db.execute(
+            "CREATE TRIGGER fail_relay BEFORE INSERT ON relay_domains BEGIN SELECT RAISE(ABORT, 'forced failure'); END",
+            &[],
+        ).unwrap();
+        let (status, body) = call(
+            router,
+            "PUT",
+            "/api/settings",
+            Some(json!({
+                "probeInterval":60,
+                "relayDomains":[{"id":"new","domain":"new.example","port":33441}]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(
+            db.get_setting_or("system", json!({})).unwrap()["probeInterval"],
+            json!(30)
+        );
+        let relays = db.list_relay_domains().unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].domain, "old.example");
+        assert!(cfg.applied.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn settings_apply_error_is_not_reported_as_success() {
+        let (router, _db, cfg) = build();
+        cfg.fail_apply.store(true, Ordering::SeqCst);
+        let (status, body) = call(
+            router,
+            "PUT",
+            "/api/settings",
+            Some(json!({"probeInterval":60})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["configApplied"], json!(false));
+        assert_eq!(body["configMessage"], json!("apply failed"));
+        assert_eq!(body["configReloaded"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn batch_group_preserves_count_and_reports_apply_error() {
+        let (router, db, cfg) = build();
+        let node: NodeCreate = serde_json::from_value(node_body("n1", 52001)).unwrap();
+        let created = db.create_node(&node).unwrap();
+        cfg.fail_apply.store(true, Ordering::SeqCst);
+        let (status, body) = call(
+            router,
+            "POST",
+            "/api/nodes/batch-group",
+            Some(json!({"ids":[created.id],"group":"G"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["updated"], json!(1));
+        assert_eq!(body["configApplied"], json!(false));
+        assert_eq!(body["configMessage"], json!("apply failed"));
+    }
+
+    #[tokio::test]
+    async fn rename_and_convert_report_apply_errors() {
+        let (router, db, cfg) = build();
+        let node: NodeCreate = serde_json::from_value(json!({
+            "name":"n1","protocol":"socks5","port":52001,"group":"old","entryProto":"mixed"
+        }))
+        .unwrap();
+        let created = db.create_node(&node).unwrap();
+        cfg.fail_apply.store(true, Ordering::SeqCst);
+        let (status, body) = call(
+            router.clone(),
+            "POST",
+            "/api/groups/rename",
+            Some(json!({"oldName":"old","newName":"new"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["updated"], json!(1));
+        assert_eq!(body["configApplied"], json!(false));
+        assert_eq!(body["configMessage"], json!("apply failed"));
+        let (status, body) = call(
+            router,
+            "POST",
+            "/api/nodes/convert-entry",
+            Some(json!({"ids":[created.id],"entryProto":"ss","ssPass":"pw"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["converted"], json!(1));
+        assert_eq!(body["configApplied"], json!(false));
+        assert_eq!(body["configMessage"], json!("apply failed"));
+    }
+
+    #[tokio::test]
+    async fn stop_and_restart_propagate_stop_errors() {
+        let (router, _db, cfg) = build();
+        cfg.fail_stop.store(true, Ordering::SeqCst);
+        let (status, body) = call(router.clone(), "POST", "/api/config/stop", None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["detail"], json!("stop failed"));
+        let (status, body) = call(router, "POST", "/api/config/restart", None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(cfg.start_calls.load(Ordering::SeqCst), 0);
     }
 
     // ---------- 统计 / 配置 ----------

@@ -15,10 +15,12 @@ function openModal(id) {
         updateGroupFilterOptions();
     }
     if (id === 'edit-modal') toggleEditEntryPassField();
-    // 打开后把焦点送进第一个可编辑控件，键盘用户无需 Tab 找输入框
+    // 仅在用户尚未改变焦点时自动聚焦，避免延迟回调抢走正在输入的控件。
+    const focusBeforeAutoFocus = document.activeElement;
     const first = el.querySelector('input:not([type="hidden"]):not([disabled]), textarea:not([disabled]), select:not([disabled])');
     if (first) {
         setTimeout(() => {
+            if (!el.classList.contains('active') || document.activeElement !== focusBeforeAutoFocus) return;
             try {
                 first.focus();
                 if (first.select && (first.tagName === 'INPUT' || first.tagName === 'TEXTAREA')) first.select();
@@ -2094,7 +2096,6 @@ async function handleBatchGroup() {
         });
         const data = await r.json().catch(() => ({}));
         const updated = (data && data.updated) || 0;
-        addLog('SUCCESS', `已将 ${updated} 个节点分组改为 [${group}]`);
         // 分组是节点属性：本地重载节点（分组影响 relay 轮询池，后端已重建配置）
         selectedNodeIds.clear();
         closeModal('batch-group-modal', true);   // 提交成功后代码主动关闭
@@ -2102,8 +2103,11 @@ async function handleBatchGroup() {
         updateGroupFilterOptions();
         renderDashRelayStatus();
         if (data && data.configApplied === false) {
-            addLog('WARN', `分组已修改，但配置未生效：${data.configMessage || ''}`);
-            showToast(`分组已修改，但配置未生效：${data.configMessage || '请查看系统日志'}`, 'warn', 5000);
+            const warnMsg = `已将 ${updated} 个节点分组改为 [${group}]，但配置未生效：${data.configMessage || '请查看系统日志'}`;
+            addLog('WARN', warnMsg);
+            showToast(warnMsg, 'warn', 5000);
+        } else {
+            addLog('SUCCESS', `已将 ${updated} 个节点分组改为 [${group}]`);
         }
     } catch (e) {
         const errEl = document.getElementById('batch-group-error');
@@ -2357,11 +2361,18 @@ async function renameGroup() {
     const newName = await auraPrompt(`将分组 [${oldName}] 重命名为:`);
     if (!newName) return;
     try {
-        await api('/api/groups/rename', {
+        const r = await api('/api/groups/rename', {
             method: 'POST',
             body: JSON.stringify({ oldName, newName })
         });
-        addLog('SUCCESS', `分组重命名成功: ${oldName} -> ${newName}`);
+        const data = await r.json().catch(() => ({}));
+        if (data && data.configApplied === false) {
+            const warnMsg = `分组重命名成功: ${oldName} -> ${newName}，但配置未生效：${data.configMessage || '请查看系统日志'}`;
+            addLog('WARN', warnMsg);
+            showToast(warnMsg, 'warn', 5000);
+        } else {
+            addLog('SUCCESS', `分组重命名成功: ${oldName} -> ${newName}`);
+        }
         await loadNodes();
     } catch (e) {
         showToast('分组重命名出错: ' + e.message, 'error');
@@ -2870,7 +2881,13 @@ async function handleConvertEntry() {
         });
         const data = await r.json();
         closeModal('convert-entry-modal', true);   // 提交成功后代码主动关闭
-        addLog('SUCCESS', `已批量转换 ${data.converted} 个节点入口协议为 ${direction}`);
+        if (data && data.configApplied === false) {
+            const warnMsg = `已批量转换 ${data.converted} 个节点入口协议为 ${direction}，但配置未生效：${data.configMessage || '请查看系统日志'}`;
+            addLog('WARN', warnMsg);
+            showToast(warnMsg, 'warn', 5000);
+        } else {
+            addLog('SUCCESS', `已批量转换 ${data.converted} 个节点入口协议为 ${direction}`);
+        }
         await loadNodes();
     } catch (e) {
         const errEl = document.getElementById('convert-error');

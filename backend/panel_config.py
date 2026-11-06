@@ -12,7 +12,8 @@ import json
 import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONF_PATH = os.path.join(BASE_DIR, "data", "panel.conf")
+DATA_DIR = os.path.abspath(os.environ["AURA_DATA_DIR"]) if os.environ.get("AURA_DATA_DIR") else os.path.join(BASE_DIR, "data")
+CONF_PATH = os.path.join(DATA_DIR, "panel.conf")
 
 _DEFAULTS = {
     "port": 19001,

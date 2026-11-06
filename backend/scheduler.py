@@ -19,6 +19,30 @@ GUARD_INTERVAL = 10  # 秒
 MAX_RESTARTS_PER_MIN = 3
 GUARD_WINDOW = 60  # 秒：崩溃重启的滑动统计窗口（测试可调小）
 
+OFFLINE_GRACE_FAILS = 2
+MIN_OFFLINE_GRACE_FAILS = 1
+MAX_OFFLINE_GRACE_FAILS = 10
+
+
+def parse_offline_grace_fails(val: Any) -> int:
+    """离线确认容差阈值：从 settings 解析并校验范围 1..=10，非法或未设置回落默认 2。"""
+    if val is None or isinstance(val, bool):
+        return OFFLINE_GRACE_FAILS
+    try:
+        if isinstance(val, (int, float)):
+            i = int(val)
+            if MIN_OFFLINE_GRACE_FAILS <= i <= MAX_OFFLINE_GRACE_FAILS:
+                return i
+            return OFFLINE_GRACE_FAILS
+        if isinstance(val, str):
+            i = int(val.strip())
+            if MIN_OFFLINE_GRACE_FAILS <= i <= MAX_OFFLINE_GRACE_FAILS:
+                return i
+            return OFFLINE_GRACE_FAILS
+    except (ValueError, TypeError):
+        pass
+    return OFFLINE_GRACE_FAILS
+
 # IP 情报惰性补查：信号量限并发（ipinfo.io 免费 5 万次/月），仅补缺情报的节点
 _ip_enrich_sem = asyncio.Semaphore(8)
 _ip_enrich_pending: set = set()  # 防同一节点并发重复查
@@ -268,7 +292,9 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
     generation = cm.operation_generation()
     nodes = db.list_nodes()
     _prune_probe_hist({n["id"] for n in nodes})
-    _test_url = (db.get_setting("system", {}) or {}).get("testUrl", "https://www.gstatic.com/generate_204")
+    system_settings = db.get_setting("system", {}) or {}
+    offline_grace = parse_offline_grace_fails(system_settings.get("offlineGraceFails"))
+    _test_url = system_settings.get("testUrl", "https://www.gstatic.com/generate_204")
     if not _test_url or not str(_test_url).startswith("https://"):
         _test_url = "https://www.gstatic.com/generate_204"
     _hdrs = {"Authorization": f"Bearer {cm.get_clash_secret()}"}
@@ -310,6 +336,7 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
         if _probe_tags.get(nid, tag_version) != tag_version:
             _reset_probe_observation(nid)
         _probe_tags[nid] = tag_version
+        actual_online = (res["status"] == "online")
         if node.get("status") == "disabled":
             if res["status"] != "online":
                 res["status"] = "disabled"
@@ -322,12 +349,33 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
             _record_probe(nid, True)
             need_rebuild = True
         else:
-            fails = db.update_node_probe(nid, res["ping"], res["status"],
-                                         count_failure=not manual, **expected)
+            raw_status = res["status"]
+            fails = db.update_node_probe(nid, res["ping"], raw_status,
+                                         count_failure=not manual,
+                                         offline_grace_fails=offline_grace, **expected)
             if fails is None:
                 res.update(status="unknown", error="节点状态或探活 tag 已变，本轮结果已跳过")
                 continue
-            if res["status"] == "online":
+
+            in_grace = (
+                not manual
+                and raw_status != "online"
+                and node.get("status") == "online"
+                and offline_grace > 1
+                and fails < offline_grace
+            )
+            if in_grace:
+                # update_node_probe 已在同一 SQL 中保留在线状态与旧 ping。
+                old_ping = int(node.get("ping") or 0)
+                res["status"] = "online"
+                if node.get("ping") is not None:
+                    res["ping"] = old_ping
+                res["error"] = f"连续失败 {fails} 次，未达离线容差 {offline_grace} 次，保持在线"
+                node["status"] = "online"
+                node["ping"] = old_ping
+                node["consecutiveFails"] = fails
+
+            if raw_status == "online":
                 _probe_failure_since.pop(nid, None)
                 if not manual:
                     _record_probe(nid, True)
@@ -346,7 +394,7 @@ async def _probe_nodes_inner(ids: Optional[List[str]] = None, all_: bool = True,
                     if db.disable_node_after_probe(nid, expected_fails=fails, **expected):
                         res["status"] = "disabled"
                         need_rebuild = True
-        if res["status"] == "online":
+        if res["status"] == "online" and actual_online:
             node["status"] = "online"
             _lazy_enrich_ip(node)
     if need_rebuild:

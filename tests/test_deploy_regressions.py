@@ -13,13 +13,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DeployRegressionTests(unittest.TestCase):
-    def deploy(self, *, stored=None, override=None, probe_code="200", old_image=None, fail_run=False, fail_old_run=False, fail_discovery=None, fail_rm=False, signal_at_sleep=False, conf_mode=None):
+    def deploy(self, *, stored=None, override=None, probe_code="200", rollback_probe_code="200", old_image=None, fail_run=False, fail_old_run=False, fail_discovery=None, fail_rm=False, fail_stop=False, signal_at_sleep=False, conf_mode=None, mutate_db=False, db_sidecars=False, fail_db_restore=False, ready_after=None):
         with tempfile.TemporaryDirectory(prefix="aura deploy ") as tmp:
             root = Path(tmp)
             data = root / "data"
             data.mkdir()
             # Prevent the legacy migration path from touching any real local database.
             (data / "panel.db").write_text("local fixture")
+            if db_sidecars:
+                (data / "panel.db-wal").write_text("old wal")
+                (data / "panel.db-shm").write_text("old shm")
             conf = data / "panel.conf"
             if stored is not None:
                 conf.write_text(json.dumps(stored))
@@ -83,7 +86,15 @@ class DeployRegressionTests(unittest.TestCase):
                     "    else:\n"
                     "        print('Error: No such container: ' + sys.argv[4], file=sys.stderr)\n"
                     "        sys.exit(1)\n"
+                    "elif sys.argv[1:2] == ['stop']:\n"
+                    "    if os.environ.get('MOCK_FAIL_STOP'):\n"
+                    "        print('docker: stop failed', file=sys.stderr)\n"
+                    "        sys.exit(1)\n"
                     "elif sys.argv[1:3] == ['run', '-d']:\n"
+                    "    if os.environ.get('MOCK_MUTATE_DB') and sys.argv[-1] == 'ghcr.io/sheying2013/aura:latest':\n"
+                    "        Path(os.environ['AURA_DATA_DIR'], 'panel.db').write_text('new incompatible db')\n"
+                    "        Path(os.environ['AURA_DATA_DIR'], 'panel.db-wal').write_text('new wal')\n"
+                    "        Path(os.environ['AURA_DATA_DIR'], 'panel.db-shm').write_text('new shm')\n"
                     "    if os.environ.get('MOCK_FAIL_RUN') and sys.argv[-1] == 'ghcr.io/sheying2013/aura:latest':\n"
                     "        print('docker: Error response from daemon: failed to start', file=sys.stderr)\n"
                     "        sys.exit(1)\n"
@@ -92,14 +103,31 @@ class DeployRegressionTests(unittest.TestCase):
                     "        sys.exit(1)\n"
                     "    print('mock-container-id')\n"
                     "elif sys.argv[1:3] == ['rm', '-f']:\n"
-                    "    if os.environ.get('MOCK_FAIL_RM'):\n"
+                    "    rm_count = Path(os.environ['MOCK_LOG'] + '.rm-count')\n"
+                    "    count = int(rm_count.read_text()) + 1 if rm_count.exists() else 1\n"
+                    "    rm_count.write_text(str(count))\n"
+                    "    if os.environ.get('MOCK_FAIL_RM') and count > 1:\n"
                     "        print('docker: remove failed', file=sys.stderr)\n"
                     "        sys.exit(1)\n"
                     "elif sys.argv[1:3] == ['logs', '--tail']:\n"
                     "    print('mock logs')\n",
-                "curl": common + "print(os.environ['PROBE_CODE'], end='')\n",
+                "cp": common +
+                    "if os.environ.get('MOCK_FAIL_DB_RESTORE') and any('panel.db.restore.' in a for a in sys.argv[1:]):\n"
+                    "    print('forced restore failure', file=sys.stderr)\n"
+                    "    sys.exit(1)\n"
+                    "os.execv('/bin/cp', ['/bin/cp', *sys.argv[1:]])\n",
+                "curl": common +
+                    "count_path = Path(os.environ['MOCK_LOG'] + '.curl-count')\n"
+                    "count = int(count_path.read_text()) + 1 if count_path.exists() else 1\n"
+                    "count_path.write_text(str(count))\n"
+                    "calls = [json.loads(line) for line in Path(os.environ['MOCK_LOG']).read_text().splitlines()]\n"
+                    "runs = [c for c in calls if c[:3] == ['docker', 'run', '-d']]\n"
+                    "old = os.environ.get('MOCK_OLD_IMAGE') and runs and runs[-1][-1] == os.environ['MOCK_OLD_IMAGE']\n"
+                    "code = os.environ['ROLLBACK_PROBE_CODE'] if old else os.environ['PROBE_CODE']\n"
+                    "if not old and os.environ.get('MOCK_READY_AFTER'): code = '200' if count >= int(os.environ['MOCK_READY_AFTER']) else '503'\n"
+                    "print(code, end='')\n",
                 "sleep": common +
-                    "if os.environ.get('MOCK_BLOCK_SLEEP'):\n"
+                    "if os.environ.get('MOCK_BLOCK_SLEEP') and not Path(os.environ['MOCK_SLEEP_MARKER']).exists():\n"
                     "    Path(os.environ['MOCK_SLEEP_MARKER']).write_text('started')\n"
                     "    import time\n"
                     "    while True:\n"
@@ -115,7 +143,7 @@ class DeployRegressionTests(unittest.TestCase):
                     del env[key]
             env.update({
                 "AURA_DATA_DIR": str(data), "MOCK_LOG": str(log),
-                "PROBE_CODE": probe_code,
+                "PROBE_CODE": probe_code, "ROLLBACK_PROBE_CODE": rollback_probe_code,
                 "PATH": str(bin_dir) + os.pathsep + env["PATH"],
             })
             if override is not None:
@@ -130,6 +158,14 @@ class DeployRegressionTests(unittest.TestCase):
                 env["MOCK_FAIL_DISCOVERY"] = fail_discovery
             if fail_rm:
                 env["MOCK_FAIL_RM"] = "1"
+            if fail_stop:
+                env["MOCK_FAIL_STOP"] = "1"
+            if mutate_db:
+                env["MOCK_MUTATE_DB"] = "1"
+            if fail_db_restore:
+                env["MOCK_FAIL_DB_RESTORE"] = "1"
+            if ready_after is not None:
+                env["MOCK_READY_AFTER"] = str(ready_after)
             if signal_at_sleep:
                 marker = root / "sleep-ready"
                 env["MOCK_BLOCK_SLEEP"] = "1"
@@ -161,6 +197,9 @@ class DeployRegressionTests(unittest.TestCase):
             if conf_mode is not None and conf.exists():
                 assert after_mode == before_mode, f"Mode mismatch: {oct(after_mode)} != {oct(before_mode)}"
             leftovers = [p.name for p in data.iterdir() if p.name.endswith(".tmp") or ".bak" in p.name]
+            self.last_db_after = (data / "panel.db").read_text() if (data / "panel.db").exists() else None
+            self.last_wal_after = (data / "panel.db-wal").read_text() if (data / "panel.db-wal").exists() else None
+            self.last_shm_after = (data / "panel.db-shm").read_text() if (data / "panel.db-shm").exists() else None
             return result, calls, before, after, leftovers
 
     def test_existing_port_and_custom_path_control_probe_and_print(self):
@@ -171,7 +210,7 @@ class DeployRegressionTests(unittest.TestCase):
         probe = next(call for call in calls if call[0] == "curl")
         self.assertEqual(probe[-1], "http://127.0.0.1:28080/private-panel/")
         self.assertIn("http://<服务器IP>:28080/private-panel", result.stdout)
-        self.assertEqual([call[1] for call in calls if call[0] == "docker"], ["pull", "run", "ps", "rm", "run"])
+        self.assertEqual([call[1] for call in calls if call[0] == "docker"], ["pull", "run", "ps", "run"])
 
     def test_explicit_port_is_persisted_without_changing_path_or_username(self):
         stored = {"port": 28080, "panel_path": "/custom", "username": "owner"}
@@ -212,6 +251,12 @@ class DeployRegressionTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(next(call for call in calls if call[0] == "curl")[-1], "http://127.0.0.1:28080/admin/")
 
+    def test_slow_start_retries_until_panel_is_ready(self):
+        result, calls, _, _, _ = self.deploy(ready_after=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(call[0] == "curl" for call in calls), 3)
+        self.assertIn("更新完成", result.stdout)
+
     def test_failed_probe_reports_logs_and_does_not_print_success(self):
         result, calls, _, _, _ = self.deploy(probe_code="503")
         self.assertNotEqual(result.returncode, 0)
@@ -235,7 +280,7 @@ class DeployRegressionTests(unittest.TestCase):
         self.assertEqual(leftovers, [], "Rollback must not leave backup or temporary files")
 
         docker_calls = [call for call in calls if call[0] == "docker"]
-        self.assertEqual([call[1] for call in docker_calls], ["pull", "run", "ps", "inspect", "rm", "run", "logs", "rm", "run"])
+        self.assertEqual([call[1] for call in docker_calls], ["pull", "run", "run", "ps", "inspect", "stop", "rm", "run", "logs", "rm", "run"])
 
         first_run_d = [call for call in docker_calls if call[1] == "run" and "-d" in call][0]
         self.assertEqual(first_run_d[-1], "ghcr.io/sheying2013/aura:latest")
@@ -260,10 +305,12 @@ class DeployRegressionTests(unittest.TestCase):
         self.assertEqual(json.loads(after), stored)
         self.assertEqual(leftovers, [], "Rollback must not leave backup or temporary files")
 
-        self.assertFalse(any(call[0] == "curl" for call in calls))
+        rollback_probes = [call for call in calls if call[0] == "curl"]
+        self.assertEqual(len(rollback_probes), 1, "The restored old container must be health-checked")
+        self.assertEqual(rollback_probes[0][-1], "http://127.0.0.1:28080/admin/")
 
         docker_calls = [call for call in calls if call[0] == "docker"]
-        self.assertEqual([call[1] for call in docker_calls], ["pull", "run", "ps", "inspect", "rm", "run", "rm", "run"])
+        self.assertEqual([call[1] for call in docker_calls], ["pull", "run", "run", "ps", "inspect", "stop", "rm", "run", "rm", "run"])
 
         first_run_d = [call for call in docker_calls if call[1] == "run" and "-d" in call][0]
         self.assertEqual(first_run_d[-1], "ghcr.io/sheying2013/aura:latest")
@@ -290,7 +337,7 @@ class DeployRegressionTests(unittest.TestCase):
         self.assertEqual(run_d_calls[0][-1], "ghcr.io/sheying2013/aura:latest")
 
         rm_calls = [call for call in docker_calls if call[1] == "rm"]
-        self.assertEqual(len(rm_calls), 2)
+        self.assertEqual(len(rm_calls), 1)
 
     def test_container_discovery_failure_preserves_old_container_and_config(self):
         stored = {"port": 28080, "panel_path": "/admin", "username": "admin"}
@@ -319,7 +366,7 @@ class DeployRegressionTests(unittest.TestCase):
         self.assertIn(f"ROLLBACK_FAILED old_image={old_image}", result.stderr)
         self.assertNotIn(f"ROLLBACK_DONE old_image={old_image}", result.stdout)
         self.assertEqual(before, after)
-        self.assertEqual(leftovers, [])
+        self.assertTrue(any(".panel.db.bak." in name for name in leftovers), "Failed old-image start must retain the SQLite snapshot")
 
     def test_failed_container_cleanup_is_reported_as_partial_rollback(self):
         old_image = "sha256:old-image-cleanup-fails"
@@ -330,10 +377,11 @@ class DeployRegressionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ROLLBACK_FAILED container_cleanup", result.stderr)
         self.assertIn("docker rm error: docker: remove failed", result.stderr)
-        self.assertIn(f"ROLLBACK_PARTIAL old_image={old_image}", result.stderr)
+        self.assertIn("容器可能仍在写入", result.stderr)
         self.assertNotIn(f"ROLLBACK_DONE old_image={old_image}", result.stdout)
         self.assertEqual(before, after)
-        self.assertEqual(leftovers, [])
+        self.assertTrue(any(".panel.db.bak." in name for name in leftovers))
+        self.assertFalse(any(call[:3] == ["docker", "run", "-d"] and call[-1] == old_image for call in calls))
 
     def test_sigterm_during_health_wait_rolls_back_old_image_and_config(self):
         old_image = "sha256:old-image-sigterm"
@@ -350,6 +398,60 @@ class DeployRegressionTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
         docker_calls = [call for call in calls if call[0] == "docker"]
         self.assertEqual(docker_calls[-1][-1], old_image)
+
+    def test_old_container_stop_failure_preserves_live_database(self):
+        old_image = "sha256:old-image-stop-fails"
+        result, calls, _, _, leftovers = self.deploy(
+            stored={"port": 28080, "panel_path": "/admin", "username": "admin"},
+            old_image=old_image, fail_stop=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.last_db_after, "local fixture")
+        self.assertEqual(leftovers, [])
+        self.assertFalse(any(call[:3] == ["docker", "run", "-d"] and call[-1] == "ghcr.io/sheying2013/aura:latest" for call in calls))
+        self.assertNotIn("ROLLBACK_DONE", result.stdout)
+        self.assertFalse(any(call[:2] == ["docker", "rm"] for call in calls))
+        self.assertFalse(any(call[:3] == ["docker", "run", "-d"] for call in calls))
+
+    def test_health_failure_restores_database_and_wal_sidecars(self):
+        old_image = "sha256:old-image-db-rollback"
+        result, calls, _, _, leftovers = self.deploy(
+            stored={"port": 28080, "panel_path": "/admin", "username": "admin"},
+            probe_code="503", old_image=old_image, mutate_db=True, db_sidecars=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.last_db_after, "local fixture")
+        self.assertEqual(self.last_wal_after, "old wal")
+        self.assertEqual(self.last_shm_after, "old shm")
+        self.assertEqual(leftovers, [])
+        docker_calls = [call for call in calls if call[0] == "docker"]
+        self.assertIn(["docker", "stop", "aura-panel"], docker_calls)
+        self.assertIn(f"ROLLBACK_DONE old_image={old_image}", result.stdout)
+        self.assertEqual(sum(call[0] == "curl" for call in calls), 6)
+
+    def test_failed_database_restore_never_starts_old_container(self):
+        old_image = "sha256:old-image-db-restore-fails"
+        result, calls, _, _, leftovers = self.deploy(
+            stored={"port": 28080, "panel_path": "/admin", "username": "admin"},
+            probe_code="503", old_image=old_image, mutate_db=True, fail_db_restore=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ROLLBACK_FAILED restore", result.stderr)
+        self.assertTrue(any(".panel.db.bak." in name for name in leftovers))
+        self.assertFalse(any(call[:3] == ["docker", "run", "-d"] and call[-1] == old_image for call in calls))
+
+    def test_old_container_health_failure_is_not_a_successful_rollback(self):
+        old_image = "sha256:old-image-unhealthy"
+        result, _, _, _, leftovers = self.deploy(
+            stored={"port": 28080, "panel_path": "/admin", "username": "admin"},
+            probe_code="503", rollback_probe_code="502", old_image=old_image, mutate_db=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.last_db_after, "local fixture")
+        self.assertIn(f"ROLLBACK_FAILED old_image={old_image} health_check", result.stderr)
+        self.assertNotIn(f"ROLLBACK_DONE old_image={old_image}", result.stdout)
+        self.assertTrue(any(".panel.db.bak." in name for name in leftovers))
+        self.assertIn("SQLite 快照保留于", result.stderr)
 
     def test_successful_deployment_leaves_no_backup_files(self):
         stored = {"port": 28080, "panel_path": "/admin", "username": "admin"}

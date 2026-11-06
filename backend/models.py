@@ -62,6 +62,8 @@ class EntryConvertResponse(BaseModel):
     failed: int = 0
     errors: List[Dict[str, str]] = []
     items: List[Node] = []
+    configApplied: bool = False
+    configMessage: str = ""
 
 
 class NodeBatchRequest(BaseModel):

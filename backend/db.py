@@ -12,7 +12,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
+_DEFAULT_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
+DATA_DIR = os.path.abspath(os.environ["AURA_DATA_DIR"]) if os.environ.get("AURA_DATA_DIR") else _DEFAULT_DATA_DIR
 DB_PATH = os.path.join(DATA_DIR, "panel.db")
 
 _conn: Optional[sqlite3.Connection] = None
@@ -288,8 +289,7 @@ def rename_group(old_name: str, new_name: str) -> Dict[str, Any]:
     """
     if not old_name or not new_name or old_name == new_name:
         return {"updated": 0, "relayUpdated": 0}
-    with _lock:
-        c = connect()
+    with _lock, connect() as c:
         cur = c.execute('UPDATE nodes SET "group"=?, updated_at=? WHERE "group"=?',
                         (new_name, _conn_now(), old_name))
         updated = cur.rowcount
@@ -320,7 +320,6 @@ def rename_group(old_name: str, new_name: str) -> Dict[str, Any]:
                 if changed:
                     c.execute("UPDATE settings SET value=? WHERE key='system'",
                               (json.dumps(s, ensure_ascii=False),))
-        c.commit()
         return {"updated": updated, "relayUpdated": relay_updated}
 
 
@@ -633,13 +632,11 @@ def update_node_port(node_id: str, port: Optional[int]) -> Optional[Dict]:
 
 
 def delete_node(node_id: str) -> bool:
-    with _lock:
-        c = connect()
+    with _lock, connect() as c:
         node = c.execute("SELECT raw_config, sub_id FROM nodes WHERE id = ?", (node_id,)).fetchone()
         cur = c.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
         if cur.rowcount > 0 and node:
             _record_deleted(c, node)
-        c.commit()
         return cur.rowcount > 0
 
 
@@ -660,8 +657,7 @@ def update_nodes_group(ids: List[str], group: str) -> int:
 
 
 def delete_node_batch(ids: List[str]) -> int:
-    with _lock:
-        c = connect()
+    with _lock, connect() as c:
         marks = []
         for nid in ids:
             node = c.execute("SELECT raw_config, sub_id FROM nodes WHERE id = ?", (nid,)).fetchone()
@@ -670,7 +666,6 @@ def delete_node_batch(ids: List[str]) -> int:
         cur = c.execute("DELETE FROM nodes WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)
         for node in marks:
             _record_deleted(c, node)
-        c.commit()
         return cur.rowcount
 
 
@@ -749,11 +744,9 @@ def reset_all_traffic() -> None:
 
 def update_node_probe(node_id: str, ping: int, status: str, error: Optional[str] = None, *,
                       count_failure: bool = True, expected_port: Optional[int] = None,
-                      expected_protocol: Optional[str] = None) -> Optional[int]:
-    """原子落库探活结果；手动失败不计数，成功清零。
-
-    当前节点已停用、删除或 tag 已变化时返回 None，调用方必须丢弃过期结果。
-    """
+                      expected_protocol: Optional[str] = None,
+                      offline_grace_fails: int = 1) -> Optional[int]:
+    """原子落库探活结果；后台失败可在容差期内保留在线状态与旧 ping。"""
     where = "id=? AND status!='disabled'"
     expected: list = [node_id]
     if expected_port is not None:
@@ -762,14 +755,22 @@ def update_node_probe(node_id: str, ping: int, status: str, error: Optional[str]
     if expected_protocol is not None:
         where += " AND protocol=?"
         expected.append(expected_protocol)
-    if status == "online":
-        counter = "0"
-    else:
-        counter = "consecutive_fails+1" if count_failure else "consecutive_fails"
+    counter = "0" if status == "online" else (
+        "consecutive_fails+1" if count_failure else "consecutive_fails"
+    )
+    preserve_online = (
+        f"status='online' AND consecutive_fails+1<{int(offline_grace_fails)}"
+        if count_failure and status != "online" and offline_grace_fails > 1
+        else "0"
+    )
     with _lock:
         c = connect()
         cur = c.execute(
-            f"UPDATE nodes SET ping=?, status=?, consecutive_fails={counter}, updated_at=? WHERE {where}",
+            f"""UPDATE nodes
+                SET ping=CASE WHEN {preserve_online} THEN ping ELSE ? END,
+                    status=CASE WHEN {preserve_online} THEN status ELSE ? END,
+                    consecutive_fails={counter}, updated_at=?
+                WHERE {where}""",
             (int(ping), status, _conn_now(), *expected),
         )
         c.commit()
@@ -824,27 +825,28 @@ def list_relay_domains() -> List[Dict]:
         return out
 
 
-def upsert_relay_domains(domains: List[Dict]) -> None:
-    """整表替换（settings 里 relayDomains 全量 PUT 时同步，settings 是唯一真源）。
+def _replace_relay_domains(c: sqlite3.Connection, domains: List[Dict], *, strict: bool = False) -> None:
+    """在调用方事务内整表替换轮询入口。"""
+    c.execute("DELETE FROM relay_domains")
+    for d in domains:
+        try:
+            c.execute(
+                "INSERT INTO relay_domains (id,domain,port,auth_user,auth_pass,groups) VALUES (?,?,?,?,?,?)",
+                (d["id"], d.get("domain", ""), d.get("port"), d.get("authUser"),
+                 d.get("authPass"), json.dumps(d.get("groups", ["ALL"]), ensure_ascii=False)),
+            )
+        except sqlite3.IntegrityError:
+            if strict:
+                raise
+            continue  # 兼容旧数据中的端口冲突
 
-    必须全删再插：settings 与 relay_domains 双份数据，若只删"列表内 id"，
-    用户删除旧 relay 后旧行永不清理 → config 生成用残留旧数据（旧凭据/旧端口），
-    新 relay 配置不生效（pu.993699.xyz 连不通事故根因）。
-    端口 UNIQUE 冲突时跳过新行（保留 DB 已有行，不静默覆盖）。
-    """
+
+def upsert_relay_domains(domains: List[Dict]) -> None:
+    """在一个事务内整表替换轮询入口。"""
     with _lock:
         c = connect()
-        c.execute("DELETE FROM relay_domains")
-        for d in domains:
-            try:
-                c.execute(
-                    "INSERT INTO relay_domains (id,domain,port,auth_user,auth_pass,groups) VALUES (?,?,?,?,?,?)",
-                    (d["id"], d.get("domain", ""), d.get("port"), d.get("authUser"),
-                     d.get("authPass"), json.dumps(d.get("groups", ["ALL"]), ensure_ascii=False)),
-                )
-            except sqlite3.IntegrityError:
-                continue  # 端口冲突：跳过新行（不静默覆盖已有行）
-        c.commit()
+        with c:
+            _replace_relay_domains(c, domains)
 
 
 # ---------- 订阅 ----------
@@ -957,3 +959,17 @@ def set_setting(key: str, value: Any) -> None:
             (key, json.dumps(value, ensure_ascii=False)),
         )
         c.commit()
+
+
+def set_system_settings(value: Dict[str, Any]) -> None:
+    """系统设置与 relay_domains 同事务提交，避免双份真源失配。"""
+    with _lock:
+        c = connect()
+        with c:
+            c.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('system', ?)",
+                (json.dumps(value, ensure_ascii=False),),
+            )
+            domains = value.get("relayDomains")
+            if isinstance(domains, list):
+                _replace_relay_domains(c, domains, strict=True)

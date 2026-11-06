@@ -24,7 +24,7 @@ import netguard
 from utils import safe_int as _safe_int
 
 SINGBOX_BIN = os.environ.get("SINGBOX_BIN", "sing-box")
-DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
+DATA_DIR = db.DATA_DIR
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 CONFIG_BAK_PATH = os.path.join(DATA_DIR, "config.json.bak")
 LOG_PATH = os.path.join(DATA_DIR, "singbox.log")

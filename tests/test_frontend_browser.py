@@ -558,6 +558,78 @@ def test_all_export_paths_use_saved_domain_and_preserve_original(ui, entry_proto
     assert original in page.locator("#export-text-area").input_value()
 
 
+def test_batch_group_config_applied_false_shows_warning_without_pure_success(ui):
+    page, state = ui
+    state["responses"]["/api/nodes/batch-group"] = (200, {
+        "ok": True,
+        "updated": 2,
+        "configApplied": False,
+        "configMessage": "sing-box reload timeout: exit status 1"
+    })
+    page.evaluate("""() => {
+        selectedNodeIds = new Set(['n1', 'n2']);
+        document.getElementById('batch-group-input').value = 'TestGroup';
+        return handleBatchGroup();
+    }""")
+    logs = page.locator("#system-logs-container").inner_text()
+    assert "sing-box reload timeout: exit status 1" in logs
+    assert "但配置未生效" in logs
+    # 不得报纯成功
+    assert not page.evaluate("bgLogs.some(log => log.includes('[SUCCESS]') && log.includes('TestGroup'))")
+    # warn toast 显示
+    toast = page.locator("#aura-toast-box").inner_text()
+    assert "sing-box reload timeout: exit status 1" in toast
+
+
+def test_rename_group_config_applied_false_shows_warning_without_pure_success(ui):
+    page, state = ui
+    state["responses"]["/api/groups/rename"] = (200, {
+        "ok": True,
+        "updated": 1,
+        "relayUpdated": 0,
+        "configApplied": False,
+        "configMessage": "sing-box syntax error in config"
+    })
+    page.evaluate("""() => {
+        window.__answers = ['old_grp', 'new_grp'];
+        window.auraPrompt = async () => window.__answers.shift();
+        return renameGroup();
+    }""")
+    logs = page.locator("#system-logs-container").inner_text()
+    assert "sing-box syntax error in config" in logs
+    assert "但配置未生效" in logs
+    # 不得报纯成功
+    assert not page.evaluate("bgLogs.some(log => log.includes('[SUCCESS]') && log.includes('old_grp -> new_grp'))")
+    # warn toast 显示
+    toast = page.locator("#aura-toast-box").inner_text()
+    assert "sing-box syntax error in config" in toast
+
+
+def test_convert_entry_config_applied_false_shows_warning_without_pure_success(ui):
+    page, state = ui
+    state["responses"]["/api/nodes/convert-entry"] = (200, {
+        "ok": True,
+        "converted": 2,
+        "failed": 0,
+        "errors": [],
+        "items": [],
+        "configApplied": False,
+        "configMessage": "sing-box binary not found"
+    })
+    page.evaluate("""() => {
+        selectedNodeIds = new Set(['n1', 'n2']);
+        return handleConvertEntry();
+    }""")
+    logs = page.locator("#system-logs-container").inner_text()
+    assert "sing-box binary not found" in logs
+    assert "但配置未生效" in logs
+    # 不得报纯成功
+    assert not page.evaluate("bgLogs.some(log => log.includes('[SUCCESS]') && log.includes('批量转换'))")
+    # warn toast 显示
+    toast = page.locator("#aura-toast-box").inner_text()
+    assert "sing-box binary not found" in toast
+
+
 def test_export_domain_drafts_failed_save_and_clear(ui):
     page, state = ui
     state["settings"]["exportDomain"] = "saved.example.com"
@@ -648,6 +720,22 @@ def test_stale_settings_fetch_does_not_replace_saved_domain(ui):
     page.evaluate("window.__releaseSettings(); window.__pendingSettings")
     assert page.evaluate("getExportHost()") == "new.example.com"
     assert page.locator("#setting-export-domain").input_value() == "new.example.com"
+
+
+def test_modal_delayed_autofocus_does_not_steal_user_focus(ui):
+    page, state = ui
+    state["nodes"] = [node("n1", protocol="socks5", rawConfig={"server": "example.com", "server_port": 1080})]
+    page.evaluate("loadNodes()")
+    focused = page.evaluate("""async () => {
+        openEditNodeModal('n1');
+        toggleEditRawLinkBar();
+        const input = document.getElementById('edit-raw-link-input');
+        input.value = 'user input';
+        input.focus();
+        await new Promise(resolve => setTimeout(resolve, 80));
+        return {id: document.activeElement.id, value: input.value};
+    }""")
+    assert focused == {"id": "edit-raw-link-input", "value": "user input"}
 
 
 def test_edit_raw_upstream_node_modal_and_patch(ui):

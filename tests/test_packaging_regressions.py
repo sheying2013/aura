@@ -206,6 +206,53 @@ class PackagingRegressionTests(unittest.TestCase):
         for pattern in ("*.bak*", "**/*.bak*", "/tests/", "/test-*.json", "/*.py"):
             self.assertIn(pattern, patterns)
 
+    def test_publish_workflow_tracks_canonical_frontend_assets(self):
+        workflow = (ROOT / ".github/workflows/docker-publish.yml").read_text()
+        self.assertIn("'static/**'", workflow)
+        self.assertIn("'index.html'", workflow)
+        self.assertIn("needs: [rust-test, python-test]", workflow)
+
+    def test_start_prefers_local_venv_bin_over_system_path(self):
+        with tempfile.TemporaryDirectory(prefix="aura packaging ") as tmp:
+            root = Path(tmp)
+            backend = root / "backend"
+            backend.mkdir(exist_ok=True)
+            shutil.copyfile(ROOT / "backend/start.sh", backend / "start.sh")
+
+            # Create system bin
+            system_bin = root / "sys_bin"
+            system_bin.mkdir()
+            for name in ("python3", "uvicorn"):
+                p = system_bin / name
+                p.write_text("#!/bin/sh\necho system-" + name + ' "$@"\n')
+                p.chmod(0o755)
+
+            # Create backend/.venv/bin
+            venv_bin = backend / ".venv/bin"
+            venv_bin.mkdir(parents=True)
+            for name in ("python3", "uvicorn"):
+                p = venv_bin / name
+                if name == "python3":
+                    p.write_text("#!/bin/sh\necho 31001\n")
+                else:
+                    p.write_text('#!/bin/sh\nprintf "%s\n" "venv-' + name + '" "$@"\n')
+                p.chmod(0o755)
+
+            env = shell_env()
+            env["PATH"] = str(system_bin) + os.pathsep + "/usr/bin:/bin"
+            result = subprocess.run(
+                ["bash", str(backend / "start.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.splitlines(),
+                ["venv-uvicorn", "app:app", "--host", "0.0.0.0", "--port", "31001"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

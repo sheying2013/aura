@@ -274,8 +274,38 @@ fn normalize_key(k: &str) -> String {
     }
 }
 
-fn is_constraint(e: &rusqlite::Error) -> bool {
-    matches!(e, rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::ConstraintViolation)
+fn is_unique_constraint(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(err, _)
+        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            || err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
+}
+
+fn replace_relay_domains(conn: &Connection, domains: &[RelayDomain], strict: bool) -> Result<()> {
+    conn.execute("DELETE FROM relay_domains", [])?;
+    for d in domains {
+        let groups = if d.groups.is_empty() {
+            vec!["ALL".to_string()]
+        } else {
+            d.groups.clone()
+        };
+        let res = conn.execute(
+            "INSERT INTO relay_domains (id,domain,port,auth_user,auth_pass,groups) VALUES (?,?,?,?,?,?)",
+            params![
+                d.id,
+                d.domain,
+                d.port,
+                d.auth_user,
+                d.auth_pass,
+                serde_json::to_string(&groups)?,
+            ],
+        );
+        match res {
+            Ok(_) => {}
+            Err(e) if !strict && is_unique_constraint(&e) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 行映射
@@ -957,7 +987,8 @@ impl Db {
         nodes: &[Value],
         update_existing_sub: bool,
     ) -> Result<BatchResult> {
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
         let mut result = BatchResult::default();
         let mut batch_ports: HashSet<i64> = HashSet::new();
 
@@ -965,7 +996,7 @@ impl Db {
         let mut existing_servers: HashSet<(String, i64)> = HashSet::new();
         let mut existing_by_key: HashMap<(String, String, i64), String> = HashMap::new();
         {
-            let mut st = conn.prepare("SELECT raw_config, id, sub_id FROM nodes")?;
+            let mut st = tx.prepare("SELECT raw_config, id, sub_id FROM nodes")?;
             let it = st.query_map([], |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
@@ -1003,11 +1034,11 @@ impl Db {
             }
         }
         let deleted_fps: HashSet<String> = {
-            let mut st = conn.prepare("SELECT fingerprint FROM deleted_fingerprints")?;
+            let mut st = tx.prepare("SELECT fingerprint FROM deleted_fingerprints")?;
             let it = st.query_map([], |r| r.get::<_, String>(0))?;
             it.collect::<rusqlite::Result<HashSet<_>>>()?
         };
-        let mut db_used = used_ports(&conn)?;
+        let mut db_used = used_ports(&tx)?;
 
         for nd in nodes {
             let mut nd = nd.clone();
@@ -1056,7 +1087,7 @@ impl Db {
                             .get(&(sub.to_string(), srv.clone(), sp))
                             .cloned()
                         {
-                            let current = fetch_node(&conn, &existing_id)?;
+                            let current = fetch_node(&tx, &existing_id)?;
                             let incoming_raw = serde_json::to_string(&rc)?;
                             let incoming_name = nd
                                 .get("name")
@@ -1081,7 +1112,7 @@ impl Db {
                                 }
                             };
                             if changed {
-                                conn.execute(
+                                tx.execute(
                                     "UPDATE nodes SET name=?,protocol=?,raw_config=?,sub_name=?,stale=?,updated_at=? WHERE id=?",
                                     params![
                                         incoming_name,
@@ -1094,7 +1125,7 @@ impl Db {
                                     ],
                                 )?;
                                 result.updated += 1;
-                                if let Some(row) = fetch_node(&conn, &existing_id)? {
+                                if let Some(row) = fetch_node(&tx, &existing_id)? {
                                     result.items.push(row);
                                 }
                             } else {
@@ -1195,7 +1226,7 @@ impl Db {
             let disabled_auto = truthy(nd.get("disabledAuto").unwrap_or(&Value::Null));
             let created_at = nd.get("createdAt").and_then(val_i64).unwrap_or(now);
             let inserted = insert_row(
-                &conn,
+                &tx,
                 &InsertRow {
                     id: &node_id,
                     name: &name,
@@ -1224,17 +1255,18 @@ impl Db {
             );
             match inserted {
                 Ok(_) => {
-                    if let Some(row) = fetch_node(&conn, &node_id)? {
+                    if let Some(row) = fetch_node(&tx, &node_id)? {
                         result.items.push(row);
                     }
                     result.created += 1;
                 }
-                Err(e) if is_constraint(&e) => {
+                Err(e) if is_unique_constraint(&e) => {
                     result.skipped += 1;
                 }
                 Err(e) => return Err(e.into()),
             }
         }
+        tx.commit()?;
         Ok(result)
     }
 
@@ -1484,22 +1516,24 @@ impl Db {
     }
 
     pub fn delete_node(&self, node_id: &str) -> Result<bool> {
-        let conn = self.lock();
-        let row: Option<(Option<String>, Option<String>)> = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let row: Option<(Option<String>, Option<String>)> = tx
             .query_row(
                 "SELECT raw_config, sub_id FROM nodes WHERE id = ?",
                 [node_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let cur = conn.execute("DELETE FROM nodes WHERE id = ?", [node_id])?;
+        let cur = tx.execute("DELETE FROM nodes WHERE id = ?", [node_id])?;
         if cur > 0 {
             if let Some((raw, sub_id)) = row {
                 let rc: Value =
                     serde_json::from_str(raw.as_deref().unwrap_or("{}")).unwrap_or(Value::Null);
-                record_deleted(&conn, &rc, sub_id.as_deref().unwrap_or(""))?;
+                record_deleted(&tx, &rc, sub_id.as_deref().unwrap_or(""))?;
             }
         }
+        tx.commit()?;
         Ok(cur > 0)
     }
 
@@ -1525,10 +1559,11 @@ impl Db {
         if ids.is_empty() {
             return Ok(0);
         }
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
         let mut marks: Vec<(Option<String>, Option<String>)> = Vec::new();
         for nid in ids {
-            let row: Option<(Option<String>, Option<String>)> = conn
+            let row: Option<(Option<String>, Option<String>)> = tx
                 .query_row(
                     "SELECT raw_config, sub_id FROM nodes WHERE id = ?",
                     [nid],
@@ -1546,12 +1581,13 @@ impl Db {
             .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>)
             .collect();
         let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
-        let cur = conn.execute(&sql, refs.as_slice())?;
+        let cur = tx.execute(&sql, refs.as_slice())?;
         for (raw, sub_id) in marks {
             let rc: Value =
                 serde_json::from_str(raw.as_deref().unwrap_or("{}")).unwrap_or(Value::Null);
-            record_deleted(&conn, &rc, sub_id.as_deref().unwrap_or(""))?;
+            record_deleted(&tx, &rc, sub_id.as_deref().unwrap_or(""))?;
         }
+        tx.commit()?;
         Ok(cur)
     }
 
@@ -1836,31 +1872,28 @@ impl Db {
     /// 整表替换（settings 是唯一真源）。必须全删再插：只删「列表内 id」会残留旧行，
     /// 导致 config 生成用旧凭据/旧端口。端口 UNIQUE 冲突时跳过新行（不覆盖已有行）。
     pub fn upsert_relay_domains(&self, domains: &[RelayDomain]) -> Result<()> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM relay_domains", [])?;
-        for d in domains {
-            let groups = if d.groups.is_empty() {
-                vec!["ALL".to_string()]
-            } else {
-                d.groups.clone()
-            };
-            let res = conn.execute(
-                "INSERT INTO relay_domains (id,domain,port,auth_user,auth_pass,groups) VALUES (?,?,?,?,?,?)",
-                params![
-                    d.id,
-                    d.domain,
-                    d.port,
-                    d.auth_user,
-                    d.auth_pass,
-                    serde_json::to_string(&groups)?,
-                ],
-            );
-            match res {
-                Ok(_) => {}
-                Err(e) if is_constraint(&e) => continue,
-                Err(e) => return Err(e.into()),
-            }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        replace_relay_domains(&tx, domains, false)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_system_settings(
+        &self,
+        value: &Value,
+        domains: Option<&[RelayDomain]>,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if let Some(domains) = domains {
+            replace_relay_domains(&tx, domains, true)?;
         }
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('system', ?)",
+            params![serde_json::to_string(value)?],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1943,7 +1976,7 @@ impl Db {
             );
             match res {
                 Ok(_) => {}
-                Err(e) if is_constraint(&e) => return Ok(None),
+                Err(e) if is_unique_constraint(&e) => return Ok(None),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -2535,6 +2568,62 @@ mod tests {
         assert_eq!(node.base.exit_country, None);
         assert_eq!(node.base.sub_name.as_deref(), Some("订阅A"));
         assert_eq!(node.base.status.as_deref(), Some("online"));
+    }
+
+    #[test]
+    fn batch_insert_rolls_back_when_a_later_row_fails() {
+        let d = db();
+        d.execute(
+            "CREATE TRIGGER fail_second BEFORE INSERT ON nodes WHEN NEW.name='second' BEGIN SELECT RAISE(ABORT, 'forced batch failure'); END",
+            &[],
+        ).unwrap();
+        let err = d
+            .create_node_batch_json(
+                &[node_json("first", 52001), node_json("second", 52002)],
+                false,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("forced batch failure"), "{err:#}");
+        assert!(d.list_nodes(None, None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_rolls_back_when_deleted_fingerprint_fails() {
+        let d = db();
+        let mut value = node_json("victim", 52001);
+        value["subId"] = json!("sub-1");
+        let node = d.create_node_batch_json(&[value], false).unwrap().items[0].clone();
+        d.execute(
+            "CREATE TRIGGER fail_fingerprint BEFORE INSERT ON deleted_fingerprints BEGIN SELECT RAISE(ABORT, 'forced fingerprint failure'); END",
+            &[],
+        ).unwrap();
+        let err = d.delete_node(&node.id).unwrap_err();
+        assert!(
+            err.to_string().contains("forced fingerprint failure"),
+            "{err:#}"
+        );
+        assert!(d.get_node(&node.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn batch_delete_rolls_back_when_deleted_fingerprint_fails() {
+        let d = db();
+        let mut a = node_json("a", 52001);
+        let mut b = node_json("b", 52002);
+        a["subId"] = json!("sub-1");
+        b["subId"] = json!("sub-1");
+        let created = d.create_node_batch_json(&[a, b], false).unwrap().items;
+        let ids: Vec<String> = created.iter().map(|n| n.id.clone()).collect();
+        d.execute(
+            "CREATE TRIGGER fail_fingerprint BEFORE INSERT ON deleted_fingerprints BEGIN SELECT RAISE(ABORT, 'forced fingerprint failure'); END",
+            &[],
+        ).unwrap();
+        let err = d.delete_node_batch(&ids).unwrap_err();
+        assert!(
+            err.to_string().contains("forced fingerprint failure"),
+            "{err:#}"
+        );
+        assert_eq!(d.list_nodes(None, None, None).unwrap().len(), 2);
     }
 
     // 2. 自动分配跳过 reservedPorts

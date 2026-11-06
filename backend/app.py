@@ -9,10 +9,9 @@ import re
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -26,9 +25,23 @@ import scheduler
 import stats
 import subs_proxy
 
+
+def _apply_outcome_fields(applied: Any) -> Tuple[bool, str]:
+    """将内核应用结果或异常统一转换为 API 的真实状态与错误文本。"""
+    if isinstance(applied, dict):
+        ok = bool(applied.get("ok"))
+        msg = applied.get("message")
+        if ok:
+            return True, msg or "配置已生效"
+        return False, msg or "配置未生效"
+    if isinstance(applied, Exception):
+        return False, str(applied)
+    return False, "未知错误"
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = db.DATA_DIR
 # 面板路径前缀（默认 /admin，可用 aura CLI / panel.conf 修改）
 PANEL_PATH = panel_config.get("panel_path") or "/admin"
 
@@ -49,7 +62,7 @@ def require_auth(request: Request) -> None:
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[len("Bearer "):].strip()
-    else:
+    elif request.url.path == "/api/stats/stream":
         token = request.query_params.get("token", "")
     if not token or not auth.verify_token(token):
         raise HTTPException(status_code=401, detail="未登录或登录已过期")
@@ -136,15 +149,6 @@ def auth_change_password(body: dict):
 @app.get("/api/auth/check", dependencies=[Depends(require_auth)])
 def auth_check():
     return {"ok": True}
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 # ---------- 节点 CRUD ----------
 
@@ -295,11 +299,20 @@ async def convert_node_entry(body: models.EntryConvertRequest):
 
     # 热重载 sing-box 使新入口生效（失败不阻断返回，配置保留待下次 apply）
     try:
-        await config_manager.apply_config()
-    except Exception:
-        pass
+        applied = await config_manager.apply_config()
+        applied_ok, applied_msg = _apply_outcome_fields(applied)
+    except Exception as exc:
+        applied_ok, applied_msg = _apply_outcome_fields(exc)
 
-    return {"ok": True, "converted": converted, "failed": failed, "errors": errors, "items": items}
+    return {
+        "ok": True,
+        "converted": converted,
+        "failed": failed,
+        "errors": errors,
+        "items": items,
+        "configApplied": applied_ok,
+        "configMessage": applied_msg,
+    }
 
 
 @app.delete("/api/nodes/{node_id}", status_code=204, dependencies=[Depends(require_auth)])
@@ -328,11 +341,15 @@ async def update_nodes_batch_group(body: dict):
     # 分组变更影响 relay 域名轮询池（按 group 匹配节点）→ 重建配置
     try:
         applied = await config_manager.apply_config()
-    except Exception:
-        applied = {}
-    return {"ok": True, "updated": updated,
-            "configApplied": bool(applied.get("ok")),
-            "configMessage": applied.get("message", "")}
+        applied_ok, applied_msg = _apply_outcome_fields(applied)
+    except Exception as exc:
+        applied_ok, applied_msg = _apply_outcome_fields(exc)
+    return {
+        "ok": True,
+        "updated": updated,
+        "configApplied": applied_ok,
+        "configMessage": applied_msg,
+    }
 
 
 @app.post("/api/groups/rename", dependencies=[Depends(require_auth)])
@@ -347,10 +364,16 @@ async def rename_group(body: dict):
         raise HTTPException(status_code=404, detail=f"分组 [{old_name}] 不存在")
     # 分组名变更影响 relay 池 → 重建配置
     try:
-        await config_manager.apply_config()
-    except Exception:
-        pass
-    return {"ok": True, **result}
+        applied = await config_manager.apply_config()
+        applied_ok, applied_msg = _apply_outcome_fields(applied)
+    except Exception as exc:
+        applied_ok, applied_msg = _apply_outcome_fields(exc)
+    return {
+        "ok": True,
+        **result,
+        "configApplied": applied_ok,
+        "configMessage": applied_msg,
+    }
 
 
 @app.post("/api/nodes/{node_id}/traffic/reset", response_model=models.Node, dependencies=[Depends(require_auth)])
@@ -626,7 +649,7 @@ async def put_settings(body: dict):
     cur = db.get_setting("system", {}) or {}
     body = {**cur, **body}
     body.pop("relayExits", None)
-    for key in ("clashPort", "inboundPort", "probeInterval", "randomRotateInterval"):
+    for key in ("clashPort", "inboundPort", "probeInterval", "randomRotateInterval", "offlineGraceFails"):
         if key not in body:
             continue
         try:
@@ -636,6 +659,9 @@ async def put_settings(body: dict):
         if key in ("clashPort", "inboundPort"):
             if not (1 <= value <= 65535 or (key == "inboundPort" and value == 0)):
                 raise HTTPException(status_code=422, detail=f"{key} 端口无效")
+        elif key == "offlineGraceFails":
+            if not (1 <= value <= 10):
+                raise HTTPException(status_code=422, detail="offlineGraceFails 必须在 1..=10 范围内")
         elif value < (10 if key == "probeInterval" else 5):
             raise HTTPException(status_code=422, detail=f"{key} 间隔过短")
         body[key] = value
@@ -669,26 +695,27 @@ async def put_settings(body: dict):
             pass  # A valid update must be able to replace malformed legacy data.
     changed = {key for key in body.keys() | previous.keys()
                if body.get(key) != previous.get(key)}
-    db.set_setting("system", body)
-    # Export-only changes never affect the running proxy core. Unchanged PUTs
-    # still apply config so a previously failed reload can be retried.
+    # Export-only changes never affect relay_domains or the running proxy core.
     if changed == {"exportDomain"}:
+        db.set_setting("system", body)
         return {"ok": True, "configApplied": True, "configReloaded": False,
                 "configMessage": "节点导出域名已保存，无需重载内核",
                 "exportDomain": body.get("exportDomain", "")}
-    if isinstance(body.get("relayDomains"), list):
-        db.upsert_relay_domains(body["relayDomains"])
+    db.set_system_settings(body)
     # 设置/域名变更后自动重生成并热重载 sing-box（新域名入口立即生效）
     # 返回实际应用结果：前端"保存按钮"据此显示配置是否真正生效（端口冲突/校验失败可见）
     try:
         applied = await config_manager.apply_config()
-    except Exception:
-        applied = {}
+        applied_ok, applied_msg = _apply_outcome_fields(applied)
+        reloaded = bool(applied.get("ok"))
+    except Exception as exc:
+        applied_ok, applied_msg = _apply_outcome_fields(exc)
+        reloaded = False
     return {
         "ok": True,
-        "configApplied": bool(applied.get("ok")),
-        "configReloaded": bool(applied.get("ok")),
-        "configMessage": applied.get("message", ""),
+        "configApplied": applied_ok,
+        "configReloaded": reloaded,
+        "configMessage": applied_msg,
         "exportDomain": body.get("exportDomain", ""),
     }
 
